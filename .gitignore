@@ -7,3 +7,10 @@ __pycache__/
 .docker/
 node_modules/
 frontend/dist/
+
+# Захваты трафика с реального оборудования (диагностика call-home,
+# см. DECISIONS.md) — большие бинарники и hex-дампы, не часть кода.
+*.pcap
+*.pcapng
+202001002352.txt
+202306004113.txt
