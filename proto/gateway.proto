@@ -1,0 +1,59 @@
+// Внутренний RPC-контракт Backend <-> Protocol Gateway (ТЗ п. 4.1: "Взаимодействие
+// Backend API <-> Protocol Gateway выполняется по внутреннему RPC-протоколу,
+// рекомендуется gRPC"). Этап 1 — только операция чтения одного регистра
+// (ТЗ п. 4.2.3, "чтение текущих показаний"); журналы событий/вмешательств,
+// профиль нагрузки, запись параметров — последующие этапы, добавляются сюда же.
+
+syntax = "proto3";
+
+package mmws.gateway.v1;
+
+service GatewayService {
+  // Читает одно значение (COSEM Register) со счётчика по одному из трёх
+  // протокольных профилей Этапа 0. Синхронный RPC — асинхронность (job_id,
+  // очередь) реализуется на стороне Backend, Gateway остаётся stateless
+  // относительно пользователей/задач (Promt_MMWS.md, раздел 3, принцип 1).
+  rpc ReadRegister(ReadRegisterRequest) returns (ReadRegisterResponse);
+
+  // Проверка доступности конкретного экземпляра Gateway (используется
+  // Backend'ом для heartbeat в реестре gateways, ТЗ п. 4.1.1).
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message ReadRegisterRequest {
+  string profile = 1;       // "mode_c" | "mode_e" | "hdlc_dlms"
+  string host = 2;
+  int32 port = 3;
+  string serial = 4;
+  string password = 5;      // передаётся только на время вызова (Promt_MMWS.md, раздел 3, принцип 4)
+  string obis = 6;           // 6-байтная hex-нотация A.B.C.D.E.F
+  int32 timeout_ms = 7;      // 0 = использовать значение по умолчанию Gateway
+  int32 retries = 8;         // 0 = использовать значение по умолчанию Gateway
+}
+
+message ReadRegisterResponse {
+  oneof result {
+    ReadValue value = 1;
+    ReadError error = 2;
+  }
+}
+
+message ReadValue {
+  // Значение атрибута DLMS, приведённое к JSON-совместимому виду
+  // (число, строка, список — см. mmws_gateway.protocols.datatypes.decode_value).
+  string value_json = 1;
+}
+
+message ReadError {
+  string code = 1;          // TIMEOUT | AUTH_FAILED | CONNECTION_LOST | CRC_ERROR | GATEWAY_ERROR
+  string message = 2;
+  bool is_partial = 3;
+  string raw_frame_hex = 4; // пусто, если сырой кадр не зафиксирован
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool ok = 1;
+  string driver_version = 2;
+}

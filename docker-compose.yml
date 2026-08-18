@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mmws
+      POSTGRES_PASSWORD: mmws
+      POSTGRES_DB: mmws
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mmws"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  gateway-risesun:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:50051:50051"
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - backend/.env
+    environment:
+      MMWS_DATABASE_URL: postgresql+asyncpg://mmws:mmws@postgres:5432/mmws
+      MMWS_GATEWAY_GRPC_TARGET: gateway-risesun:50051
+    depends_on:
+      postgres:
+        condition: service_healthy
+      gateway-risesun:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8000:8000"
+
+volumes:
+  postgres_data:

@@ -3,13 +3,14 @@ name = "mmws-gateway"
 version = "0.0.1"
 description = "MMWS Protocol Gateway — PoC этапа 0 (Risesun, IEC 62056-21 mode C/E, HDLC-DLMS)"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["grpcio>=1.60", "protobuf>=4"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
 
 [project.scripts]
 gateway = "mmws_gateway.cli:main"
+gateway-grpc-server = "mmws_gateway.grpc_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
