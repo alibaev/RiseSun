@@ -77,3 +77,23 @@ def test_crc_error_recovers_after_retry():
     with _start_server(ErrorInjection(force_crc_error=True, fail_attempts=1)) as server:
         value = _read(server, retries=3)
     assert value == 1234567
+
+
+def test_read_survives_serial_whose_frame_contains_embedded_flag_byte():
+    """Регрессия, найденная на живой проверке 2026-08-18: для серийного
+    номера 999000111222 второй байт HCS GET.request-кадра случайно
+    совпадает с 0x7E — раньше это обрезало кадр и на клиенте, и на
+    сервере (эмулятор использует тот же разбор кадра). Проверяем именно
+    этот серийный номер целиком через эмулятор, а не только сборку
+    кадра изолированно (test_hdlc.py)."""
+    serial = "999000111222"
+    obis_values = {dlms.parse_obis(OBIS): 1234567}
+    counter = ConnectionCounter()
+    handler = make_hdlc_dlms_handler(
+        password=PASSWORD, obis_values=obis_values, error_injection=ErrorInjection(), counter=counter
+    )
+    with ThreadedEmulatorServer(handler) as server:
+        config = TransportConfig(host=server.host, port=server.port, timeout_ms=1000, max_retries=1)
+        with TcpTransport(config) as transport:
+            value = hdlc_dlms.read_register(transport, serial=serial, password=PASSWORD, obis=OBIS)
+    assert value == 1234567

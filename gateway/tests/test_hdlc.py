@@ -1,15 +1,22 @@
 """Тесты HDLC-кадрирования: CRC16/X.25, сборка/разбор кадра."""
 
+import socket
+
 import pytest
 
 from mmws_gateway.errors import CrcError, GatewayError
 from mmws_gateway.protocols.hdlc import (
     CONTROL_SNRM,
+    DEFAULT_CLIENT_ADDRESS,
     FLAG,
     HdlcFrame,
+    control_information_frame,
     crc16_x25,
+    read_frame_from_transport,
     server_hdlc_address,
 )
+from mmws_gateway.protocols import dlms
+from mmws_gateway.transport import TcpServerTransport
 
 
 def test_crc16_x25_known_vector():
@@ -92,3 +99,36 @@ def test_multi_byte_address_round_trip():
 def test_hdlc_address_out_of_range_rejected(bad_address):
     with pytest.raises(ValueError):
         HdlcFrame(destination=bad_address, source=16, control=CONTROL_SNRM).encode()
+
+
+def test_read_frame_handles_embedded_flag_byte_in_body():
+    """Регрессия, найденная на живой проверке 2026-08-18 (счётчик
+    999000111222): второй байт HCS у GET.request-кадра для этого адреса
+    случайно совпадает с 0x7E (FLAG). Чтение кадра сканированием до
+    первого 0x7E (recv_until) обрезало такой кадр раньше времени —
+    read_frame_from_transport должен читать строго по длине из поля
+    Frame Format, независимо от того, что встретится в теле."""
+    request = dlms.build_get_request(dlms.parse_obis("1.1.1.8.0.ff"), invoke_id=1)
+    obis_info = dlms.wrap_llc_command(request)
+    frame = HdlcFrame(
+        destination=server_hdlc_address("11222"),
+        source=DEFAULT_CLIENT_ADDRESS,
+        control=control_information_frame(1, 1),
+        information=obis_info,
+    )
+    encoded = frame.encode()
+    assert 0x7E in encoded[1:-1], "тестовый кейс должен провоцировать именно этот баг"
+
+    server_sock, client_sock = socket.socketpair()
+    try:
+        server_sock.sendall(encoded)
+        server_sock.close()
+        transport = TcpServerTransport.from_accepted_socket(client_sock, peer_host="test", peer_port=0)
+        raw = read_frame_from_transport(transport)
+    finally:
+        client_sock.close()
+
+    assert raw == encoded
+    decoded = HdlcFrame.decode(raw)
+    assert decoded.destination == server_hdlc_address("11222")
+    assert decoded.information == obis_info

@@ -116,8 +116,13 @@ def serve_hdlc_dlms_session(
 
 
 def _read_frame(conn: socket.socket) -> bytes:
+    """Читает кадр по длине из Frame Format, не сканированием на 0x7E —
+    см. подробное обоснование в ``protocols.hdlc.read_frame_from_transport``
+    (тот же баг воспроизводится и на серверной стороне эмулятора)."""
     first = recv_exact(conn, 1)
     if first != bytes([FLAG]):
         raise ConnectionError("Ожидался открывающий флаг HDLC")
-    rest = recv_until(conn, bytes([FLAG]))
-    return first + rest
+    frame_format = recv_exact(conn, 2)
+    declared_len = int.from_bytes(frame_format, "big") & 0x07FF
+    rest = recv_exact(conn, declared_len - 2 + 1)
+    return first + frame_format + rest

@@ -195,11 +195,39 @@ def control_information_frame(send_seq: int, recv_seq: int) -> int:
 
 
 def read_frame_from_transport(transport: TcpTransport) -> bytes:
-    """Читает один HDLC-кадр целиком (от открывающего до закрывающего флага)."""
+    """Читает один HDLC-кадр целиком, опираясь на длину из поля Frame
+    Format — НЕ поиском закрывающего флага сканированием байт.
+
+    Баг, найденный на практике (2026-08-18, при живой проверке с
+    серийным номером 999000111222): байт 0x7E может случайно встретиться
+    внутри тела кадра — в HCS/FCS, которые представляют собой CRC и
+    могут принять любое значение байта. При росте вариативности адреса
+    (4-байтная адресация вместо 1-байтной) вероятность такого совпадения
+    выросла и стала регулярно обрезать кадр раньше времени при разборе
+    через recv_until(FLAG). Настоящий HDLC устраняет это байт-стаффингом
+    на битовом уровне физического канала; при переносе протокола поверх
+    TCP (уже надёжного байтового потока) корректно и достаточно просто
+    довериться длине, объявленной в самом кадре, а не искать флаг.
+    """
     first = transport.recv_exact(1)
     if first != bytes([FLAG]):
         raise GatewayError(
             f"Ожидался открывающий флаг HDLC 0x{FLAG:02X}, получено: {first.hex()}"
         )
-    rest = transport.recv_until(bytes([FLAG]))
-    return first + rest
+    frame_format = transport.recv_exact(2)
+    declared_len = int.from_bytes(frame_format, "big") & 0x07FF
+    if declared_len < 2:
+        raise CrcError(
+            "Некорректная длина в поле Frame Format HDLC-кадра",
+            raw_frame=first + frame_format,
+        )
+    # declared_len считает от frame_format (включительно) до FCS
+    # (включительно); frame_format (2 байта) уже прочитан, поэтому
+    # остаётся declared_len - 2 байт тела и 1 байт закрывающего флага.
+    rest = transport.recv_exact(declared_len - 2 + 1)
+    if rest[-1:] != bytes([FLAG]):
+        raise CrcError(
+            "Не найден закрывающий флаг HDLC на ожидаемой по длине позиции",
+            raw_frame=first + frame_format + rest,
+        )
+    return first + frame_format + rest
