@@ -16,28 +16,42 @@ from ..models import User
 _oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
-async def get_current_user(
-    token: str = Depends(_oauth2_scheme), db: AsyncSession = Depends(get_db)
-) -> User:
-    credentials_error = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Недействительный или истёкший токен",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+class InvalidCredentials(Exception):
+    """Токен недействителен/истёк, либо пользователь неактивен/удалён.
+
+    Отдельное от HTTPException исключение — переиспользуется и HTTP-, и
+    WebSocket-обработчиками (у них разные способы сообщить об отказе).
+    """
+
+
+async def load_user_from_token(token: str, db: AsyncSession) -> User:
     try:
         payload = decode_token(token)
     except JWTError:
-        raise credentials_error
+        raise InvalidCredentials
     if payload.get("type") != "access":
-        raise credentials_error
+        raise InvalidCredentials
     username = payload.get("sub")
     if not username:
-        raise credentials_error
+        raise InvalidCredentials
     result = await db.execute(select(User).where(User.username == username))
     user = result.scalar_one_or_none()
     if user is None or not user.is_active:
-        raise credentials_error
+        raise InvalidCredentials
     return user
+
+
+async def get_current_user(
+    token: str = Depends(_oauth2_scheme), db: AsyncSession = Depends(get_db)
+) -> User:
+    try:
+        return await load_user_from_token(token, db)
+    except InvalidCredentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Недействительный или истёкший токен",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 def require_permission(permission: Permission):

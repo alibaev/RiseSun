@@ -7,8 +7,7 @@ import asyncio
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..auth.deps import get_current_user
-from ..core.security import decode_token
+from ..auth.deps import InvalidCredentials, get_current_user, load_user_from_token
 from ..db import SessionLocal, get_db
 from ..models import Job, JobStatus, User
 from ..schemas import JobOut
@@ -40,8 +39,9 @@ async def stream_job(websocket: WebSocket, job_id: int) -> None:
         await websocket.close(code=4401)
         return
     try:
-        decode_token(token)
-    except Exception:
+        async with SessionLocal() as db:
+            await load_user_from_token(token, db)
+    except InvalidCredentials:
         await websocket.close(code=4401)
         return
 
