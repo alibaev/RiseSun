@@ -1,8 +1,20 @@
 """Транспортный уровень: TCP-соединение со счётчиком (ТЗ п. 4.3.1, Table 1).
 
-Gateway всегда выступает инициатором TCP-соединения к IP-адресу и порту
-счётчика. Таймаут и число повторов конфигурируемы, по умолчанию —
-5000 мс и 3 попытки с возрастающей задержкой.
+ТЗ описывает Gateway как инициатора TCP-соединения к IP-адресу и порту
+счётчика — так и работает ``TcpTransport`` ниже. Таймаут и число
+повторов конфигурируемы, по умолчанию — 5000 мс и 3 попытки с
+возрастающей задержкой.
+
+Проверка на реальном оборудовании Risesun (2026-08-18, см.
+DECISIONS.md) выявила расхождение с этой моделью: как минимум часть
+счётчиков сама инициирует TCP-соединение к Gateway («звонок домой»,
+типично для GPRS-счётчиков без статического IP/за NAT оператора).
+``TcpServerTransport`` ниже — транспорт для этого сценария: не
+подключается сам, а оборачивает уже принятое (``accept()``) соединение.
+Полноценная архитектура серверного режима (постоянный листенер,
+сопоставление входящего соединения с записью в реестре ``meters`` по
+объявленному счётчиком адресу, keepalive) — вне рамок Этапа 0, это
+строительный блок для будущей реализации.
 """
 
 from __future__ import annotations
@@ -145,3 +157,38 @@ class TcpTransport:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+
+class TcpServerTransport(TcpTransport):
+    """Транспорт поверх уже принятого (``accept()``) входящего соединения.
+
+    Используется для счётчиков в режиме «звонок домой» (см. docstring
+    модуля). В отличие от базового ``TcpTransport``, не подключается сам
+    — ``connect_with_retries()`` для этого класса недопустим.
+    """
+
+    @classmethod
+    def from_accepted_socket(
+        cls,
+        sock: socket.socket,
+        *,
+        peer_host: str,
+        peer_port: int,
+        timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    ) -> "TcpServerTransport":
+        transport = cls.__new__(cls)
+        transport._config = TransportConfig(
+            host=peer_host, port=peer_port, timeout_ms=timeout_ms, max_retries=1
+        )
+        sock.settimeout(timeout_ms / 1000)
+        transport._sock = sock
+        return transport
+
+    def connect_with_retries(self) -> None:
+        raise GatewayError(
+            "TcpServerTransport оборачивает уже принятое соединение — "
+            "connect_with_retries() здесь не применим"
+        )
+
+    def __enter__(self) -> "TcpServerTransport":
+        return self

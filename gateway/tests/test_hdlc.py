@@ -8,7 +8,7 @@ from mmws_gateway.protocols.hdlc import (
     FLAG,
     HdlcFrame,
     crc16_x25,
-    encode_server_address,
+    server_hdlc_address,
 )
 
 
@@ -58,12 +58,37 @@ def test_decode_detects_corrupted_hcs():
         HdlcFrame.decode(bytes(encoded))
 
 
-def test_encode_server_address_wraps_into_7_bits():
-    # Последние 5 цифр серийного номера могут превышать 127 — адрес приводится по модулю.
-    assert 0 <= encode_server_address("99999") <= 0x7F
+def test_server_hdlc_address_matches_real_capture():
+    # Проверено на реальном счётчике Risesun 202001002352 (2026-08-18):
+    # upper=1 (логическое устройство), lower=2352 (последние 5 цифр серийного) -> 18736.
+    assert server_hdlc_address("02352") == (1 << 14) | 2352
 
 
-@pytest.mark.parametrize("bad_address", [-1, 128, 999])
+def test_server_hdlc_address_supports_up_to_14_bit_physical_address():
+    # Раньше адрес приводился по модулю 128 — теперь влезает до 14 бит (16383),
+    # этого достаточно для обоих проверенных реальных счётчиков (2352, 4113).
+    assert server_hdlc_address("16383") == (1 << 14) | 16383
+
+
+def test_server_hdlc_address_rejects_5_digit_overflow():
+    # Известное ограничение (см. DECISIONS.md, 2026-08-18): last-5-digits
+    # серийного может доходить до 99999, что превышает 14-битный lower —
+    # редкий случай, требующий отдельного решения при встрече на практике.
+    with pytest.raises(ValueError):
+        server_hdlc_address("99999")
+
+
+def test_multi_byte_address_round_trip():
+    # 18736 не влезает в 1 байт (127) и не влезает в 2 байта (16383) —
+    # требует 4-байтной адресации, подтверждённой реальным трафиком.
+    frame = HdlcFrame(destination=18736, source=48, control=CONTROL_SNRM)
+    encoded = frame.encode()
+    decoded = HdlcFrame.decode(encoded)
+    assert decoded.destination == 18736
+    assert decoded.source == 48
+
+
+@pytest.mark.parametrize("bad_address", [-1, 2**28])
 def test_hdlc_address_out_of_range_rejected(bad_address):
     with pytest.raises(ValueError):
         HdlcFrame(destination=bad_address, source=16, control=CONTROL_SNRM).encode()

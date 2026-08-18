@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+TAG_ARRAY = 0x01  # count (1 байт) + N вложенных значений
+TAG_STRUCTURE = 0x02  # count (1 байт) + N вложенных значений
 TAG_DOUBLE_LONG = 0x05  # int32, big-endian
 TAG_DOUBLE_LONG_UNSIGNED = 0x06  # uint32, big-endian
 TAG_OCTET_STRING = 0x09  # длина (1 байт) + сырые байты
@@ -24,8 +26,18 @@ TAG_INTEGER = 0x0F  # int8
 TAG_LONG = 0x10  # int16, big-endian
 TAG_UNSIGNED = 0x11  # uint8
 TAG_LONG_UNSIGNED = 0x12  # uint16, big-endian
+TAG_LONG64 = 0x14  # int64, big-endian
+TAG_LONG64_UNSIGNED = 0x15  # uint64, big-endian
+TAG_ENUM = 0x16  # uint8 (перечисление, напр. код единицы измерения)
+
+# array/structure(0x02)/long64/enum добавлены по итогам разбора реального
+# трафика Risesun 2026-08-18 (структура scaler_unit, вендорское значение
+# показания у одного из счётчиков в int64) — не входили в минимальный
+# набор Этапа 0.
 
 _TAG_NAMES = {
+    TAG_ARRAY: "array",
+    TAG_STRUCTURE: "structure",
     TAG_DOUBLE_LONG: "double-long",
     TAG_DOUBLE_LONG_UNSIGNED: "double-long-unsigned",
     TAG_OCTET_STRING: "octet-string",
@@ -34,6 +46,9 @@ _TAG_NAMES = {
     TAG_LONG: "long",
     TAG_UNSIGNED: "unsigned",
     TAG_LONG_UNSIGNED: "long-unsigned",
+    TAG_LONG64: "long64",
+    TAG_LONG64_UNSIGNED: "long64-unsigned",
+    TAG_ENUM: "enum",
 }
 
 
@@ -98,13 +113,19 @@ def decode_value(data: bytes, offset: int = 0) -> tuple[object, int]:
     if tag == TAG_DOUBLE_LONG:
         _require(data, pos, 4)
         return int.from_bytes(data[pos : pos + 4], "big", signed=True), 5
+    if tag == TAG_LONG64_UNSIGNED:
+        _require(data, pos, 8)
+        return int.from_bytes(data[pos : pos + 8], "big", signed=False), 9
+    if tag == TAG_LONG64:
+        _require(data, pos, 8)
+        return int.from_bytes(data[pos : pos + 8], "big", signed=True), 9
     if tag == TAG_LONG_UNSIGNED:
         _require(data, pos, 2)
         return int.from_bytes(data[pos : pos + 2], "big", signed=False), 3
     if tag == TAG_LONG:
         _require(data, pos, 2)
         return int.from_bytes(data[pos : pos + 2], "big", signed=True), 3
-    if tag == TAG_UNSIGNED:
+    if tag in (TAG_UNSIGNED, TAG_ENUM):
         _require(data, pos, 1)
         return data[pos], 2
     if tag == TAG_INTEGER:
@@ -118,6 +139,16 @@ def decode_value(data: bytes, offset: int = 0) -> tuple[object, int]:
         raw = data[pos : pos + length]
         value = raw.decode("ascii") if tag == TAG_VISIBLE_STRING else raw
         return value, (pos + length) - offset
+    if tag in (TAG_ARRAY, TAG_STRUCTURE):
+        _require(data, pos, 1)
+        count = data[pos]
+        pos += 1
+        items = []
+        for _ in range(count):
+            item, consumed = decode_value(data, offset=pos)
+            items.append(item)
+            pos += consumed
+        return items, pos - offset
 
     raise DlmsDataError(f"Неподдержанный тег типа данных DLMS: 0x{tag:02X}")
 

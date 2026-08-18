@@ -28,6 +28,28 @@ from . import datatypes
 AARQ_TAG = 0x60
 AARE_TAG = 0x61
 
+# LLC-заголовок (Logical Link Control) поверх информационного поля
+# HDLC-кадра, несущего DLMS/ACSE-данные (IEC 8802-2 LLC1, используется
+# для COSEM-over-HDLC). Проверено на реальном трафике Risesun
+# 2026-08-18: кадры от клиента к счётчику начинаются с ``E6 E6 00``,
+# ответные — с ``E6 E7 00``. В ранней версии PoC не учитывалось.
+LLC_COMMAND_HEADER = bytes([0xE6, 0xE6, 0x00])
+LLC_RESPONSE_HEADER = bytes([0xE6, 0xE7, 0x00])
+
+
+def wrap_llc_command(data: bytes) -> bytes:
+    return LLC_COMMAND_HEADER + data
+
+
+def wrap_llc_response(data: bytes) -> bytes:
+    return LLC_RESPONSE_HEADER + data
+
+
+def unwrap_llc(data: bytes) -> bytes:
+    if len(data) < 3 or data[0] != 0xE6 or data[1] not in (0xE6, 0xE7) or data[2] != 0x00:
+        raise GatewayError(f"Некорректный или отсутствующий LLC-заголовок: {data[:3].hex()}")
+    return data[3:]
+
 GET_REQUEST_TAG = 0xC0
 GET_REQUEST_NORMAL = 0x01
 GET_RESPONSE_TAG = 0xC4
@@ -42,6 +64,18 @@ AARE_DIAGNOSTIC_AUTH_FAILURE = 13  # authenticationFailure (Green Book acse-serv
 
 # application-context-name «LN referencing, без шифрования» — {2 16 756 5 8 1 1}
 APPLICATION_CONTEXT_LN_NO_CIPHERING = (2, 16, 756, 5, 8, 1, 1)
+# mechanism-name «Low Level Security» — {2 16 756 5 8 2 1}
+MECHANISM_NAME_LLS = (2, 16, 756, 5, 8, 2, 1)
+
+# sender-acse-requirements (тег 0x8A) и user-information/InitiateRequest
+# (тег 0xBE) — фиксированные значения, не зависящие от пароля/счётчика,
+# подтверждены побайтово одинаковыми в обоих реальных сеансах Risesun
+# (2026-08-18): authentication-функция и стандартный набор
+# proposed-conformance/max-pdu-size. Полный разбор/сборка InitiateRequest
+# по BER — избыточно для Этапа 0, см. общую оговорку об упрощении ACSE
+# в начале модуля.
+SENDER_ACSE_REQUIREMENTS = bytes.fromhex("8a020780")
+USER_INFORMATION_INITIATE = bytes.fromhex("be10040e01000000065f1f040000081d0000")
 
 REGISTER_CLASS_ID = 3
 REGISTER_VALUE_ATTRIBUTE = 2
@@ -84,12 +118,32 @@ def parse_obis(text: str) -> bytes:
 
 
 def build_aarq(password: bytes) -> bytes:
-    """Строит AARQ с calling-authentication-value = пароль низкого уровня."""
-    oid = encode_oid(APPLICATION_CONTEXT_LN_NO_CIPHERING)
-    application_context = bytes([0xA1, len(oid) + 2, 0x06, len(oid)]) + oid
+    """Строит AARQ с calling-authentication-value = пароль низкого уровня.
+
+    Состав полей (application-context, sender-acse-requirements,
+    mechanism-name, calling-authentication-value, user-information)
+    сверен побайтово с реальным трафиком Risesun — без
+    sender-acse-requirements/mechanism-name/user-information реальный
+    счётчик ассоциацию не примет (см. DECISIONS.md, 2026-08-18).
+    """
+    context_oid = encode_oid(APPLICATION_CONTEXT_LN_NO_CIPHERING)
+    application_context = bytes([0xA1, len(context_oid) + 2, 0x06, len(context_oid)]) + context_oid
+    mechanism_oid = encode_oid(MECHANISM_NAME_LLS)
+    mechanism_name = bytes([0x8B, len(mechanism_oid)]) + mechanism_oid
     auth_value = bytes([0x80, len(password)]) + password
     calling_auth = bytes([0xAC, len(auth_value)]) + auth_value
-    body = application_context + calling_auth
+    body = (
+        application_context
+        + SENDER_ACSE_REQUIREMENTS
+        + mechanism_name
+        + calling_auth
+        + USER_INFORMATION_INITIATE
+    )
+    if len(body) > 0x7F:
+        raise GatewayError(
+            "AARQ длиннее 127 байт — короткая форма длины BER не подходит (не ожидается "
+            "при пароле LLS фиксированной длины 8 символов, ТЗ п. 4.3.3)"
+        )
     return bytes([AARQ_TAG, len(body)]) + body
 
 
@@ -129,26 +183,50 @@ def build_aare(*, accepted: bool) -> bytes:
     return bytes([AARE_TAG, len(body)]) + body
 
 
+_AARE_RESULT_TAG = 0xA2
+
+
 def parse_aare(data: bytes) -> bool:
-    """Возвращает True, если ассоциация принята; иначе бросает AuthFailedError."""
+    """Возвращает True, если ассоциация принята; иначе бросает AuthFailedError.
+
+    Поле ``result`` (тег 0xA2) ищется сканированием TLV, а не по
+    фиксированной позиции — реальный AARE (в отличие от упрощённого
+    ``build_aare`` ниже) содержит перед ним application-context (тег
+    0xA1), см. DECISIONS.md, 2026-08-18.
+    """
     if not data or data[0] != AARE_TAG:
         raise GatewayError("Ожидался AARE (тег 0x61)")
     body = data[2 : 2 + data[1]]
-    if len(body) < 5 or body[0] != 0xA2:
+    pos = 0
+    result: int | None = None
+    while pos + 1 < len(body):
+        tag = body[pos]
+        length = body[pos + 1]
+        content = body[pos + 2 : pos + 2 + length]
+        if tag == _AARE_RESULT_TAG and len(content) >= 3:
+            result = content[2]
+        pos += 2 + length
+    if result is None:
         raise GatewayError("Некорректное поле result в AARE")
-    result = body[4]
     if result == AARE_RESULT_ACCEPTED:
         return True
     raise AuthFailedError("Счётчик отклонил ассоциацию (неверный пароль доступа)")
 
 
-def build_get_request(obis: bytes, *, invoke_id: int = 1) -> bytes:
+def build_get_request(
+    obis: bytes, *, invoke_id: int = 1, attribute_id: int = REGISTER_VALUE_ATTRIBUTE
+) -> bytes:
+    """``attribute_id`` по умолчанию — 2 (value). Атрибут 3 (scaler_unit)
+    нужен для чтения масштаба/единицы измерения перед интерпретацией
+    значения (подтверждено реальным трафиком Risesun — легитимный
+    клиент читает scaler_unit отдельным GET перед value, см.
+    DECISIONS.md, 2026-08-18)."""
     if len(obis) != 6:
         raise GatewayError("OBIS для GET.request должен быть ровно 6 байт")
     descriptor = (
         REGISTER_CLASS_ID.to_bytes(2, "big")
         + obis
-        + bytes([REGISTER_VALUE_ATTRIBUTE])
+        + bytes([attribute_id])
     )
     return (
         bytes([GET_REQUEST_TAG, GET_REQUEST_NORMAL, invoke_id])

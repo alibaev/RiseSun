@@ -72,21 +72,21 @@ def serve_hdlc_dlms_session(
     conn.sendall(ua.encode())
 
     aarq_frame = HdlcFrame.decode(_read_frame(conn))
-    parsed_aarq = dlms.parse_aarq(aarq_frame.information)
+    parsed_aarq = dlms.parse_aarq(dlms.unwrap_llc(aarq_frame.information))
     accepted = (not error_injection.force_auth_fail) and parsed_aarq.password == password
     aare = dlms.build_aare(accepted=accepted)
     aare_frame = HdlcFrame(
         destination=aarq_frame.source,
         source=aarq_frame.destination,
         control=control_information_frame(0, 1),
-        information=aare,
+        information=dlms.wrap_llc_response(aare),
     )
     conn.sendall(aare_frame.encode())
     if not accepted:
         return
 
     get_frame = HdlcFrame.decode(_read_frame(conn))
-    get_request = dlms.parse_get_request(get_frame.information)
+    get_request = dlms.parse_get_request(dlms.unwrap_llc(get_frame.information))
     value = obis_values.get(get_request.obis)
     if value is None:
         info = dlms.build_get_response_error(get_request.invoke_id, OBJECT_UNDEFINED)
@@ -98,7 +98,7 @@ def serve_hdlc_dlms_session(
         destination=get_frame.source,
         source=get_frame.destination,
         control=control_information_frame(1, 2),
-        information=info,
+        information=dlms.wrap_llc_response(info),
     )
     encoded = response_frame.encode()
 

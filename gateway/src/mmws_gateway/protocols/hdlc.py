@@ -14,12 +14,18 @@ Frame Format: старшие 4 бита — тип кадра (0xA для фор
 сегментация длинных ответов не реализована (ограничение PoC, полная
 докачка — Этап 3 согласно Promt_MMWS.md).
 
-Адреса HDLC кодируются однобайтно: (адрес << 1) | признак_последнего_байта.
-В Этапе 0 поддержаны только физические адреса, умещающиеся в 7 бит
-(0..127) — этого достаточно для последних 5 цифр серийного номера,
-приведённых по модулю (см. ``encode_server_address``); при выходе за
-диапазон потребуется двух- или трёхбайтная адресация DLMS (не
-реализована в PoC).
+Адресация HDLC (проверено на реальном оборудовании Risesun, 2026-08-18):
+адресное поле — 1, 2 или 4 байта. Значение разбивается на 7-битные
+группы (big-endian); каждый байт кодируется как
+``(группа << 1) | признак_последнего_байта_ПОЛЯ_ЦЕЛИКОМ`` — признак
+установлен только у самого последнего байта всего адресного поля, а не
+у каждой логической части. Двухкомпонентный (4-байтный) адрес счётчика
+— верхний адрес (логическое устройство, на практике всегда 1) и нижний
+адрес (физический адрес счётчика) — кодируется как единое 28-битное
+значение ``(upper << 14) | lower`` этой же схемой, см.
+``server_hdlc_address``. Более раннее предположение PoC (адрес всегда
+влезает в 7 бит, приводится по модулю 128) опровергнуто реальными
+данными и удалено.
 """
 
 from __future__ import annotations
@@ -32,7 +38,9 @@ from ..transport import TcpTransport
 FLAG = 0x7E
 FRAME_TYPE_NIBBLE = 0xA0  # тип кадра «формат 3», без сегментации
 
-DEFAULT_CLIENT_ADDRESS = 0x10  # публичный клиент (общепринятое значение Green Book)
+DEFAULT_CLIENT_ADDRESS = 0x30  # подтверждено реальным трафиком (Risesun, оба счётчика)
+
+_ADDRESS_LENGTHS = (1, 2, 4)  # допустимые длины адресного поля HDLC (3 байта не используются)
 
 
 def crc16_x25(data: bytes) -> int:
@@ -53,17 +61,34 @@ def crc16_x25(data: bytes) -> int:
 
 
 def _encode_hdlc_address(value: int) -> bytes:
-    if not 0 <= value <= 0x7F:
+    if value < 0:
+        raise ValueError(f"Адрес {value} отрицательный — недопустимо")
+    for num_bytes in _ADDRESS_LENGTHS:
+        if value < (1 << (7 * num_bytes)):
+            chunks = [(value >> (7 * (num_bytes - 1 - i))) & 0x7F for i in range(num_bytes)]
+            return bytes(
+                (chunk << 1) | (1 if i == num_bytes - 1 else 0) for i, chunk in enumerate(chunks)
+            )
+    raise ValueError(
+        f"Адрес {value} превышает максимум 4-байтной адресации HDLC (2**28 - 1)"
+    )
+
+
+def server_hdlc_address(physical_address: str, *, logical_device: int = 1) -> int:
+    """Строит адрес счётчика для 4-байтной двухкомпонентной адресации.
+
+    ``upper`` (логическое устройство, на практике всегда 1) и ``lower``
+    (физический адрес счётчика) кодируются как единое 28-битное число
+    ``(upper << 14) | lower`` — см. docstring модуля. Подтверждено
+    реальным трафиком Risesun (``upper=1`` в обоих проверенных сеансах).
+    """
+    lower = int(physical_address)
+    if not 0 <= logical_device < (1 << 14) or not 0 <= lower < (1 << 14):
         raise ValueError(
-            f"Адрес {value} вне диапазона однобайтной адресации HDLC (0..127), "
-            "поддержанной в Этапе 0"
+            f"Компоненты адреса вне диапазона 14 бит: logical_device={logical_device}, "
+            f"physical_address={lower}"
         )
-    return bytes([(value << 1) | 1])
-
-
-def encode_server_address(physical_address: str) -> int:
-    """Приводит физический адрес счётчика (строка цифр) к 7-битному адресу HDLC."""
-    return int(physical_address) % 0x80
+    return (logical_device << 14) | lower
 
 
 @dataclass
@@ -124,19 +149,40 @@ class HdlcFrame:
 
 
 def _decode_hdlc_address(body: bytes, offset: int) -> tuple[int, int]:
-    """Разбирает однобайтный адрес HDLC (бит расширения — младший бит)."""
-    byte = body[offset]
-    if not byte & 1:
-        raise GatewayError(
-            "Многобайтная адресация HDLC не поддержана в Этапе 0 (см. ограничение PoC)"
-        )
-    return byte >> 1, 1
+    """Разбирает адресное поле HDLC (1, 2 или 4 байта — см. docstring модуля).
+
+    Читает байты, пока не встретит байт с установленным младшим битом
+    (признак последнего байта поля); из них восстанавливает исходное
+    значение обратной сборкой 7-битных групп.
+    """
+    value = 0
+    length = 0
+    max_len = _ADDRESS_LENGTHS[-1]
+    while True:
+        if offset + length >= len(body) or length >= max_len:
+            raise GatewayError(
+                f"Адресное поле HDLC превышает {max_len} байт без признака конца"
+            )
+        byte = body[offset + length]
+        value = (value << 7) | (byte >> 1)
+        length += 1
+        if byte & 1:
+            break
+    return value, length
 
 
 # Управляющие байты для установления/разрыва логического соединения HDLC.
 CONTROL_SNRM = 0x93  # Set Normal Response Mode
 CONTROL_UA = 0x73  # Unnumbered Acknowledge
 CONTROL_DISC = 0x53  # Disconnect
+
+# Согласование HDLC-параметров (max info length tx/rx, window size tx/rx)
+# в информационном поле SNRM — байты сверены с реальным трафиком Risesun
+# (одинаковы в обоих проверенных сеансах, не зависят от счётчика/пароля).
+# Без этого поля реакция реального оборудования не проверялась — решено
+# отправлять точно то же, что и рабочее legacy-приложение, а не
+# полагаться на умолчания.
+SNRM_PARAMETER_NEGOTIATION = bytes.fromhex("8180120501ff0601ff070400000001080400000001")
 
 
 def control_information_frame(send_seq: int, recv_seq: int) -> int:
