@@ -178,3 +178,40 @@ async def test_observer_can_list_meters_but_not_trigger_read(client, db_session)
 async def test_unauthenticated_request_rejected(client):
     resp = await client.get("/api/meters")
     assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_delete_meter_with_history_returns_409_not_500(client, db_session):
+    # Регрессия (найдена при ручной проверке 2026-08-18): удаление
+    # счётчика с показаниями роняло 500 через необработанный FK-конфликт
+    # вместо понятной ошибки.
+    from app.models import Job, JobStatus, Meter, MeterReading, ProtocolProfile
+    from app.core.security import encrypt_secret
+
+    root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    db_session.add(
+        Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    )
+    await db_session.flush()
+    meter = Meter(
+        serial_number="202006003607",
+        ip_address="127.0.0.1",
+        port=4059,
+        protocol_profile=ProtocolProfile.HDLC_DLMS,
+        password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=1,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    db_session.add(MeterReading(meter_id=meter.id, obis_code="1.1.1.8.0.ff", value_json=123))
+    db_session.add(Job(job_type="read_current", meter_id=meter.id, status=JobStatus.SUCCEEDED, payload={}))
+    await db_session.commit()
+
+    token = await _login(client, "root", "pass1234")
+    resp = await client.delete(f"/api/meters/{meter.id}", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 409
+    assert "деактивируйте" in resp.text.lower()
+
+    # Счётчик по-прежнему на месте — DELETE не оставил БД в промежуточном состоянии.
+    get_resp = await client.get(f"/api/meters/{meter.id}", headers={"Authorization": f"Bearer {token}"})
+    assert get_resp.status_code == 200

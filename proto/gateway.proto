@@ -22,13 +22,19 @@ service GatewayService {
 
 message ReadRegisterRequest {
   string profile = 1;       // "mode_c" | "mode_e" | "hdlc_dlms"
-  string host = 2;
-  int32 port = 3;
+  string host = 2;           // игнорируется при call_home=true
+  int32 port = 3;             // игнорируется при call_home=true
   string serial = 4;
   string password = 5;      // передаётся только на время вызова (Promt_MMWS.md, раздел 3, принцип 4)
   string obis = 6;           // 6-байтная hex-нотация A.B.C.D.E.F
   int32 timeout_ms = 7;      // 0 = использовать значение по умолчанию Gateway
   int32 retries = 8;         // 0 = использовать значение по умолчанию Gateway
+  // Счётчик сам инициирует TCP-соединение к Gateway ("звонок домой" —
+  // расхождение с ТЗ Table 1, подтверждено на реальном оборудовании
+  // Risesun 2026-08-18, см. DECISIONS.md). При true Gateway не набирает
+  // host:port, а берёт уже установленное соединение из пула call-home
+  // листенера (protocols/callhome.py), подобранное по serial.
+  bool call_home = 9;
 }
 
 message ReadRegisterResponse {

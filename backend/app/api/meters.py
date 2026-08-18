@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth.deps import require_permission
@@ -138,7 +139,25 @@ async def delete_meter(
     meter = await db.get(Meter, meter_id)
     if meter is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Счётчик не найден")
+
     await db.delete(meter)
+    try:
+        await db.flush()
+    except IntegrityError:
+        # Найдено при ручной проверке (2026-08-18): показания/задачи/журналы
+        # ссылаются на счётчик по FK без каскада — удаление роняло 500
+        # вместо понятной ошибки. История счётчика — фактически часть
+        # аудита, поэтому удаление с историей запрещено осознанно
+        # (не каскадное удаление), а не просто "починено" молча.
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Нельзя удалить счётчик — с ним связаны показания, задачи "
+                "или журналы. Деактивируйте счётчик (is_active=false) вместо удаления."
+            ),
+        )
+
     await record_audit(
         db, user_id=user.id, action="meter.delete", object_type="meter",
         object_id=str(meter_id), ip_address=request.client.host if request.client else None,
