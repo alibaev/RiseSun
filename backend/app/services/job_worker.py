@@ -20,10 +20,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import settings
 from ..core.security import decrypt_secret
 from ..db import SessionLocal
-from ..models import Job, JobStatus, Meter, MeterReading
-from .gateway_client import read_register
+from ..models import Job, JobStatus, Meter, MeterReading, ParameterWriteHistory, ParameterWriteResult
+from .audit import record_audit
+from .gateway_client import read_register, write_register
 
 logger = logging.getLogger("mmws_backend.job_worker")
+
+# Этап 2, ТЗ п.4.2.4 («дата и время счётчика») + п.4.2.11 («Установить
+# время»). Словарь OBIS (лист RW_Tree_параметры): «Current Time» и
+# «Current Date» — ДВА отдельных объекта класса 1 (Data), не единый
+# DLMS Clock (класс 8). Кодировка байт значения — лучшее приближение по
+# листу «Типы_данных_кодирование» словаря OBIS (Type_ID=6 «Time»,
+# формат hhmmss, 3 байта; Type_ID=5 «Date and Week», формат YYMMDDWW,
+# 4 байта; BitType не указан как BCD ни для одной из этих записей, в
+# отличие от энергии/тока — значит сырые двоичные байты, не BCD) — НЕ
+# подтверждено на реальном оборудовании, требует сверки при живой
+# проверке записи (см. DECISIONS.md).
+_DATETIME_TIME_OBIS = "1.0.0.9.1.ff"
+_DATETIME_DATE_OBIS = "1.0.0.9.2.ff"
+_DATA_CLASS_ID = 1
 
 
 async def _claim_next_job(db: AsyncSession) -> Job | None:
@@ -60,11 +75,18 @@ async def _run_read_current(db: AsyncSession, job: Job) -> None:
     outcome = await read_register(
         grpc_target=gateway.grpc_target if gateway else settings.gateway_grpc_target,
         profile=meter.protocol_profile.value,
-        host=meter.ip_address,
-        port=meter.port,
+        host=meter.ip_address or "",
+        port=meter.port or 0,
+        call_home=meter.is_call_home,
         serial=meter.serial_number,
         password=password,
         obis=obis,
+        # call-home ждёт, пока звонящий счётчик установит и подтвердит
+        # соединение (см. callhome.read_via_call_home, max_wait_s=150с —
+        # gateway/src/mmws_gateway/grpc_server.py) — даём Backend'у чуть
+        # больше времени, чем сам Gateway готов ждать, чтобы не отвалиться
+        # раньше него самого.
+        call_timeout_s=160.0 if meter.is_call_home else 60.0,
     )
 
     now = datetime.now(timezone.utc)
@@ -85,8 +107,104 @@ async def _run_read_current(db: AsyncSession, job: Job) -> None:
     await db.commit()
 
 
+async def _run_write_datetime(db: AsyncSession, job: Job) -> None:
+    """Устанавливает текущее (системное, UTC) время/дату на счётчике —
+    ТЗ п.4.2.4/4.2.11. Перед каждой записью пытается прочитать прежнее
+    значение (best-effort — используется существующий путь чтения,
+    ошибка чтения не прерывает запись, просто ``old_value`` останется
+    неизвестным) — обе категории фиксируются в parameter_write_history
+    БЕЗУСЛОВНО, независимо от успеха (принцип 2 Promt_MMWS.md, раздел 3)."""
+    meter = await db.get(Meter, job.meter_id)
+    if meter is None:
+        job.status = JobStatus.FAILED
+        job.error = {"code": "METER_NOT_FOUND", "message": f"Счётчик id={job.meter_id} не найден"}
+        job.finished_at = datetime.now(timezone.utc)
+        await db.commit()
+        return
+
+    gateway = meter.gateway
+    grpc_target = gateway.grpc_target if gateway else settings.gateway_grpc_target
+    password = decrypt_secret(meter.password_encrypted).decode("ascii")
+    now = datetime.now(timezone.utc)
+
+    entries = [
+        ("datetime.time", _DATETIME_TIME_OBIS, bytes([now.hour, now.minute, now.second])),
+        ("datetime.date", _DATETIME_DATE_OBIS, bytes([now.year % 100, now.month, now.day, now.isoweekday()])),
+    ]
+
+    overall_ok = True
+    results: dict[str, dict] = {}
+    for parameter, obis, value_bytes in entries:
+        old_read = await read_register(
+            grpc_target=grpc_target,
+            profile=meter.protocol_profile.value,
+            host=meter.ip_address or "",
+            port=meter.port or 0,
+            call_home=meter.is_call_home,
+            serial=meter.serial_number,
+            password=password,
+            obis=obis,
+            class_id=_DATA_CLASS_ID,
+            call_timeout_s=60.0,
+        )
+        old_value = old_read.value if old_read.ok else None
+
+        outcome = await write_register(
+            grpc_target=grpc_target,
+            profile=meter.protocol_profile.value,
+            host=meter.ip_address or "",
+            port=meter.port or 0,
+            call_home=meter.is_call_home,
+            serial=meter.serial_number,
+            password=password,
+            obis=obis,
+            class_id=_DATA_CLASS_ID,
+            value_bytes=value_bytes,
+            call_timeout_s=60.0,
+        )
+        new_value = value_bytes.hex()
+        result = ParameterWriteResult.SUCCESS if outcome.ok else ParameterWriteResult.FAILURE
+        db.add(
+            ParameterWriteHistory(
+                user_id=job.created_by_id,
+                meter_id=meter.id,
+                parameter=parameter,
+                obis_code=obis,
+                old_value=old_value,
+                new_value=new_value,
+                result=result,
+                error_message=None if outcome.ok else outcome.error_message,
+                job_id=job.id,
+            )
+        )
+        await record_audit(
+            db,
+            user_id=job.created_by_id,
+            action="meter.write_parameter",
+            object_type="meter",
+            object_id=str(meter.id),
+            result="success" if outcome.ok else "failure",
+            source="system",
+            details={"parameter": parameter, "obis": obis, "old_value": old_value, "new_value": new_value},
+        )
+        results[parameter] = {"ok": outcome.ok, "error": None if outcome.ok else outcome.error_message}
+        if not outcome.ok:
+            overall_ok = False
+
+    job.status = JobStatus.SUCCEEDED if overall_ok else JobStatus.FAILED
+    job.result = results
+    if not overall_ok:
+        job.error = {
+            "code": "WRITE_FAILED",
+            "message": "Не удалось записать один или оба параметра даты/времени",
+        }
+    job.finished_at = datetime.now(timezone.utc)
+    await db.commit()
+
+
 _JOB_HANDLERS = {
     "read_current": _run_read_current,
+    "write_datetime": _run_write_datetime,
 }
 
 

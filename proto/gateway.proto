@@ -15,6 +15,11 @@ service GatewayService {
   // относительно пользователей/задач (Promt_MMWS.md, раздел 3, принцип 1).
   rpc ReadRegister(ReadRegisterRequest) returns (ReadRegisterResponse);
 
+  // Записывает один атрибут COSEM-объекта (Этап 2, ТЗ п. 4.2.4). Как и
+  // ReadRegister — синхронный RPC, асинхронность и аудит записи
+  // (parameter_write_history) реализуются на стороне Backend.
+  rpc WriteRegister(WriteRegisterRequest) returns (WriteRegisterResponse);
+
   // Проверка доступности конкретного экземпляра Gateway (используется
   // Backend'ом для heartbeat в реестре gateways, ТЗ п. 4.1.1).
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
@@ -35,6 +40,11 @@ message ReadRegisterRequest {
   // host:port, а берёт уже установленное соединение из пула call-home
   // листенера (protocols/callhome.py), подобранное по serial.
   bool call_home = 9;
+  // COSEM class-id для запрашиваемого объекта. 0 = использовать
+  // дефолт Gateway (Register, класс 3). Параметры Этапа 2 (напр.
+  // «Current Time»/«Current Date», словарь OBIS RW_Tree_параметры) —
+  // класс 1 (Data).
+  int32 class_id = 10;
 }
 
 message ReadRegisterResponse {
@@ -55,6 +65,39 @@ message ReadError {
   string message = 2;
   bool is_partial = 3;
   string raw_frame_hex = 4; // пусто, если сырой кадр не зафиксирован
+}
+
+message WriteRegisterRequest {
+  string profile = 1;       // Этап 2 реализован только для "hdlc_dlms"
+  string host = 2;
+  int32 port = 3;
+  string serial = 4;
+  string password = 5;
+  string obis = 6;
+  int32 class_id = 7;        // 0 = дефолт Gateway (Register, класс 3)
+  int32 attribute_id = 8;    // 0 = дефолт Gateway (2 = value)
+  // Значение кодируется на стороне Gateway (Backend не знает DLMS —
+  // Promt_MMWS.md, раздел 3, принцип 1) по дискриминатору value_type.
+  // Сейчас поддержан только "octet_string"; остальные Common-Data-Types
+  // добавляются по мере реализации следующих категорий записи (ТЗ
+  // п.4.2.4: режимы отображения, тарифное расписание, профиль
+  // нагрузки, GPRS).
+  string value_type = 9;     // "octet_string"
+  bytes value_bytes = 10;    // сырое содержимое для value_type="octet_string"
+  int32 timeout_ms = 11;
+  int32 retries = 12;
+  bool call_home = 13;       // пока не реализовано, см. WriteError
+}
+
+message WriteRegisterResponse {
+  oneof result {
+    WriteSuccess success = 1;
+    ReadError error = 2;     // тот же формат ошибки, что и у чтения
+  }
+}
+
+message WriteSuccess {
+  bool ok = 1;
 }
 
 message HealthCheckRequest {}

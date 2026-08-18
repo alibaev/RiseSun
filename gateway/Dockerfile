@@ -6,6 +6,6 @@ COPY gateway/pyproject.toml gateway/pyproject.toml
 COPY gateway/src gateway/src
 RUN pip install --no-cache-dir -e gateway
 
-EXPOSE 50051
+EXPOSE 50051 2009
 
 CMD ["python", "-m", "mmws_gateway.grpc_server"]

@@ -39,6 +39,11 @@ class GatewayServiceStub:
                 request_serializer=gateway__pb2.ReadRegisterRequest.SerializeToString,
                 response_deserializer=gateway__pb2.ReadRegisterResponse.FromString,
                 _registered_method=True)
+        self.WriteRegister = channel.unary_unary(
+                '/mmws.gateway.v1.GatewayService/WriteRegister',
+                request_serializer=gateway__pb2.WriteRegisterRequest.SerializeToString,
+                response_deserializer=gateway__pb2.WriteRegisterResponse.FromString,
+                _registered_method=True)
         self.HealthCheck = channel.unary_unary(
                 '/mmws.gateway.v1.GatewayService/HealthCheck',
                 request_serializer=gateway__pb2.HealthCheckRequest.SerializeToString,
@@ -59,6 +64,15 @@ class GatewayServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def WriteRegister(self, request, context):
+        """Записывает один атрибут COSEM-объекта (Этап 2, ТЗ п. 4.2.4). Как и
+        ReadRegister — синхронный RPC, асинхронность и аудит записи
+        (parameter_write_history) реализуются на стороне Backend.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def HealthCheck(self, request, context):
         """Проверка доступности конкретного экземпляра Gateway (используется
         Backend'ом для heartbeat в реестре gateways, ТЗ п. 4.1.1).
@@ -74,6 +88,11 @@ def add_GatewayServiceServicer_to_server(servicer, server):
                     servicer.ReadRegister,
                     request_deserializer=gateway__pb2.ReadRegisterRequest.FromString,
                     response_serializer=gateway__pb2.ReadRegisterResponse.SerializeToString,
+            ),
+            'WriteRegister': grpc.unary_unary_rpc_method_handler(
+                    servicer.WriteRegister,
+                    request_deserializer=gateway__pb2.WriteRegisterRequest.FromString,
+                    response_serializer=gateway__pb2.WriteRegisterResponse.SerializeToString,
             ),
             'HealthCheck': grpc.unary_unary_rpc_method_handler(
                     servicer.HealthCheck,
@@ -108,6 +127,33 @@ class GatewayService:
             '/mmws.gateway.v1.GatewayService/ReadRegister',
             gateway__pb2.ReadRegisterRequest.SerializeToString,
             gateway__pb2.ReadRegisterResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def WriteRegister(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/mmws.gateway.v1.GatewayService/WriteRegister',
+            gateway__pb2.WriteRegisterRequest.SerializeToString,
+            gateway__pb2.WriteRegisterResponse.FromString,
             options,
             channel_credentials,
             insecure,

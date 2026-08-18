@@ -54,6 +54,37 @@ def test_get_response_error_raises():
         dlms.parse_get_response(response)
 
 
+def test_get_request_with_custom_class_id():
+    # class 1 (Data) — параметры вроде «Current Time» (Этап 2, ТЗ п.4.2.4,
+    # словарь OBIS RW_Tree_параметры), не Register (class 3).
+    obis = dlms.parse_obis("1.0.0.9.1.ff")
+    request = dlms.build_get_request(obis, class_id=1)
+    parsed = dlms.parse_get_request(request)
+    assert parsed.class_id == 1
+    assert parsed.obis == obis
+
+
+def test_set_request_response_round_trip():
+    obis = dlms.parse_obis("1.0.0.9.1.ff")
+    value = datatypes.encode_octet_string(bytes([12, 30, 0]))  # 12:30:00
+    request = dlms.build_set_request(obis, value, invoke_id=3, class_id=1)
+    parsed = dlms.parse_set_request(request)
+    assert parsed.invoke_id == 3
+    assert parsed.class_id == 1
+    assert parsed.obis == obis
+    assert parsed.value == bytes([12, 30, 0])
+    assert parsed.encoded_value == value
+
+    response = dlms.build_set_response(3)
+    dlms.parse_set_response(response)  # не бросает — успех
+
+
+def test_set_response_failure_raises():
+    response = dlms.build_set_response(3, result=dlms.SET_RESULT_SUCCESS + 1)
+    with pytest.raises(GatewayError):
+        dlms.parse_set_response(response)
+
+
 def test_encode_oid_matches_manual_encoding():
     # {2 16 756 5 8 1 1}: первый байт 40*2+16=96=0x60; 756 -> 0x85 0x74 (base-128).
     assert dlms.encode_oid((2, 16, 756, 5, 8, 1, 1)) == bytes(

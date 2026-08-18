@@ -41,7 +41,9 @@ export interface Job {
   job_type: string;
   meter_id: number;
   status: JobStatus;
-  result: { obis: string; value: unknown } | null;
+  // read_current -> {obis, value}; write_datetime (Этап 2, ТЗ п.4.2.4) ->
+  // {[parameter]: {ok, error}} по каждому записанному OBIS-объекту.
+  result: Record<string, unknown> | null;
   error: { code: string; message: string; is_partial?: boolean } | null;
   created_at: string;
   started_at: string | null;

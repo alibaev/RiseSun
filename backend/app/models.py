@@ -61,6 +61,11 @@ class JobStatus(str, enum.Enum):
     FAILED = "failed"
 
 
+class ParameterWriteResult(str, enum.Enum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -110,8 +115,14 @@ class Meter(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     serial_number: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
-    ip_address: Mapped[str] = mapped_column(String(64), nullable=False)
-    port: Mapped[int] = mapped_column(Integer, nullable=False)
+    # ip_address/port обязательны только для обычной модели (Gateway —
+    # инициатор, ТЗ Table 1). Для call-home счётчиков (звонят сами —
+    # подтверждённое расхождение с ТЗ, см. DECISIONS.md) они необязательны:
+    # Gateway опознаёт звонящий счётчик по serial_number через свой
+    # call-home пул, а не по адресу назначения.
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_call_home: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     protocol_profile: Mapped[ProtocolProfile] = mapped_column(
         Enum(ProtocolProfile, name="protocol_profile"), nullable=False
     )
@@ -210,6 +221,41 @@ class Job(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ParameterWriteHistory(Base):
+    """История операций записи параметров на счётчики (Этап 2, ТЗ п.4.2.4).
+
+    Обязательный состав полей по ТЗ: пользователь, время, счётчик,
+    изменяемый параметр, предыдущее и новое значение, результат —
+    заполняется безусловно при КАЖДОЙ попытке записи (успешной или нет),
+    независимо от общего audit_log (тот же принцип раздельного
+    журналирования, что и у event_log/tamper_log — предметный журнал
+    отдельно от общего аудита действий)."""
+
+    __tablename__ = "parameter_write_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    meter_id: Mapped[int] = mapped_column(ForeignKey("meters.id"), nullable=False, index=True)
+    # Машиночитаемое имя параметра (напр. "datetime.time", "datetime.date") —
+    # не OBIS-код напрямую, т.к. одна логическая операция записи (Этап 2,
+    # итерация 1: "дата и время") может затрагивать несколько OBIS-объектов.
+    parameter: Mapped[str] = mapped_column(String(64), nullable=False)
+    obis_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    # old_value может быть NULL — не для каждой операции записи
+    # предварительное чтение осмысленно (напр. синхронизация часов "на
+    # текущее время" не требует знания предыдущего показания часов
+    # счётчика для аудита операции как таковой); когда прочитано —
+    # значение то же представление, что и meter_readings.value_json.
+    old_value: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    new_value: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    result: Mapped[ParameterWriteResult] = mapped_column(
+        Enum(ParameterWriteResult, name="parameter_write_result"), nullable=False
+    )
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
 class AuditLog(Base):

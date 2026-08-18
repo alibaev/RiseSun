@@ -45,3 +45,12 @@ const READ_TRIGGER_ROLES = new Set(["operator", "engineer", "admin", "super_admi
 export function canTriggerRead(role: string | null): boolean {
   return role !== null && READ_TRIGGER_ROLES.has(role);
 }
+
+// Этап 2 (ТЗ п.4.2.4): запись параметров — «Инженер»/«Администратор»,
+// плюс «Супер-администратор» как надмножество прав (тот же набор, что
+// и Permission.WRITE_PARAMETER на Backend, app/core/permissions.py).
+const WRITE_PARAMETER_ROLES = new Set(["engineer", "admin", "super_admin"]);
+
+export function canWriteParameter(role: string | null): boolean {
+  return role !== null && WRITE_PARAMETER_ROLES.has(role);
+}

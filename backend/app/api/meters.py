@@ -11,13 +11,24 @@ from ..auth.deps import require_permission
 from ..core.permissions import Permission
 from ..core.security import encrypt_secret
 from ..db import get_db
-from ..models import EventLog, Gateway, GatewayStatus, Job, Meter, MeterReading, TamperLog, User
+from ..models import (
+    EventLog,
+    Gateway,
+    GatewayStatus,
+    Job,
+    Meter,
+    MeterReading,
+    ParameterWriteHistory,
+    TamperLog,
+    User,
+)
 from ..schemas import (
     JobOut,
     MeterCreate,
     MeterOut,
     MeterReadingOut,
     MeterUpdate,
+    ParameterWriteHistoryOut,
     ReadTriggerRequest,
 )
 from ..services.audit import record_audit
@@ -80,6 +91,7 @@ async def create_meter(
         serial_number=body.serial_number,
         ip_address=body.ip_address,
         port=body.port,
+        is_call_home=body.is_call_home,
         protocol_profile=body.protocol_profile,
         password_encrypted=encrypt_secret(body.password.encode("ascii")),
         aes_key_encrypted=encrypt_secret(bytes.fromhex(body.aes_key_hex)) if body.aes_key_hex else None,
@@ -189,6 +201,47 @@ async def trigger_read(
     await db.commit()
     await db.refresh(job)
     return job
+
+
+@router.post("/{meter_id}/write-datetime", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
+async def trigger_write_datetime(
+    meter_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.WRITE_PARAMETER)),
+) -> Job:
+    """Ставит операцию установки текущей даты/времени счётчика в очередь
+    (ТЗ п.4.2.4, «дата и время счётчика»; п.4.2.11, кнопка «Установить
+    время» на карточке счётчика) — синхронизация с системным временем
+    Backend (UTC). Доступно ролям «Инженер»/«Администратор»/«Супер-
+    администратор» (Permission.WRITE_PARAMETER)."""
+    meter = await db.get(Meter, meter_id)
+    if meter is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Счётчик не найден")
+
+    job = Job(job_type="write_datetime", meter_id=meter_id, payload={}, created_by_id=user.id)
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
+@router.get("/{meter_id}/write-history", response_model=list[ParameterWriteHistoryOut])
+async def list_write_history(
+    meter_id: int,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.VIEW_METERS)),
+) -> list[ParameterWriteHistory]:
+    """История записи параметров (ТЗ п.4.2.4 — предыдущее/новое значение,
+    результат каждой операции) — просмотр доступен всем ролям с правом
+    видеть счётчик, запись — только Permission.WRITE_PARAMETER."""
+    result = await db.execute(
+        select(ParameterWriteHistory)
+        .where(ParameterWriteHistory.meter_id == meter_id)
+        .order_by(ParameterWriteHistory.created_at.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
 
 
 @router.get("/{meter_id}/readings", response_model=list[MeterReadingOut])

@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from ..addressing import HDLC_DLMS, physical_address
 from ..errors import GatewayError
 from ..transport import TcpTransport
@@ -29,14 +31,44 @@ from .hdlc import (
     server_hdlc_address,
 )
 
+logger = logging.getLogger("mmws_gateway.hdlc_dlms")
+
 
 def read_register(
-    transport: TcpTransport, *, serial: str, password: bytes, obis: str
+    transport: TcpTransport,
+    *,
+    serial: str,
+    password: bytes,
+    obis: str,
+    class_id: int = dlms.REGISTER_CLASS_ID,
 ) -> object:
+    establish_link(transport, serial=serial)
+    return read_register_via_established_link(
+        transport, serial=serial, password=password, obis=obis, class_id=class_id
+    )
+
+
+def establish_link(transport: TcpTransport, *, serial: str) -> None:
+    """Только шаг SNRM -> UA — используется отдельно фоновым
+    "прогревом" call-home соединений (см. ``callhome.py``), которые
+    держат HDLC-связь установленной заранее, до того как понадобится
+    реальное чтение регистра."""
     server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
     client_addr = DEFAULT_CLIENT_ADDRESS
-
     _establish_link(transport, server_addr, client_addr)
+
+
+def read_register_via_established_link(
+    transport: TcpTransport,
+    *,
+    serial: str,
+    password: bytes,
+    obis: str,
+    class_id: int = dlms.REGISTER_CLASS_ID,
+) -> object:
+    """AARQ/AARE + GET поверх УЖЕ установленной (SNRM/UA пройден) HDLC-связи."""
+    server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
+    client_addr = DEFAULT_CLIENT_ADDRESS
 
     aarq = dlms.build_aarq(password)
     _send_i_frame(
@@ -46,13 +78,63 @@ def read_register(
     aare_frame = _recv_i_frame(transport)
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))  # бросает AuthFailedError при отказе
 
-    request = dlms.build_get_request(dlms.parse_obis(obis))
+    request = dlms.build_get_request(dlms.parse_obis(obis), class_id=class_id)
     _send_i_frame(
         transport, server_addr, client_addr, send_seq=1, recv_seq=1,
         information=dlms.wrap_llc_command(request),
     )
     response_frame = _recv_i_frame(transport)
     return dlms.parse_get_response(dlms.unwrap_llc(response_frame.information))
+
+
+def write_register(
+    transport: TcpTransport,
+    *,
+    serial: str,
+    password: bytes,
+    obis: str,
+    encoded_value: bytes,
+    class_id: int = dlms.REGISTER_CLASS_ID,
+) -> None:
+    """Запись параметра (Этап 2, ТЗ п. 4.2.4) — SNRM/UA + AARQ/AARE + SET.
+    ``encoded_value`` — уже закодированное Common-Data-Type значение (см.
+    ``protocols.datatypes.encode_*``); ничего не возвращает, бросает
+    GatewayError при отказе (в т.ч. AuthFailedError)."""
+    establish_link(transport, serial=serial)
+    write_register_via_established_link(
+        transport, serial=serial, password=password, obis=obis,
+        encoded_value=encoded_value, class_id=class_id,
+    )
+
+
+def write_register_via_established_link(
+    transport: TcpTransport,
+    *,
+    serial: str,
+    password: bytes,
+    obis: str,
+    encoded_value: bytes,
+    class_id: int = dlms.REGISTER_CLASS_ID,
+) -> None:
+    """AARQ/AARE + SET поверх УЖЕ установленной (SNRM/UA пройден) HDLC-связи."""
+    server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
+    client_addr = DEFAULT_CLIENT_ADDRESS
+
+    aarq = dlms.build_aarq(password)
+    _send_i_frame(
+        transport, server_addr, client_addr, send_seq=0, recv_seq=0,
+        information=dlms.wrap_llc_command(aarq),
+    )
+    aare_frame = _recv_i_frame(transport)
+    dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))
+
+    request = dlms.build_set_request(dlms.parse_obis(obis), encoded_value, class_id=class_id)
+    _send_i_frame(
+        transport, server_addr, client_addr, send_seq=1, recv_seq=1,
+        information=dlms.wrap_llc_command(request),
+    )
+    response_frame = _recv_i_frame(transport)
+    dlms.parse_set_response(dlms.unwrap_llc(response_frame.information))
 
 
 def _establish_link(transport: TcpTransport, server_addr: int, client_addr: int) -> None:
@@ -64,6 +146,10 @@ def _establish_link(transport: TcpTransport, server_addr: int, client_addr: int)
     )
     transport.send(frame.encode())
     response = HdlcFrame.decode(read_frame_from_transport(transport))
+    logger.info(
+        "Ответ на SNRM: control=0x%02x src=%d dst=%d info=%s",
+        response.control, response.source, response.destination, response.information.hex(),
+    )
     if response.control != CONTROL_UA:
         raise GatewayError(
             "Счётчик не подтвердил установление HDLC-соединения (ожидался управляющий байт UA)"
@@ -86,5 +172,26 @@ def _send_i_frame(
     transport.send(frame.encode())
 
 
+_MAX_SUPERVISORY_FRAMES_SKIPPED = 20
+
+
 def _recv_i_frame(transport: TcpTransport) -> HdlcFrame:
-    return HdlcFrame.decode(read_frame_from_transport(transport))
+    """Ждёт информационный (I-) кадр, пропуская супервизорные S-кадры
+    (напр. RR — подтверждение приёма без данных). Подтверждено на
+    реальном оборудовании 2026-08-18: счётчик сразу же отвечает RR-
+    подтверждением на присланный AARQ (control такого кадра — нечётный,
+    ``information`` пуст), а сам AARE в виде настоящего I-кадра приходит
+    отдельным, следующим кадром — если считать первым же полученным
+    кадром сразу ответ приложения, то это RR-подтверждение ошибочно
+    принимается за AARE с пустыми (некорректными) LLC-данными."""
+    for _ in range(_MAX_SUPERVISORY_FRAMES_SKIPPED):
+        frame = HdlcFrame.decode(read_frame_from_transport(transport))
+        logger.info(
+            "Получен HDLC-кадр: control=0x%02x src=%d dst=%d info=%s",
+            frame.control, frame.source, frame.destination, frame.information.hex(),
+        )
+        if frame.control & 0x01 == 0:  # I-кадр — control_information_frame() всегда даёт чётный control
+            return frame
+    raise GatewayError(
+        "Счётчик прислал слишком много супервизорных кадров подряд без ответа приложения"
+    )

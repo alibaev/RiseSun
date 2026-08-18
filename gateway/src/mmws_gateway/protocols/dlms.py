@@ -214,17 +214,24 @@ def parse_aare(data: bytes) -> bool:
 
 
 def build_get_request(
-    obis: bytes, *, invoke_id: int = 1, attribute_id: int = REGISTER_VALUE_ATTRIBUTE
+    obis: bytes,
+    *,
+    invoke_id: int = 1,
+    attribute_id: int = REGISTER_VALUE_ATTRIBUTE,
+    class_id: int = REGISTER_CLASS_ID,
 ) -> bytes:
     """``attribute_id`` по умолчанию — 2 (value). Атрибут 3 (scaler_unit)
     нужен для чтения масштаба/единицы измерения перед интерпретацией
     значения (подтверждено реальным трафиком Risesun — легитимный
     клиент читает scaler_unit отдельным GET перед value, см.
-    DECISIONS.md, 2026-08-18)."""
+    DECISIONS.md, 2026-08-18). ``class_id`` по умолчанию — 3 (Register);
+    параметры записи (Этап 2, например «Current Time»/«Current Date» —
+    словарь OBIS, лист RW_Tree_параметры) — класс 1 (Data), передаётся
+    явно вызывающим кодом."""
     if len(obis) != 6:
         raise GatewayError("OBIS для GET.request должен быть ровно 6 байт")
     descriptor = (
-        REGISTER_CLASS_ID.to_bytes(2, "big")
+        class_id.to_bytes(2, "big")
         + obis
         + bytes([attribute_id])
     )
@@ -284,3 +291,94 @@ def parse_get_response(data: bytes) -> object:
         raise GatewayError(f"Счётчик вернул data-access-result={code} на GET-запрос")
     value, _consumed = datatypes.decode_value(data, offset=4)
     return value
+
+
+# --- SET-request/response (Этап 2 — запись параметров, ТЗ п. 4.2.4) ---
+#
+# Тот же принцип APDU, что и у GET выше (IEC 62056-6-2): SET-request-
+# Normal переносит cosem-attribute-descriptor (class-id, OBIS,
+# attribute-id) + access-selection + новое значение атрибута;
+# SET-response-Normal возвращает единственный байт data-access-result
+# (0 = success, прочие значения — конкретный код отказа записи, тот же
+# перечень, что и у GET, Green Book).
+
+SET_REQUEST_TAG = 0xC1
+SET_REQUEST_NORMAL = 0x01
+SET_RESPONSE_TAG = 0xC5
+SET_RESPONSE_NORMAL = 0x01
+
+SET_RESULT_SUCCESS = 0
+_SET_RESULT_NAMES = {
+    0: "success",
+    1: "hardware-fault",
+    2: "temporary-failure",
+    3: "read-write-denied",
+    4: "object-undefined",
+    9: "object-class-inconsistent",
+    11: "object-unavailable",
+    12: "type-unmatched",
+    13: "scope-of-access-violated",
+    14: "data-block-unavailable",
+    250: "other-reason",
+}
+
+
+def build_set_request(
+    obis: bytes,
+    encoded_value: bytes,
+    *,
+    invoke_id: int = 1,
+    attribute_id: int = REGISTER_VALUE_ATTRIBUTE,
+    class_id: int = REGISTER_CLASS_ID,
+) -> bytes:
+    """``encoded_value`` — уже закодированное Common-Data-Type значение
+    (тег + длина + содержимое, см. ``protocols.datatypes.encode_*``)."""
+    if len(obis) != 6:
+        raise GatewayError("OBIS для SET.request должен быть ровно 6 байт")
+    descriptor = class_id.to_bytes(2, "big") + obis + bytes([attribute_id])
+    return (
+        bytes([SET_REQUEST_TAG, SET_REQUEST_NORMAL, invoke_id])
+        + descriptor
+        + bytes([0x00])  # access-selection отсутствует
+        + encoded_value
+    )
+
+
+@dataclass
+class ParsedSetRequest:
+    invoke_id: int
+    class_id: int
+    obis: bytes
+    attribute_id: int
+    value: object
+    encoded_value: bytes  # сырые байты значения (тег+длина+содержимое) — удобно эмулятору для эхо в GET
+
+
+def parse_set_request(data: bytes) -> ParsedSetRequest:
+    if len(data) < 13 or data[0] != SET_REQUEST_TAG or data[1] != SET_REQUEST_NORMAL:
+        raise GatewayError("Ожидался SET.request-normal (тег 0xC1 0x01)")
+    invoke_id = data[2]
+    class_id = int.from_bytes(data[3:5], "big")
+    obis = data[5:11]
+    attribute_id = data[11]
+    # data[12] — access-selection, всегда 0x00 (отсутствует) в текущей реализации
+    value, consumed = datatypes.decode_value(data, offset=13)
+    encoded_value = data[13 : 13 + consumed]
+    return ParsedSetRequest(
+        invoke_id=invoke_id, class_id=class_id, obis=obis, attribute_id=attribute_id,
+        value=value, encoded_value=encoded_value,
+    )
+
+
+def build_set_response(invoke_id: int, *, result: int = SET_RESULT_SUCCESS) -> bytes:
+    return bytes([SET_RESPONSE_TAG, SET_RESPONSE_NORMAL, invoke_id, result])
+
+
+def parse_set_response(data: bytes) -> None:
+    """Не возвращает значения — бросает GatewayError, если запись отклонена."""
+    if len(data) < 4 or data[0] != SET_RESPONSE_TAG or data[1] != SET_RESPONSE_NORMAL:
+        raise GatewayError("Ожидался SET.response-normal (тег 0xC5 0x01)")
+    result = data[3]
+    if result != SET_RESULT_SUCCESS:
+        name = _SET_RESULT_NAMES.get(result, f"0x{result:02X}")
+        raise GatewayError(f"Счётчик отклонил запись параметра: data-access-result={result} ({name})")

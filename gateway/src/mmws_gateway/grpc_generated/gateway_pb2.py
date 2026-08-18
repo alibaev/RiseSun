@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\rgateway.proto\x12\x0fmmws.gateway.v1\"\xaa\x01\n\x13ReadRegisterRequest\x12\x0f\n\x07profile\x18\x01 \x01(\t\x12\x0c\n\x04host\x18\x02 \x01(\t\x12\x0c\n\x04port\x18\x03 \x01(\x05\x12\x0e\n\x06serial\x18\x04 \x01(\t\x12\x10\n\x08password\x18\x05 \x01(\t\x12\x0c\n\x04obis\x18\x06 \x01(\t\x12\x12\n\ntimeout_ms\x18\x07 \x01(\x05\x12\x0f\n\x07retries\x18\x08 \x01(\x05\x12\x11\n\tcall_home\x18\t \x01(\x08\"z\n\x14ReadRegisterResponse\x12+\n\x05value\x18\x01 \x01(\x0b\x32\x1a.mmws.gateway.v1.ReadValueH\x00\x12+\n\x05\x65rror\x18\x02 \x01(\x0b\x32\x1a.mmws.gateway.v1.ReadErrorH\x00\x42\x08\n\x06result\"\x1f\n\tReadValue\x12\x12\n\nvalue_json\x18\x01 \x01(\t\"U\n\tReadError\x12\x0c\n\x04\x63ode\x18\x01 \x01(\t\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x12\n\nis_partial\x18\x03 \x01(\x08\x12\x15\n\rraw_frame_hex\x18\x04 \x01(\t\"\x14\n\x12HealthCheckRequest\"9\n\x13HealthCheckResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x16\n\x0e\x64river_version\x18\x02 \x01(\t2\xc7\x01\n\x0eGatewayService\x12[\n\x0cReadRegister\x12$.mmws.gateway.v1.ReadRegisterRequest\x1a%.mmws.gateway.v1.ReadRegisterResponse\x12X\n\x0bHealthCheck\x12#.mmws.gateway.v1.HealthCheckRequest\x1a$.mmws.gateway.v1.HealthCheckResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\rgateway.proto\x12\x0fmmws.gateway.v1\"\xbc\x01\n\x13ReadRegisterRequest\x12\x0f\n\x07profile\x18\x01 \x01(\t\x12\x0c\n\x04host\x18\x02 \x01(\t\x12\x0c\n\x04port\x18\x03 \x01(\x05\x12\x0e\n\x06serial\x18\x04 \x01(\t\x12\x10\n\x08password\x18\x05 \x01(\t\x12\x0c\n\x04obis\x18\x06 \x01(\t\x12\x12\n\ntimeout_ms\x18\x07 \x01(\x05\x12\x0f\n\x07retries\x18\x08 \x01(\x05\x12\x11\n\tcall_home\x18\t \x01(\x08\x12\x10\n\x08\x63lass_id\x18\n \x01(\x05\"z\n\x14ReadRegisterResponse\x12+\n\x05value\x18\x01 \x01(\x0b\x32\x1a.mmws.gateway.v1.ReadValueH\x00\x12+\n\x05\x65rror\x18\x02 \x01(\x0b\x32\x1a.mmws.gateway.v1.ReadErrorH\x00\x42\x08\n\x06result\"\x1f\n\tReadValue\x12\x12\n\nvalue_json\x18\x01 \x01(\t\"U\n\tReadError\x12\x0c\n\x04\x63ode\x18\x01 \x01(\t\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x12\n\nis_partial\x18\x03 \x01(\x08\x12\x15\n\rraw_frame_hex\x18\x04 \x01(\t\"\xfc\x01\n\x14WriteRegisterRequest\x12\x0f\n\x07profile\x18\x01 \x01(\t\x12\x0c\n\x04host\x18\x02 \x01(\t\x12\x0c\n\x04port\x18\x03 \x01(\x05\x12\x0e\n\x06serial\x18\x04 \x01(\t\x12\x10\n\x08password\x18\x05 \x01(\t\x12\x0c\n\x04obis\x18\x06 \x01(\t\x12\x10\n\x08\x63lass_id\x18\x07 \x01(\x05\x12\x14\n\x0c\x61ttribute_id\x18\x08 \x01(\x05\x12\x12\n\nvalue_type\x18\t \x01(\t\x12\x13\n\x0bvalue_bytes\x18\n \x01(\x0c\x12\x12\n\ntimeout_ms\x18\x0b \x01(\x05\x12\x0f\n\x07retries\x18\x0c \x01(\x05\x12\x11\n\tcall_home\x18\r \x01(\x08\"\x80\x01\n\x15WriteRegisterResponse\x12\x30\n\x07success\x18\x01 \x01(\x0b\x32\x1d.mmws.gateway.v1.WriteSuccessH\x00\x12+\n\x05\x65rror\x18\x02 \x01(\x0b\x32\x1a.mmws.gateway.v1.ReadErrorH\x00\x42\x08\n\x06result\"\x1a\n\x0cWriteSuccess\x12\n\n\x02ok\x18\x01 \x01(\x08\"\x14\n\x12HealthCheckRequest\"9\n\x13HealthCheckResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x16\n\x0e\x64river_version\x18\x02 \x01(\t2\xa7\x02\n\x0eGatewayService\x12[\n\x0cReadRegister\x12$.mmws.gateway.v1.ReadRegisterRequest\x1a%.mmws.gateway.v1.ReadRegisterResponse\x12^\n\rWriteRegister\x12%.mmws.gateway.v1.WriteRegisterRequest\x1a&.mmws.gateway.v1.WriteRegisterResponse\x12X\n\x0bHealthCheck\x12#.mmws.gateway.v1.HealthCheckRequest\x1a$.mmws.gateway.v1.HealthCheckResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -32,17 +32,23 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'gateway_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_READREGISTERREQUEST']._serialized_start=35
-  _globals['_READREGISTERREQUEST']._serialized_end=205
-  _globals['_READREGISTERRESPONSE']._serialized_start=207
-  _globals['_READREGISTERRESPONSE']._serialized_end=329
-  _globals['_READVALUE']._serialized_start=331
-  _globals['_READVALUE']._serialized_end=362
-  _globals['_READERROR']._serialized_start=364
-  _globals['_READERROR']._serialized_end=449
-  _globals['_HEALTHCHECKREQUEST']._serialized_start=451
-  _globals['_HEALTHCHECKREQUEST']._serialized_end=471
-  _globals['_HEALTHCHECKRESPONSE']._serialized_start=473
-  _globals['_HEALTHCHECKRESPONSE']._serialized_end=530
-  _globals['_GATEWAYSERVICE']._serialized_start=533
-  _globals['_GATEWAYSERVICE']._serialized_end=732
+  _globals['_READREGISTERREQUEST']._serialized_end=223
+  _globals['_READREGISTERRESPONSE']._serialized_start=225
+  _globals['_READREGISTERRESPONSE']._serialized_end=347
+  _globals['_READVALUE']._serialized_start=349
+  _globals['_READVALUE']._serialized_end=380
+  _globals['_READERROR']._serialized_start=382
+  _globals['_READERROR']._serialized_end=467
+  _globals['_WRITEREGISTERREQUEST']._serialized_start=470
+  _globals['_WRITEREGISTERREQUEST']._serialized_end=722
+  _globals['_WRITEREGISTERRESPONSE']._serialized_start=725
+  _globals['_WRITEREGISTERRESPONSE']._serialized_end=853
+  _globals['_WRITESUCCESS']._serialized_start=855
+  _globals['_WRITESUCCESS']._serialized_end=881
+  _globals['_HEALTHCHECKREQUEST']._serialized_start=883
+  _globals['_HEALTHCHECKREQUEST']._serialized_end=903
+  _globals['_HEALTHCHECKRESPONSE']._serialized_start=905
+  _globals['_HEALTHCHECKRESPONSE']._serialized_end=962
+  _globals['_GATEWAYSERVICE']._serialized_start=965
+  _globals['_GATEWAYSERVICE']._serialized_end=1260
 # @@protoc_insertion_point(module_scope)

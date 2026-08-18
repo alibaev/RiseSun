@@ -28,15 +28,25 @@ async def read_register(
     *,
     grpc_target: str,
     profile: str,
-    host: str,
-    port: int,
     serial: str,
     password: str,
     obis: str,
+    host: str = "",
+    port: int = 0,
+    call_home: bool = False,
+    class_id: int = 0,
     timeout_ms: int = 0,
     retries: int = 0,
     call_timeout_s: float = 60.0,
 ) -> ReadResult:
+    """``call_home=True`` — счётчик сам звонит Gateway (подтверждённое
+    расхождение с ТЗ Table 1, см. ../DECISIONS.md); ``host``/``port``
+    в этом случае игнорируются на стороне Gateway (не набираются), а
+    ``call_timeout_s`` стоит держать не меньше таймаута ожидания внутри
+    Gateway (``callhome.read_via_call_home``'s ``max_wait_s``, по
+    умолчанию тоже 60с — согласовано специально). ``class_id=0`` —
+    дефолт Gateway (Register, класс 3); параметры Этапа 2 (класс 1,
+    Data) передают явно."""
     async with grpc.aio.insecure_channel(grpc_target) as channel:
         stub = gateway_pb2_grpc.GatewayServiceStub(channel)
         request = gateway_pb2.ReadRegisterRequest(
@@ -46,8 +56,10 @@ async def read_register(
             serial=serial,
             password=password,
             obis=obis,
+            class_id=class_id,
             timeout_ms=timeout_ms,
             retries=retries,
+            call_home=call_home,
         )
         response = await stub.ReadRegister(request, timeout=call_timeout_s)
 
@@ -62,3 +74,56 @@ async def read_register(
         is_partial=error.is_partial,
         raw_frame_hex=error.raw_frame_hex,
     )
+
+
+@dataclass
+class WriteResult:
+    ok: bool
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+async def write_register(
+    *,
+    grpc_target: str,
+    profile: str,
+    serial: str,
+    password: str,
+    obis: str,
+    value_bytes: bytes,
+    class_id: int = 0,
+    value_type: str = "octet_string",
+    host: str = "",
+    port: int = 0,
+    call_home: bool = False,
+    timeout_ms: int = 0,
+    retries: int = 0,
+    call_timeout_s: float = 60.0,
+) -> WriteResult:
+    """Запись одного атрибута COSEM-объекта (Этап 2, ТЗ п.4.2.4).
+    ``value_bytes``/``value_type`` — сырое значение и дискриминатор
+    DLMS-кодировки; Gateway кодирует в Common-Data-Type сам (Backend не
+    реализует протокольную логику — Promt_MMWS.md, раздел 3, принцип 1)."""
+    async with grpc.aio.insecure_channel(grpc_target) as channel:
+        stub = gateway_pb2_grpc.GatewayServiceStub(channel)
+        request = gateway_pb2.WriteRegisterRequest(
+            profile=profile,
+            host=host,
+            port=port,
+            serial=serial,
+            password=password,
+            obis=obis,
+            class_id=class_id,
+            value_type=value_type,
+            value_bytes=value_bytes,
+            timeout_ms=timeout_ms,
+            retries=retries,
+            call_home=call_home,
+        )
+        response = await stub.WriteRegister(request, timeout=call_timeout_s)
+
+    which = response.WhichOneof("result")
+    if which == "success":
+        return WriteResult(ok=True)
+    error = response.error
+    return WriteResult(ok=False, error_code=error.code, error_message=error.message)

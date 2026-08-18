@@ -9,7 +9,7 @@ import pytest
 from mmws_gateway.emulators.common import ConnectionCounter, ErrorInjection, ThreadedEmulatorServer
 from mmws_gateway.emulators.hdlc_dlms_emulator import make_hdlc_dlms_handler
 from mmws_gateway.errors import AuthFailedError, ConnectionLostError, MeterTimeoutError
-from mmws_gateway.protocols import dlms, hdlc_dlms
+from mmws_gateway.protocols import datatypes, dlms, hdlc_dlms
 from mmws_gateway.session import run_with_retries
 from mmws_gateway.transport import TcpTransport, TransportConfig
 
@@ -77,6 +77,46 @@ def test_crc_error_recovers_after_retry():
     with _start_server(ErrorInjection(force_crc_error=True, fail_attempts=1)) as server:
         value = _read(server, retries=3)
     assert value == 1234567
+
+
+def test_write_register_then_read_back_value():
+    """Этап 2 (ТЗ п.4.2.4): SET параметра class-1 (Data), затем GET того
+    же OBIS отдельной сессией — подтверждает, что записанное значение
+    действительно сохранилось на «счётчике» (эмуляторе)."""
+    obis = "1.0.0.9.1.ff"
+    encoded_value = datatypes.encode_octet_string(bytes([12, 30, 0]))  # 12:30:00
+    counter = ConnectionCounter()
+    data_values: dict[bytes, bytes] = {}
+    handler = make_hdlc_dlms_handler(
+        password=PASSWORD, obis_values=OBIS_VALUES, error_injection=ErrorInjection(),
+        counter=counter, data_values=data_values,
+    )
+    with ThreadedEmulatorServer(handler) as server:
+        config = TransportConfig(host=server.host, port=server.port, timeout_ms=1000, max_retries=1)
+
+        with TcpTransport(config) as transport:
+            hdlc_dlms.write_register(
+                transport, serial=SERIAL, password=PASSWORD, obis=obis,
+                encoded_value=encoded_value, class_id=1,
+            )
+
+        with TcpTransport(config) as transport:
+            value = hdlc_dlms.read_register(transport, serial=SERIAL, password=PASSWORD, obis=obis, class_id=1)
+
+    assert value == bytes([12, 30, 0])
+
+
+def test_write_register_wrong_password_raises_auth_failed():
+    obis = "1.0.0.9.1.ff"
+    encoded_value = datatypes.encode_octet_string(bytes([12, 30, 0]))
+    with _start_server(ErrorInjection()) as server:
+        config = TransportConfig(host=server.host, port=server.port, timeout_ms=1000, max_retries=1)
+        with pytest.raises(AuthFailedError):
+            with TcpTransport(config) as transport:
+                hdlc_dlms.write_register(
+                    transport, serial=SERIAL, password=b"WRONGPASS", obis=obis,
+                    encoded_value=encoded_value, class_id=1,
+                )
 
 
 def test_read_survives_serial_whose_frame_contains_embedded_flag_byte():

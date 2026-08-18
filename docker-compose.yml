@@ -22,7 +22,12 @@ services:
       dockerfile: gateway/Dockerfile
     restart: unless-stopped
     ports:
-      - "127.0.0.1:50051:50051"
+      - "127.0.0.1:50051:50051"  # внутренний gRPC — наружу не нужен
+      # Call-home порт (счётчик сам инициирует TCP-соединение — см.
+      # DECISIONS.md) — ОБЯЗАН быть доступен со стороны реальной сети
+      # счётчиков, не только localhost (аналогично тому, как открыт
+      # 5173 у frontend).
+      - "2009:2009"
 
   backend:
     build:

@@ -178,9 +178,15 @@ def test_read_via_call_home_succeeds_after_ignored_snrm_attempts():
         # СЛЕДУЮЩУЮ попытку SNRM раньше, чем метр успеет ответить на
         # предыдущую (в реальности между попытками были секунды, не
         # миллисекунды).
+        # max_attempts_per_connection передан явно: боевой дефолт теперь
+        # 1 (см. callhome.py — повтор SNRM на том же соединении при
+        # большом per-attempt таймауте создавал рассинхронизацию с
+        # реальным оборудованием), но этот тест намеренно проверяет
+        # именно поведение "повтор на одном и том же соединении".
         value = read_via_call_home(
             pool, serial=serial, password=password, obis=obis,
             retry_interval_s=0.5, max_wait_s=15, per_attempt_timeout_ms=1500,
+            max_attempts_per_connection=5,
         )
         assert value == 1234567
         meter_thread.join(timeout=3)

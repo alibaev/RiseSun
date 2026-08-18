@@ -29,8 +29,16 @@ def make_hdlc_dlms_handler(
     obis_values: dict[bytes, int],
     error_injection: ErrorInjection,
     counter: ConnectionCounter,
+    data_values: dict[bytes, bytes] | None = None,
 ):
-    """Возвращает обработчик TCP-подключения для ``ThreadedEmulatorServer``."""
+    """Возвращает обработчик TCP-подключения для ``ThreadedEmulatorServer``.
+
+    ``data_values`` (Этап 2) — состояние class-1 (Data) объектов вроде
+    «Current Time»/«Current Date» (словарь OBIS, лист RW_Tree_параметры):
+    ключ — OBIS, значение — уже закодированные байты (тег+длина+
+    содержимое). SET обновляет запись, GET читает — общий изменяемый
+    словарь, переданный вызывающим тестом, чтобы проверить, что именно
+    было записано."""
 
     def handler(conn: socket.socket) -> None:
         conn.settimeout(5)
@@ -46,6 +54,7 @@ def make_hdlc_dlms_handler(
             obis_values=obis_values,
             error_injection=error_injection,
             attempt=attempt,
+            data_values=data_values,
         )
 
     return handler
@@ -58,8 +67,9 @@ def serve_hdlc_dlms_session(
     obis_values: dict[bytes, int],
     error_injection: ErrorInjection,
     attempt: int,
+    data_values: dict[bytes, bytes] | None = None,
 ) -> None:
-    """Обслуживает установление HDLC-соединения, AARQ/AARE и один GET.
+    """Обслуживает установление HDLC-соединения, AARQ/AARE и один GET либо SET.
 
     Вынесено отдельной функцией, чтобы её мог переиспользовать эмулятор
     режима E (``mode_e_emulator``) после собственной идентификационной
@@ -85,18 +95,37 @@ def serve_hdlc_dlms_session(
     if not accepted:
         return
 
-    get_frame = HdlcFrame.decode(_read_frame(conn))
-    get_request = dlms.parse_get_request(dlms.unwrap_llc(get_frame.information))
-    value = obis_values.get(get_request.obis)
-    if value is None:
-        info = dlms.build_get_response_error(get_request.invoke_id, OBJECT_UNDEFINED)
+    req_frame = HdlcFrame.decode(_read_frame(conn))
+    payload = dlms.unwrap_llc(req_frame.information)
+    tag = payload[0] if payload else None
+
+    if tag == dlms.SET_REQUEST_TAG:
+        set_request = dlms.parse_set_request(payload)
+        if data_values is not None:
+            data_values[set_request.obis] = set_request.encoded_value
+        info = dlms.build_set_response(set_request.invoke_id)
     else:
-        info = dlms.build_get_response_data(
-            get_request.invoke_id, datatypes.encode_double_long_unsigned(value)
-        )
+        get_request = dlms.parse_get_request(payload)
+        if get_request.class_id == dlms.REGISTER_CLASS_ID:
+            value = obis_values.get(get_request.obis)
+            info = (
+                dlms.build_get_response_data(
+                    get_request.invoke_id, datatypes.encode_double_long_unsigned(value)
+                )
+                if value is not None
+                else dlms.build_get_response_error(get_request.invoke_id, OBJECT_UNDEFINED)
+            )
+        else:
+            encoded = (data_values or {}).get(get_request.obis)
+            info = (
+                dlms.build_get_response_data(get_request.invoke_id, encoded)
+                if encoded is not None
+                else dlms.build_get_response_error(get_request.invoke_id, OBJECT_UNDEFINED)
+            )
+
     response_frame = HdlcFrame(
-        destination=get_frame.source,
-        source=get_frame.destination,
+        destination=req_frame.source,
+        source=req_frame.destination,
         control=control_information_frame(1, 2),
         information=dlms.wrap_llc_response(info),
     )

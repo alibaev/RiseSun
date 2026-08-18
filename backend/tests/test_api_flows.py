@@ -215,3 +215,97 @@ async def test_delete_meter_with_history_returns_409_not_500(client, db_session)
     # Счётчик по-прежнему на месте — DELETE не оставил БД в промежуточном состоянии.
     get_resp = await client.get(f"/api/meters/{meter.id}", headers={"Authorization": f"Bearer {token}"})
     assert get_resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_call_home_meter_does_not_require_ip_and_port(client, db_session):
+    # Звонящий домой счётчик (подтверждённое расхождение с ТЗ Table 1,
+    # см. DECISIONS.md) — Gateway опознаёт его по serial_number через
+    # свой call-home пул, ip_address/port ему не нужны.
+    root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    db_session.add(
+        Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    )
+    await db_session.commit()
+    token = await _login(client, "root", "pass1234")
+
+    resp = await client.post(
+        "/api/meters",
+        json={
+            "serial_number": "202306004113",
+            "is_call_home": True,
+            "protocol_profile": "hdlc_dlms",
+            "password": "12345678",
+            "gateway_id": 1,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["is_call_home"] is True
+    assert body["ip_address"] is None
+    assert body["port"] is None
+
+
+@pytest.mark.asyncio
+async def test_observer_cannot_trigger_write_datetime_but_engineer_can(client, db_session):
+    """Этап 2 (ТЗ п.4.2.4): запись параметров — доступно ролям «Инженер»
+    и «Администратор» (Permission.WRITE_PARAMETER), не «Наблюдателю»."""
+    root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    await _seed_user(db_session, username="eng", password="pass1234", role=UserRole.ENGINEER)
+    await _seed_user(db_session, username="obs", password="pass1234", role=UserRole.OBSERVER)
+    db_session.add(
+        Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    )
+    await db_session.commit()
+
+    root_token = await _login(client, "root", "pass1234")
+    await client.post(
+        "/api/meters",
+        json={
+            "serial_number": "202006003607",
+            "ip_address": "127.0.0.1",
+            "port": 4059,
+            "protocol_profile": "hdlc_dlms",
+            "password": "12345678",
+            "gateway_id": 1,
+        },
+        headers={"Authorization": f"Bearer {root_token}"},
+    )
+
+    obs_token = await _login(client, "obs", "pass1234")
+    obs_resp = await client.post(
+        "/api/meters/1/write-datetime", headers={"Authorization": f"Bearer {obs_token}"}
+    )
+    assert obs_resp.status_code == 403
+
+    eng_token = await _login(client, "eng", "pass1234")
+    eng_resp = await client.post(
+        "/api/meters/1/write-datetime", headers={"Authorization": f"Bearer {eng_token}"}
+    )
+    assert eng_resp.status_code == 202, eng_resp.text
+    body = eng_resp.json()
+    assert body["job_type"] == "write_datetime"
+    assert body["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_non_call_home_meter_requires_ip_and_port(client, db_session):
+    root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    db_session.add(
+        Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    )
+    await db_session.commit()
+    token = await _login(client, "root", "pass1234")
+
+    resp = await client.post(
+        "/api/meters",
+        json={
+            "serial_number": "202306004113",
+            "protocol_profile": "hdlc_dlms",
+            "password": "12345678",
+            "gateway_id": 1,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422

@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, ApiError } from "../api/client";
 import { tokenStorage } from "../auth/tokenStorage";
-import { useAuth, canTriggerRead } from "../auth/AuthContext";
+import { useAuth, canTriggerRead, canWriteParameter } from "../auth/AuthContext";
+import { ConfirmModal } from "../components/ConfirmModal";
 import type { Job, LogEntry, Meter, MeterReading } from "../api/types";
 
 const DEFAULT_OBIS = "1.1.1.8.0.ff"; // активная энергия, приём, всего (ТЗ Приложение Г.3)
@@ -23,6 +24,9 @@ export function MeterDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [activeJob, setActiveJob] = useState<Job | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const [showDatetimeConfirm, setShowDatetimeConfirm] = useState(false);
+  const [datetimeJob, setDatetimeJob] = useState<Job | null>(null);
+  const datetimeWsRef = useRef<WebSocket | null>(null);
 
   const loadAll = useCallback(async () => {
     if (!id) return;
@@ -48,6 +52,35 @@ export function MeterDetailPage() {
   }, [loadAll]);
 
   useEffect(() => () => wsRef.current?.close(), []);
+  useEffect(() => () => datetimeWsRef.current?.close(), []);
+
+  function watchJob(job: Job, wsRef: { current: WebSocket | null }, onUpdate: (job: Job) => void) {
+    const token = tokenStorage.getAccess();
+    const proto = window.location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${window.location.host}/api/jobs/${job.id}/stream?token=${token}`);
+    wsRef.current = ws;
+    ws.onmessage = (evt) => {
+      const updated: Job = JSON.parse(evt.data);
+      onUpdate(updated);
+      if (updated.status === "succeeded" || updated.status === "failed") {
+        ws.close();
+        loadAll();
+      }
+    };
+  }
+
+  function handleConfirmSetDatetime() {
+    if (!id) return;
+    setShowDatetimeConfirm(false);
+    setError(null);
+    api
+      .post<Job>(`/api/meters/${id}/write-datetime`)
+      .then((job) => {
+        setDatetimeJob(job);
+        watchJob(job, datetimeWsRef, setDatetimeJob);
+      })
+      .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось запустить установку времени"));
+  }
 
   function handleRefreshReadings() {
     if (!id) return;
@@ -92,7 +125,19 @@ export function MeterDetailPage() {
       </h1>
 
       <section className="card">
-        <h2>Общая информация</h2>
+        <div className="card-header">
+          <h2>Общая информация</h2>
+          {canWriteParameter(role) && (
+            <button
+              onClick={() => setShowDatetimeConfirm(true)}
+              disabled={datetimeJob?.status === "queued" || datetimeJob?.status === "running"}
+            >
+              {datetimeJob?.status === "queued" || datetimeJob?.status === "running"
+                ? "Устанавливаю..."
+                : "Установить время"}
+            </button>
+          )}
+        </div>
         <dl className="info-grid">
           <dt>IP-адрес</dt>
           <dd>
@@ -109,7 +154,23 @@ export function MeterDetailPage() {
           <dt>Последнее подключение</dt>
           <dd>{meter.last_seen_at ? new Date(meter.last_seen_at).toLocaleString("ru-RU") : "—"}</dd>
         </dl>
+        {datetimeJob?.status === "succeeded" && <p className="hint">Дата и время счётчика обновлены.</p>}
+        {datetimeJob?.status === "failed" && (
+          <div className="error-message">
+            Ошибка установки времени: {datetimeJob.error?.code} — {datetimeJob.error?.message}
+          </div>
+        )}
       </section>
+
+      {showDatetimeConfirm && (
+        <ConfirmModal
+          title="Установить время счётчика"
+          message="Счётчику будут переданы текущие дата и время сервера. Подтвердите операцию."
+          confirmLabel="Установить"
+          onConfirm={handleConfirmSetDatetime}
+          onCancel={() => setShowDatetimeConfirm(false)}
+        />
+      )}
 
       <section className="card">
         <div className="card-header">

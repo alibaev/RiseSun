@@ -14,12 +14,21 @@ DECISIONS.md, разделы про звонящие домой счётчики
 2. Счётчик держит до ``WINDOW_SIZE`` таких соединений одновременно; при
    попытке открыть ещё одно Gateway обязан закрыть САМОЕ СТАРОЕ из уже
    открытых (скользящее окно, а не «принять N и перестать слушать»).
-3. Счётчик перестаёт открывать новые соединения, как только на ОДНОМ
-   из держащихся начинается настоящий обмен (Gateway получает
-   осмысленный ответ на SNRM). Для этого попытки SNRM повторяются на
-   каждом держащемся соединении с интервалом в несколько секунд — один
-   единственный SNRM сразу после подключения ответа не получает
-   (подтверждено многократно), только повторные попытки.
+3. У каждого held-соединения есть ограниченное "окно жизни" от момента
+   подключения — весь обмен SNRM->UA->AARQ->AARE->GET нужно успеть
+   провести целиком, пока оно не истекло; попытка растянуть этот обмен
+   во времени (например, сначала заранее провести SNRM, а через
+   несколько минут — отдельно AARQ) не работает: соединение продолжает
+   технически отвечать на HDLC-уровне (RR-подтверждения на каждый
+   присланный I-кадр), но реального ответа приложения (AARE/GET-response)
+   уже не даёт — подтверждено многократно живым чтением 2026-08-18, см.
+   DECISIONS.md. Поэтому SNRM и последующий AARQ/GET всегда выполняются
+   ОДНИМ непрерывным заходом (``hdlc_dlms.read_register``), а не
+   отдельными фазами, разнесёнными по времени. Один-единственный такой
+   заход сразу после подключения тоже обычно ответа не даёт — нужны
+   именно повторные попытки с интервалом в несколько секунд, поэтому
+   заход повторяется целиком (со свежим SNRM) несколько раз на одном
+   соединении, прежде чем перейти к другому.
 
 Ключевое наблюдение для адресации: 6-байтный адрес внутри DL/T645-кадра
 восстанавливается в десятичный серийный номер счётчика реверсом
@@ -41,8 +50,41 @@ from .errors import GatewayError
 logger = logging.getLogger("mmws_gateway.callhome")
 
 DEFAULT_WINDOW_SIZE = 10
-DEFAULT_RETRY_INTERVAL_S = 4.0
+# Подтверждено на практике 2026-08-18 на заведомо СВЕЖЕМ (только что
+# принятом, см. DEFAULT_MAX_CLAIM_AGE_S) соединении: ответ на SNRM
+# приходит стабильно и предсказуемо — просто с задержкой около 7-10с
+# (не мгновенно, но и не хаотично). Раньше при коротком таймауте на
+# попытку (3с) и паузе перед повтором в 4с получался ровно такой же
+# период ~7с у ВСЕГО цикла "попытка+пауза" — из-за чего ответ на
+# СТАРЫЙ SNRM раз за разом приходил уже ПОСЛЕ того, как отправлялся
+# СЛЕДУЮЩИЙ (см. историю в комментариях ниже и в DECISIONS.md), и
+# ошибочно связывался с новой попыткой. Пауза сведена к минимуму, а
+# таймаут на попытку увеличен настолько, чтобы реальный ответ успевал
+# прийти В РАМКАХ ТОЙ ЖЕ попытки, которая его вызвала.
+DEFAULT_RETRY_INTERVAL_S = 0.5
 DEFAULT_IDENTIFY_TIMEOUT_S = 5.0
+DEFAULT_PER_ATTEMPT_TIMEOUT_MS = 9000
+# Сколько раз подряд повторить ВЕСЬ обмен (SNRM+AARQ+GET) на ОДНОМ и том
+# же held-соединении, прежде чем сдаться на нём и перейти к следующему —
+# большое значение, чтобы не переключаться на другое соединение раньше
+# времени: см. комментарий выше про частые короткие попытки.
+DEFAULT_MAX_ATTEMPTS_PER_CONNECTION = 20
+# Подтверждено на практике 2026-08-18: held-соединение, простоявшее в
+# пуле опознанным дольше примерно минуты без единой попытки чтения,
+# оказывается уже полностью нежизнеспособным (не отвечает вообще ни на
+# один SNRM). claim() с этим порогом просто не отдаёт такие соединения —
+# вызывающий код ждёт следующее свежее вместо того, чтобы тратить время
+# на заведомо мёртвое.
+DEFAULT_MAX_CLAIM_AGE_S = 30.0
+# Подтверждено побайтовым разбором tcpdump-захвата 2026-08-18: AARQ
+# доходит до счётчика и подтверждается на уровне TCP (ACK) уже в первую
+# секунду — то есть проблема НЕ в доставке запроса. После этого счётчик
+# может молчать намного дольше, чем ~9с (наш прежний общий таймаут на
+# попытку), прежде чем прислать AARE. Раз доставка уже подтверждена
+# TCP-подтверждением, повторно слать SNRM тут бессмысленно (проверено:
+# счётчик и так уже принял и обработал AARQ) — лучше просто терпеливо
+# подождать ответ дольше именно на этом шаге, не начиная сессию заново.
+DEFAULT_ASSOCIATION_TIMEOUT_MS = 45000
 
 _DLT645_START = 0x68
 
@@ -145,9 +187,8 @@ class _PooledConnection:
 
 class CallHomePool:
     """Слушает входящие call-home соединения, держит скользящее окно из
-    ``window_size`` кандидатов, отдаёт уже установленные (но ещё не
-    прошедшие SNRM) соединения по запросу ``claim`` для конкретного
-    серийного номера.
+    ``window_size`` кандидатов, отдаёт held-соединения по запросу
+    ``claim`` для конкретного серийного номера.
     """
 
     def __init__(
@@ -262,16 +303,33 @@ class CallHomePool:
         except (socket.timeout, OSError):
             return
 
-    def claim(self, serial: str) -> _PooledConnection | None:
-        """Забирает из пула одно held-соединение для данного серийного
-        номера (если есть) — оно больше не подлежит вытеснению по
-        скользящему окну, ответственность за него переходит вызывающему."""
+    def claim(self, serial: str, *, max_age_s: float | None = None) -> _PooledConnection | None:
+        """Забирает из пула САМОЕ СВЕЖЕЕ held-соединение для данного
+        серийного номера (если есть) — оно больше не подлежит вытеснению
+        по скользящему окну, ответственность за него переходит
+        вызывающему. Предпочтение свежему, а не старейшему совпадению —
+        у более старого соединения выше шанс, что его окно жизни (см.
+        docstring модуля, п.3) уже истекло.
+
+        ``max_age_s``, если задан, полностью ИСКЛЮЧАЕТ из рассмотрения
+        соединения старше этого возраста — подтверждено на практике
+        2026-08-18: соединение, которое пролежало в пуле опознанным, но
+        невостребованным дольше примерно минуты, не отвечает ВООБЩЕ
+        НИЧЕГО ни на один SNRM (проверено 20 попытками подряд), даже
+        если формально ещё не закрыто со своей стороны. Лучше подождать
+        следующее свежее соединение (см. вызывающий код в
+        ``read_via_call_home``), чем тратить время на заведомо мёртвое.
+        """
         with self._lock:
-            for conn_no, pc in list(self._pool.items()):
-                if pc.serial == serial:
-                    del self._pool[conn_no]
-                    return pc
-        return None
+            matches = [pc for pc in self._pool.values() if pc.serial == serial]
+            if max_age_s is not None:
+                now = time.time()
+                matches = [pc for pc in matches if now - pc.accepted_at <= max_age_s]
+            if not matches:
+                return None
+            chosen = matches[-1]
+            del self._pool[chosen.conn_no]
+            return chosen
 
     def pending_count(self, serial: str | None = None) -> int:
         with self._lock:
@@ -292,13 +350,22 @@ def read_via_call_home(
     # ДО того, как Gateway сдастся сам, и ошибка выглядит немым обрывом
     # соединения вместо понятного TIMEOUT/GATEWAY_ERROR.
     max_wait_s: float = 60.0,
-    per_attempt_timeout_ms: int = 3000,
+    per_attempt_timeout_ms: int = DEFAULT_PER_ATTEMPT_TIMEOUT_MS,
+    max_attempts_per_connection: int = DEFAULT_MAX_ATTEMPTS_PER_CONNECTION,
+    max_claim_age_s: float = DEFAULT_MAX_CLAIM_AGE_S,
+    association_timeout_ms: int = DEFAULT_ASSOCIATION_TIMEOUT_MS,
 ) -> object:
     """Пытается прочитать регистр через уже установленные (call-home)
-    соединения для данного счётчика — перебирает все, что есть в пуле,
-    на каждом повторяя SNRM+полный обмен, пока один не даст успех либо
-    не истечёт ``max_wait_s`` (нужны повторные попытки: единственный
-    SNRM сразу после подключения ответа не даёт, см. docstring модуля).
+    соединения для данного счётчика — перебирает held-соединения от
+    самого свежего. На каждом соединении сначала повторяет SNRM
+    (``max_attempts_per_connection`` раз с коротким ``per_attempt_timeout_ms``
+    — счётчик действительно не отвечает на первый SNRM, нужны именно
+    повторы). После того как SNRM/UA прошёл, AARQ+GET выполняются ОДИН
+    раз с намного бОльшим ``association_timeout_ms`` и БЕЗ повторной
+    отправки SNRM — см. ``DEFAULT_ASSOCIATION_TIMEOUT_MS``: доставка
+    AARQ подтверждена TCP-ACK, дальнейшие повторы SNRM тут не помогут,
+    нужно просто терпеливее ждать. Соединения старше ``max_claim_age_s``
+    не забираются вовсе (см. docstring ``CallHomePool.claim``).
     """
     # Импорт здесь, а не на верхнем уровне модуля — chain
     # callhome -> protocols.hdlc_dlms -> transport не нужен для тех, кто
@@ -311,33 +378,59 @@ def read_via_call_home(
     tried_any = False
 
     while time.time() < deadline:
-        pc = pool.claim(serial)
+        pc = pool.claim(serial, max_age_s=max_claim_age_s)
         if pc is None:
             time.sleep(0.5)
             continue
         tried_any = True
         filtering_sock = DlT645FilteringSocket(pc.raw_sock)
-        attempt = 0
-        while time.time() < deadline:
-            attempt += 1
+        linked = False
+        for attempt in range(1, max_attempts_per_connection + 1):
+            if time.time() >= deadline:
+                break
             filtering_sock.reset_seeking()
             transport = TcpServerTransport.from_accepted_socket(
                 filtering_sock, peer_host=pc.peer[0], peer_port=pc.peer[1], timeout_ms=per_attempt_timeout_ms
             )
             try:
-                value = hdlc_dlms.read_register(transport, serial=serial, password=password, obis=obis)
+                hdlc_dlms.establish_link(transport, serial=serial)
+                linked = True
+                break
+            except GatewayError as exc:
+                last_error = exc
                 logger.info(
-                    "Call-home: чтение %s удалось на соединении #%d, попытка %d",
-                    serial, pc.conn_no, attempt,
+                    "Call-home: попытка %d SNRM на соединении #%d — %s, повтор",
+                    attempt, pc.conn_no, exc.code,
                 )
+            except (ConnectionError, OSError) as exc:
+                last_error = GatewayError(f"Обрыв соединения #{pc.conn_no}: {exc}")
+                break  # это соединение мертво, пробуем следующее held-соединение (если появится)
+            time.sleep(retry_interval_s)
+
+        if linked:
+            # SNRM/UA прошёл — доставку AARQ дальше подтверждает сам TCP
+            # (ACK), так что смысла пересылать SNRM снова нет. Просто
+            # терпеливо ждём AARE/GET-response на том же transport, без
+            # разрыва сессии.
+            filtering_sock.settimeout(association_timeout_ms / 1000)
+            try:
+                value = hdlc_dlms.read_register_via_established_link(
+                    transport, serial=serial, password=password, obis=obis
+                )
+                logger.info("Call-home: чтение %s удалось на соединении #%d", serial, pc.conn_no)
                 return value
             except GatewayError as exc:
                 last_error = exc
                 if exc.code == "AUTH_FAILED":
                     raise  # не связано с проблемой соединения — повторять бессмысленно
-            except (ConnectionError, OSError):
-                break  # это соединение мертво, пробуем следующее held-соединение (если появится)
-            time.sleep(retry_interval_s)
+                logger.info(
+                    "Call-home: AARQ/GET на соединении #%d подтверждён TCP, но AARE/GET-response "
+                    "не пришёл за %.0fс (%s) — переходим к следующему соединению",
+                    pc.conn_no, association_timeout_ms / 1000, exc.code,
+                )
+            except (ConnectionError, OSError) as exc:
+                last_error = GatewayError(f"Обрыв соединения #{pc.conn_no}: {exc}")
+
         try:
             pc.raw_sock.close()
         except OSError:
