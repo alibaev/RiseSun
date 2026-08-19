@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 
+from datetime import timedelta
 from typing import Iterator
 
 from ..addressing import HDLC_DLMS, physical_address
@@ -69,7 +70,17 @@ def read_register_via_established_link(
     obis: str,
     class_id: int = dlms.REGISTER_CLASS_ID,
 ) -> object:
-    """AARQ/AARE + GET поверх УЖЕ установленной (SNRM/UA пройден) HDLC-связи."""
+    """AARQ/AARE + GET поверх УЖЕ установленной (SNRM/UA пройден) HDLC-связи.
+
+    Для объектов класса Register (3) значение атрибута 2 — это СЫРОЕ
+    целое число, применить масштаб (атрибут 3, scaler_unit) обязан
+    именно Gateway (Backend не реализует протокольную логику,
+    Promt_MMWS.md, раздел 3, принцип 1) — иначе, например, показание
+    4507.70 отдаётся как 450770 (найденный баг, см. dlms.py). Если
+    объект вообще не поддерживает scaler_unit (data-access-error на
+    GET атрибута 3 — актуально для параметров класса Data, обычно
+    читаемых через этот же путь с явно переданным class_id=1),
+    возвращается сырое значение без изменений."""
     server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
     client_addr = DEFAULT_CLIENT_ADDRESS
 
@@ -81,13 +92,37 @@ def read_register_via_established_link(
     aare_frame = _recv_i_frame(transport)
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))  # бросает AuthFailedError при отказе
 
-    request = dlms.build_get_request(dlms.parse_obis(obis), class_id=class_id)
+    parsed_obis = dlms.parse_obis(obis)
+    request = dlms.build_get_request(parsed_obis, class_id=class_id)
     _send_i_frame(
         transport, server_addr, client_addr, send_seq=1, recv_seq=1,
         information=dlms.wrap_llc_command(request),
     )
     response_frame = _recv_i_frame(transport)
-    return dlms.parse_get_response(dlms.unwrap_llc(response_frame.information))
+    raw_value = dlms.parse_get_response(dlms.unwrap_llc(response_frame.information))
+
+    if class_id != dlms.REGISTER_CLASS_ID or not isinstance(raw_value, (int, float)):
+        return raw_value
+
+    scaler_request = dlms.build_get_request(
+        parsed_obis, class_id=class_id, attribute_id=dlms.REGISTER_SCALER_UNIT_ATTRIBUTE,
+    )
+    _send_i_frame(
+        transport, server_addr, client_addr, send_seq=2, recv_seq=2,
+        information=dlms.wrap_llc_command(scaler_request),
+    )
+    scaler_frame = _recv_i_frame(transport)
+    try:
+        scaler_unit = dlms.parse_get_response(dlms.unwrap_llc(scaler_frame.information))
+    except GatewayError:
+        return raw_value  # объект не отдаёт scaler_unit — значение уже финальное
+
+    if not (isinstance(scaler_unit, list) and len(scaler_unit) == 2 and isinstance(scaler_unit[0], int)):
+        return raw_value
+    scaler = scaler_unit[0]
+    if scaler == 0:
+        return raw_value
+    return round(raw_value * (10**scaler), max(0, -scaler))
 
 
 def write_register(
@@ -257,21 +292,56 @@ def read_load_profile(
     class_id: int,
     from_dt,
     to_dt,
-) -> Iterator[object]:
-    """Профиль нагрузки (Этап 3, ТЗ п.4.2.3) — GET с выборкой по датам,
-    при необходимости через несколько датаблоков (см. dlms.py).
+) -> Iterator[tuple[object, object]]:
+    """Профиль нагрузки (Этап 3, ТЗ п.4.2.3) — SNRM/UA + AARQ/AARE + GET
+    с выборкой по датам поверх ЕЩЁ НЕ установленного HDLC-соединения
+    (обычный, не call-home, транспорт). См. docstring
+    ``read_load_profile_via_established_link`` — вся протокольная логика
+    там, здесь только установление связи перед ней (та же схема, что и
+    у ``read_register``/``read_register_via_established_link``)."""
+    server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
+    client_addr = DEFAULT_CLIENT_ADDRESS
+
+    _establish_link(transport, server_addr, client_addr)
+
+    yield from read_load_profile_via_established_link(
+        transport, serial=serial, password=password, obis=obis,
+        class_id=class_id, from_dt=from_dt, to_dt=to_dt,
+    )
+
+
+def read_load_profile_via_established_link(
+    transport: TcpTransport,
+    *,
+    serial: str,
+    password: bytes,
+    obis: str,
+    class_id: int,
+    from_dt,
+    to_dt,
+) -> Iterator[tuple[object, object]]:
+    """AARQ/AARE + GET профиля нагрузки поверх УЖЕ установленной (SNRM/UA
+    пройден) HDLC-связи — используется как обычным ``read_load_profile``,
+    так и call-home транспортом (``callhome.read_load_profile_via_call_home``),
+    у которого SNRM/UA выполняется отдельно с повторами (счётчик не
+    всегда отвечает на первый SNRM, см. callhome.py).
+
+    Реальный экспорт объектной модели счётчика (сервисная программа
+    завода, 2026-08-19, см. DECISIONS.md) показал, что захватываемые
+    колонки буфера НЕ включают объект Clock — строка не несёт метку
+    времени сама по себе. Поэтому перед чтением буфера отдельным
+    GET читается атрибут 4 (capture_period, секунды), а метка времени
+    каждой строки вычисляется как ``from_dt + номер_строки * period``.
 
     Генератор: отдаёт КАЖДУЮ строку буфера сразу, как только она
     полностью собрана из накопленных байт (не дожидаясь всего ответа
     целиком) — обрыв соединения посреди передачи не теряет уже
     отданные вызывающему коду строки (ТЗ п.4.2.3 — докачка при обрыве,
-    is_partial). Каждая строка — то, что вернул ``datatypes.decode_value``
-    для одного элемента массива (обычно список значений колонок,
-    первая колонка по конвенции — метка времени)."""
+    is_partial). Каждый элемент генератора — пара ``(timestamp, values)``,
+    где ``values`` — то, что вернул ``datatypes.decode_value`` для
+    захватываемых колонок одной строки буфера (список значений)."""
     server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
     client_addr = DEFAULT_CLIENT_ADDRESS
-
-    _establish_link(transport, server_addr, client_addr)
 
     aarq = dlms.build_aarq(password)
     _send_i_frame(
@@ -281,19 +351,39 @@ def read_load_profile(
     aare_frame = _recv_i_frame(transport)
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))
 
-    request = dlms.build_get_request_range(
-        dlms.parse_obis(obis), class_id=class_id, from_dt=from_dt, to_dt=to_dt,
+    parsed_obis = dlms.parse_obis(obis)
+
+    period_request = dlms.build_get_request(
+        parsed_obis, class_id=class_id,
+        attribute_id=dlms.PROFILE_GENERIC_CAPTURE_PERIOD_ATTRIBUTE,
     )
     _send_i_frame(
         transport, server_addr, client_addr, send_seq=1, recv_seq=1,
+        information=dlms.wrap_llc_command(period_request),
+    )
+    period_frame = _recv_i_frame(transport)
+    capture_period_seconds = dlms.parse_get_response(dlms.unwrap_llc(period_frame.information))
+    if not isinstance(capture_period_seconds, int) or capture_period_seconds <= 0:
+        raise GatewayError(
+            f"Некорректный capture_period профиля нагрузки: {capture_period_seconds!r}"
+        )
+
+    request = dlms.build_get_request_range(
+        parsed_obis, class_id=class_id, from_dt=from_dt, to_dt=to_dt,
+    )
+    _send_i_frame(
+        transport, server_addr, client_addr, send_seq=2, recv_seq=2,
         information=dlms.wrap_llc_command(request),
     )
 
-    send_seq = 2
+    send_seq = 3
     buf = bytearray()
     cursor = 0
     total_count: int | None = None
     decoded_count = 0
+
+    def _timestamp_for(index: int):
+        return from_dt + timedelta(seconds=capture_period_seconds * index)
 
     while True:
         response_frame = _recv_i_frame(transport)
@@ -304,8 +394,8 @@ def read_load_profile(
             # Весь ответ уместился в одном PDU — блочная передача не
             # понадобилась (короткий диапазон дат).
             value = dlms.parse_get_response(payload)
-            for row in value:
-                yield row
+            for index, row in enumerate(value):
+                yield _timestamp_for(index), row
             return
 
         if response_type != dlms.GET_RESPONSE_WITH_DATABLOCK:
@@ -326,7 +416,7 @@ def read_load_profile(
                     row, consumed = datatypes.decode_value(bytes(buf), offset=cursor)
                 except DlmsDataError:
                     break  # строка ещё не собрана целиком — ждём следующий датаблок
-                yield row
+                yield _timestamp_for(decoded_count), row
                 cursor += consumed
                 decoded_count += 1
 

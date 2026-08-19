@@ -320,7 +320,7 @@ async def test_read_load_profile_stores_all_rows(db_session):
         await _run_read_load_profile(db_session, job)
 
     assert job.status == JobStatus.SUCCEEDED
-    assert job.result == {"obis": "1.0.63.1.0.ff", "rows_written": 3}
+    assert job.result == {"obis": "1.1.63.1.0.ff", "rows_written": 3}
 
     stored = (
         (await db_session.execute(select(LoadProfileData).where(LoadProfileData.meter_id == meter.id)))
@@ -329,7 +329,7 @@ async def test_read_load_profile_stores_all_rows(db_session):
     )
     assert len(stored) == 3
     assert {r.values_json[0] for r in stored} == {1000, 1001, 1002}
-    assert all(r.obis_code == "1.0.63.1.0.ff" for r in stored)
+    assert all(r.obis_code == "1.1.63.1.0.ff" for r in stored)
 
 
 @pytest.mark.asyncio
@@ -401,7 +401,7 @@ async def test_read_load_profile_partial_failure_keeps_already_received_rows(db_
 
     assert job.status == JobStatus.FAILED
     assert job.error == {"code": "CONNECTION_LOST", "message": "соединение оборвалось", "is_partial": True}
-    assert job.result == {"obis": "1.0.63.1.0.ff", "rows_written": 1}
+    assert job.result == {"obis": "1.1.63.1.0.ff", "rows_written": 1}
 
     stored = (
         (await db_session.execute(select(LoadProfileData).where(LoadProfileData.meter_id == meter.id)))

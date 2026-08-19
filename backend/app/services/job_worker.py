@@ -349,7 +349,17 @@ async def _run_read_load_profile(db: AsyncSession, job: Job) -> None:
             obis=obis,
             from_iso=from_iso,
             to_iso=to_iso,
-            call_timeout_s=160.0 if meter.is_call_home else 180.0,
+            # 220с (не 160с, как у read_current) — живая проверка
+            # 2026-08-19 показала, что многошаговый обмен профиля
+            # нагрузки (AARQ/AARE + GET capture_period + GET с
+            # диапазоном) на одном call-home соединении может упереться
+            # в association_timeout_ms (45с) уже ПОСЛЕ того, как
+            # внутренний max_wait_s=150с Gateway формально истёк (сам
+            # цикл проверяет дедлайн только МЕЖДУ попытками, не обрывает
+            # уже начатое ожидание ответа) — без запаса клиентский gRPC
+            # deadline обрывал вызов раньше, чем Gateway успевал отдать
+            # собственную, понятную ошибку.
+            call_timeout_s=220.0 if meter.is_call_home else 180.0,
         ):
             stmt = (
                 pg_insert(LoadProfileData)

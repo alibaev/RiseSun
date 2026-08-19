@@ -54,6 +54,31 @@ def test_happy_path_reads_value():
     assert value == 1234567
 
 
+def test_register_read_applies_scaler():
+    """Найденный баг (2026-08-19, сообщение пользователя): показание
+    4507.70 отображалось в MMWS как 450770 — атрибут 3 (scaler_unit)
+    читался счётчиком реального трафика, но в коде не применялся. Сырое
+    значение 450770 при scaler=-2 (0.01) должно превращаться в 4507.7."""
+    counter = ConnectionCounter()
+    handler = make_hdlc_dlms_handler(
+        password=PASSWORD,
+        obis_values={dlms.parse_obis(OBIS): 450770},
+        error_injection=ErrorInjection(),
+        counter=counter,
+        register_scalers={dlms.parse_obis(OBIS): -2},
+    )
+    with ThreadedEmulatorServer(handler) as server:
+        value = _read(server)
+    assert value == 4507.7
+
+
+def test_register_read_without_scaler_stays_integer():
+    with _start_server(ErrorInjection()) as server:
+        value = _read(server)
+    assert value == 1234567
+    assert isinstance(value, int)
+
+
 def test_wrong_password_raises_auth_failed():
     with _start_server(ErrorInjection()) as server:
         with pytest.raises(AuthFailedError):

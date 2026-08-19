@@ -22,7 +22,7 @@ from datetime import datetime
 
 import grpc
 
-from .callhome import CallHomePool, read_via_call_home
+from .callhome import CallHomePool, read_load_profile_via_call_home, read_via_call_home
 from .errors import GatewayError
 from .grpc_generated import gateway_pb2, gateway_pb2_grpc
 from .protocols import datatypes, dlms, hdlc_dlms, mode_c, mode_e
@@ -132,43 +132,59 @@ def _do_read_load_profile(request: gateway_pb2.ReadLoadProfileRequest, call_home
     передачи неоднозначен (какие строки повторно запрашивать), поэтому
     решение «докачивать ли остаток после обрыва» (is_partial) отдано
     на откуп Backend'у (см. ReadLoadProfile в gateway.proto), а не
-    реализовано здесь неявным повтором всей операции заново."""
+    реализовано здесь неявным повтором всей операции заново. Для
+    call-home (2026-08-19) повтор ВСЕЙ операции на следующем
+    held-соединении всё же встроен в ``callhome.read_load_profile_via_call_home``
+    — это внутренний приём подбора рабочего соединения при нестабильной
+    задержке реального счётчика, а не докачка остатка буфера."""
     password = request.password.encode("ascii")
 
-    if request.call_home:
-        raise GatewayError("Профиль нагрузки через call-home пока не реализован")
     if request.profile != "hdlc_dlms":
         raise GatewayError(f"Профиль нагрузки для протокольного профиля {request.profile!r} пока не реализован")
 
-    timeout_ms = request.timeout_ms or DEFAULT_TIMEOUT_MS
-    config = TransportConfig(host=request.host, port=request.port, timeout_ms=timeout_ms, max_retries=1)
+    class_id = request.class_id or dlms.PROFILE_GENERIC_CLASS_ID
     from_dt = datetime.fromisoformat(request.from_iso)
     to_dt = datetime.fromisoformat(request.to_iso)
+
+    if request.call_home:
+        if call_home_pool is None:
+            raise GatewayError("Call-home пул не запущен на этом экземпляре Gateway")
+        # max_wait_s согласован с call_timeout_s для профиля нагрузки в
+        # backend/app/services/job_worker.py — тот же принцип, что и у
+        # ReadRegister через call-home (см. _do_read выше).
+        yield from read_load_profile_via_call_home(
+            call_home_pool, serial=request.serial, password=password, obis=request.obis,
+            class_id=class_id, from_dt=from_dt, to_dt=to_dt, max_wait_s=150.0,
+        )
+        return
+
+    timeout_ms = request.timeout_ms or DEFAULT_TIMEOUT_MS
+    config = TransportConfig(host=request.host, port=request.port, timeout_ms=timeout_ms, max_retries=1)
 
     with TcpTransport(config) as transport:
         yield from hdlc_dlms.read_load_profile(
             transport, serial=request.serial, password=password, obis=request.obis,
-            class_id=request.class_id or dlms.PROFILE_GENERIC_CLASS_ID,
-            from_dt=from_dt, to_dt=to_dt,
+            class_id=class_id, from_dt=from_dt, to_dt=to_dt,
         )
 
 
-def _load_profile_row_to_proto(row: object) -> gateway_pb2.LoadProfileRow:
-    """Первая колонка строки буфера по конвенции — метка времени
-    (octet_string, 12 сырых байт cosem-date-time); Gateway декодирует
-    её сам (Backend не реализует протокольную логику — Promt_MMWS.md,
-    раздел 3, принцип 1). Если строка не в этой форме — гипотеза о
-    структуре буфера профиля нагрузки (см. DECISIONS.md) не
-    подтвердилась, это должно упасть явной ошибкой, а не молча отдать
-    мусор."""
-    if not isinstance(row, list) or not row or not isinstance(row[0], bytes) or len(row[0]) != 12:
+def _load_profile_row_to_proto(entry: tuple[object, object]) -> gateway_pb2.LoadProfileRow:
+    """Буфер профиля нагрузки на реальном оборудовании (проверено по
+    экспорту объектной модели счётчика, сервисная программа завода,
+    2026-08-19 — см. DECISIONS.md) не захватывает объект Clock внутри
+    строки — метку времени вычисляет сам ``read_load_profile`` из
+    ``capture_period``, прочитанного отдельным GET (Gateway, а не
+    Backend, реализует эту протокольную логику — Promt_MMWS.md, раздел
+    3, принцип 1). ``entry`` — пара ``(timestamp, values)``, отданная
+    генератором ``hdlc_dlms.read_load_profile``."""
+    timestamp, values = entry
+    if not isinstance(values, list):
         raise GatewayError(
-            "Первая колонка строки профиля нагрузки не похожа на cosem-date-time "
-            "(12 сырых байт) — гипотеза о структуре буфера не подтвердилась"
+            "Строка профиля нагрузки не в форме списка захваченных колонок — "
+            "гипотеза о структуре буфера не подтвердилась"
         )
-    timestamp = datatypes.decode_cosem_date_time(row[0])
     return gateway_pb2.LoadProfileRow(
-        timestamp_iso=timestamp.isoformat(), values_json=json.dumps(_jsonable(row[1:]))
+        timestamp_iso=timestamp.isoformat(), values_json=json.dumps(_jsonable(values))
     )
 
 

@@ -466,3 +466,105 @@ def read_via_call_home(
     if last_error is not None:
         raise last_error
     raise GatewayError(f"Не удалось прочитать регистр со счётчика {serial} за {max_wait_s}с")
+
+
+def read_load_profile_via_call_home(
+    pool: CallHomePool,
+    *,
+    serial: str,
+    password: bytes,
+    obis: str,
+    class_id: int,
+    from_dt,
+    to_dt,
+    retry_interval_s: float = DEFAULT_RETRY_INTERVAL_S,
+    max_wait_s: float = 150.0,
+    per_attempt_timeout_ms: int = DEFAULT_PER_ATTEMPT_TIMEOUT_MS,
+    max_attempts_per_connection: int = DEFAULT_MAX_ATTEMPTS_PER_CONNECTION,
+    max_claim_age_s: float = DEFAULT_MAX_CLAIM_AGE_S,
+    association_timeout_ms: int = DEFAULT_ASSOCIATION_TIMEOUT_MS,
+):
+    """Профиль нагрузки через call-home (2026-08-19) — тот же приём
+    перебора held-соединений, что и ``read_via_call_home`` (см. её
+    docstring про повторы SNRM и терпеливое ожидание AARE/GET-response),
+    но вместо одного GET на найденном соединении выполняется ВЕСЬ обмен
+    чтения буфера целиком (``hdlc_dlms.read_load_profile_via_established_link``
+    — GET capture_period, затем GET с диапазоном, возможно несколько
+    датаблоков). Если соединение обрывается посреди буфера, уже
+    отданные вызывающему коду строки не теряются (генератор), но сам
+    обмен НЕ возобновляется с места обрыва — начинается заново на
+    следующем held-соединении (протокол не поддерживает докачку внутри
+    одной сессии буфера); повторно отданные строки безвредны — Backend
+    дедуплицирует по (meter_id, obis, timestamp), см. job_worker.py."""
+    from .protocols import hdlc_dlms
+    from .transport import TcpServerTransport
+
+    deadline = time.time() + max_wait_s
+    last_error: GatewayError | None = None
+    tried_any = False
+
+    while time.time() < deadline:
+        pc = pool.claim(serial, max_age_s=max_claim_age_s)
+        if pc is None:
+            time.sleep(0.5)
+            continue
+        tried_any = True
+        filtering_sock = DlT645FilteringSocket(pc.raw_sock)
+        linked = False
+        for attempt in range(1, max_attempts_per_connection + 1):
+            if time.time() >= deadline:
+                break
+            filtering_sock.reset_seeking()
+            transport = TcpServerTransport.from_accepted_socket(
+                filtering_sock, peer_host=pc.peer[0], peer_port=pc.peer[1], timeout_ms=per_attempt_timeout_ms
+            )
+            try:
+                hdlc_dlms.establish_link(transport, serial=serial)
+                linked = True
+                break
+            except GatewayError as exc:
+                last_error = exc
+                logger.info(
+                    "Call-home (профиль нагрузки): попытка %d SNRM на соединении #%d — %s, повтор",
+                    attempt, pc.conn_no, exc.code,
+                )
+            except (ConnectionError, OSError) as exc:
+                last_error = GatewayError(f"Обрыв соединения #{pc.conn_no}: {exc}")
+                break
+            time.sleep(retry_interval_s)
+
+        if linked:
+            filtering_sock.settimeout(association_timeout_ms / 1000)
+            try:
+                yield from hdlc_dlms.read_load_profile_via_established_link(
+                    transport, serial=serial, password=password, obis=obis,
+                    class_id=class_id, from_dt=from_dt, to_dt=to_dt,
+                )
+                logger.info(
+                    "Call-home: профиль нагрузки %s прочитан на соединении #%d", serial, pc.conn_no
+                )
+                return
+            except GatewayError as exc:
+                last_error = exc
+                if exc.code == "AUTH_FAILED":
+                    raise
+                logger.info(
+                    "Call-home (профиль нагрузки): обмен на соединении #%d не завершился (%s) — "
+                    "переходим к следующему соединению",
+                    pc.conn_no, exc.code,
+                )
+            except (ConnectionError, OSError) as exc:
+                last_error = GatewayError(f"Обрыв соединения #{pc.conn_no}: {exc}")
+
+        try:
+            pc.raw_sock.close()
+        except OSError:
+            pass
+
+    if not tried_any:
+        raise GatewayError(
+            f"Счётчик {serial} ещё не установил ни одного call-home соединения с Gateway"
+        )
+    if last_error is not None:
+        raise last_error
+    raise GatewayError(f"Не удалось прочитать профиль нагрузки со счётчика {serial} за {max_wait_s}с")

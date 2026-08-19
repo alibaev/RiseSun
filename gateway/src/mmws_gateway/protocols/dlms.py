@@ -79,7 +79,23 @@ USER_INFORMATION_INITIATE = bytes.fromhex("be10040e01000000065f1f040000081d0000"
 
 REGISTER_CLASS_ID = 3
 REGISTER_VALUE_ATTRIBUTE = 2
+# Атрибут 3 (scaler_unit) — structure {scaler: integer (десятичный
+# показатель степени), unit: enum}. Найденный баг (2026-08-19,
+# сообщение пользователя): показания выводились БЕЗ применения scaler
+# (напр. 4507.70 отображалось как 450770) — атрибут 3 упоминался в
+# докстрингах ещё с Этапа 0 как «легитимный клиент читает scaler_unit
+# отдельным GET перед value» (подтверждено реальным трафиком Risesun),
+# но фактически нигде не читался и не применялся. См.
+# ``hdlc_dlms.read_register_via_established_link``.
+REGISTER_SCALER_UNIT_ATTRIBUTE = 3
 PROFILE_GENERIC_CLASS_ID = 7  # буфер профиля нагрузки (Этап 3, ТЗ п.4.2.3)
+# Атрибут 4 (capture_period, секунды) — период записи строк буфера.
+# Реальный экспорт объектной модели DTZY217 (сервисная программа завода,
+# 2026-08-19, см. DECISIONS.md) показал, что захватываемые колонки этого
+# профиля НЕ включают объект Clock — буфер не несёт метку времени внутри
+# строки, поэтому Gateway обязан прочитать capture_period ДО чтения
+# буфера и вычислить метки сам (см. read_load_profile в hdlc_dlms.py).
+PROFILE_GENERIC_CAPTURE_PERIOD_ATTRIBUTE = 4
 
 
 def encode_oid(components: tuple[int, ...]) -> bytes:

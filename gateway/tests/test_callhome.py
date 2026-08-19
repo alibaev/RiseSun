@@ -12,13 +12,16 @@ import time
 
 import pytest
 
+from datetime import datetime, timedelta
+
 from mmws_gateway.callhome import (
     CallHomePool,
     DlT645FilteringSocket,
+    read_load_profile_via_call_home,
     read_via_call_home,
     serial_from_dlt645_address,
 )
-from mmws_gateway.protocols import dlms
+from mmws_gateway.protocols import datatypes, dlms
 from mmws_gateway.protocols.hdlc import CONTROL_SNRM, CONTROL_UA, HdlcFrame
 
 
@@ -179,6 +182,23 @@ def _serve_rest_of_session(conn: socket.socket, *, password: bytes, obis_values:
     )
     conn.sendall(response_frame.encode())
 
+    if value is not None:
+        # Значение прочитано успешно — read_register_via_established_link
+        # (2026-08-19, найденный баг со scaler) сразу же дочитывает
+        # scaler_unit (атрибут 3) тем же обменом; отвечаем scaler=0
+        # (не меняет ожидаемое сырое значение в этом тесте).
+        scaler_frame = HdlcFrame.decode(_read_frame(conn))
+        scaler_request = dlms.parse_get_request(dlms.unwrap_llc(scaler_frame.information))
+        scaler_value = datatypes.encode_structure(
+            [datatypes.encode_integer(0), datatypes.encode_unsigned(0)]
+        )
+        scaler_info = dlms.build_get_response_data(scaler_request.invoke_id, scaler_value)
+        scaler_response_frame = HdlcFrame(
+            destination=scaler_frame.source, source=scaler_frame.destination,
+            control=control_information_frame(2, 3), information=dlms.wrap_llc_response(scaler_info),
+        )
+        conn.sendall(scaler_response_frame.encode())
+
 
 def test_read_via_call_home_succeeds_after_ignored_snrm_attempts():
     """Регрессия модели реального поведения: первая попытка SNRM ответа
@@ -236,3 +256,99 @@ def test_read_via_call_home_raises_if_meter_never_connected():
             )
     finally:
         pool.stop()
+
+
+def _run_fake_meter_load_profile(
+    conn: socket.socket, *, addr6: bytes, password: bytes,
+    load_profile_obis: bytes, rows: list, capture_period_seconds: int, block_size: int,
+) -> None:
+    """Тот же приём, что и ``_run_fake_meter``/``_serve_rest_of_session``
+    (2026-08-19) — воспроизводит SNRM->UA->AARQ->AARE, затем GET
+    capture_period (обычный GET, без access-selection) и GET с диапазоном
+    дат (``_serve_load_profile`` из эмулятора, форсирующего датаблочную
+    передачу)."""
+    from mmws_gateway.emulators.hdlc_dlms_emulator import _read_frame, _serve_load_profile
+    from mmws_gateway.protocols.hdlc import control_information_frame
+
+    conn.sendall(_build_dummy_dlt645_frame(addr6))
+
+    frame = HdlcFrame.decode(_read_frame(conn))
+    assert frame.control == CONTROL_SNRM
+    ua = HdlcFrame(destination=frame.source, source=frame.destination, control=CONTROL_UA)
+    conn.sendall(ua.encode())
+
+    aarq_frame = HdlcFrame.decode(_read_frame(conn))
+    parsed_aarq = dlms.parse_aarq(dlms.unwrap_llc(aarq_frame.information))
+    assert parsed_aarq.password == password
+    aare = dlms.build_aare(accepted=True)
+    aare_frame = HdlcFrame(
+        destination=aarq_frame.source, source=aarq_frame.destination,
+        control=control_information_frame(0, 1), information=dlms.wrap_llc_response(aare),
+    )
+    conn.sendall(aare_frame.encode())
+
+    period_frame = HdlcFrame.decode(_read_frame(conn))
+    period_request = dlms.parse_get_request(dlms.unwrap_llc(period_frame.information))
+    assert period_request.obis == load_profile_obis
+    info = dlms.build_get_response_data(
+        period_request.invoke_id, datatypes.encode_double_long_unsigned(capture_period_seconds)
+    )
+    response_frame = HdlcFrame(
+        destination=period_frame.source, source=period_frame.destination,
+        control=control_information_frame(1, 2), information=dlms.wrap_llc_response(info),
+    )
+    conn.sendall(response_frame.encode())
+
+    range_frame = HdlcFrame.decode(_read_frame(conn))
+    payload = dlms.unwrap_llc(range_frame.information)
+    _serve_load_profile(
+        conn, range_frame, invoke_id=payload[2], rows=rows, block_size=block_size,
+        send_seq=2, recv_seq=3,
+    )
+
+
+def test_read_load_profile_via_call_home_streams_rows():
+    """Профиль нагрузки через call-home (2026-08-19) — тот же сценарий
+    нестабильного реального счётчика (первая попытка SNRM без ответа),
+    но для ВСЕГО обмена чтения буфера, не одного GET."""
+    serial = "202001002352"
+    addr6 = bytes.fromhex("522300012020")
+    password = b"12345678"
+    obis = "1.1.63.1.0.ff"
+    class_id = dlms.PROFILE_GENERIC_CLASS_ID
+    capture_period_seconds = 900
+    from_dt = datetime(2026, 8, 1)
+    to_dt = datetime(2026, 8, 19)
+    rows = [[datatypes.encode_double_long_unsigned(5000 + i)] for i in range(4)]
+
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10)
+    pool.start()
+    try:
+        client_conn = socket.create_connection(("127.0.0.1", pool.bind_port))
+        meter_thread = threading.Thread(
+            target=_run_fake_meter_load_profile,
+            kwargs=dict(
+                conn=client_conn, addr6=addr6, password=password,
+                load_profile_obis=dlms.parse_obis(obis), rows=rows,
+                capture_period_seconds=capture_period_seconds, block_size=6,
+            ),
+            daemon=True,
+        )
+        meter_thread.start()
+
+        decoded = list(
+            read_load_profile_via_call_home(
+                pool, serial=serial, password=password, obis=obis, class_id=class_id,
+                from_dt=from_dt, to_dt=to_dt,
+                retry_interval_s=0.5, max_wait_s=15, per_attempt_timeout_ms=1500,
+                max_attempts_per_connection=5,
+            )
+        )
+        meter_thread.join(timeout=3)
+    finally:
+        pool.stop()
+
+    assert len(decoded) == 4
+    for i, (timestamp, values) in enumerate(decoded):
+        assert timestamp == from_dt + timedelta(seconds=capture_period_seconds * i)
+        assert values == [5000 + i]

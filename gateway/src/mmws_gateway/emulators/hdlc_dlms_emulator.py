@@ -33,6 +33,8 @@ def make_hdlc_dlms_handler(
     load_profile_obis: bytes | None = None,
     load_profile_rows: list[list[bytes]] | None = None,
     load_profile_block_size: int = 40,
+    load_profile_capture_period_seconds: int = 900,
+    register_scalers: dict[bytes, int] | None = None,
     action_state: dict[bytes, int] | None = None,
     action_force_result: int | None = None,
 ):
@@ -47,20 +49,32 @@ def make_hdlc_dlms_handler(
 
     ``load_profile_obis``/``load_profile_rows`` (Этап 3) — эмуляция
     буфера профиля нагрузки: каждая строка ``load_profile_rows`` — уже
-    закодированный список колонок (см. ``datatypes.encode_*``),
-    оборачивается в structure и отдаётся ВСЕГДА через датаблоки (по
-    ``load_profile_block_size`` байт на датаблок — специально маленький
-    по умолчанию, чтобы гарантированно проверить склейку нескольких
-    датаблоков в тестах), не через GET.response-Normal. Реальная
-    фильтрация по диапазону дат не эмулируется — отдаются все строки
-    целиком, диапазон в запросе не проверяется (эмулятор нужен для
-    проверки МЕХАНИЗМА блочной передачи, не бизнес-логики счётчика).
+    закодированный список колонок (см. ``datatypes.encode_*``, БЕЗ
+    колонки-метки времени — реальный буфер её не захватывает, см.
+    DECISIONS.md 2026-08-19), оборачивается в structure и отдаётся
+    ВСЕГДА через датаблоки (по ``load_profile_block_size`` байт на
+    датаблок — специально маленький по умолчанию, чтобы гарантированно
+    проверить склейку нескольких датаблоков в тестах), не через
+    GET.response-Normal. Реальная фильтрация по диапазону дат не
+    эмулируется — отдаются все строки целиком, диапазон в запросе не
+    проверяется (эмулятор нужен для проверки МЕХАНИЗМА блочной
+    передачи, не бизнес-логики счётчика). Перед этим запросом Gateway
+    сначала читает атрибут 4 (capture_period) обычным GET без
+    access-selection — эмулятор отвечает ``load_profile_capture_period_seconds``.
 
     ``action_state`` (Этап 5) — если задан, каждый обработанный
     ACTION.request записывает в него ``{obis: method_id}``, чтобы тест
     мог проверить, что именно было вызвано (remote_disconnect/
     remote_reconnect). ``action_force_result`` — принудительный код
-    Action-Result в ответе (для проверки обработки отказа)."""
+    Action-Result в ответе (для проверки обработки отказа).
+
+    ``register_scalers`` (2026-08-19, найденный баг — см.
+    ``hdlc_dlms.read_register_via_established_link``) — после ответа на
+    GET атрибута 2 (value) объекта класса Register эмулятор сам
+    дочитывает следующий кадр и отвечает на GET атрибута 3
+    (scaler_unit): `{scaler: register_scalers.get(obis, 0), unit: 0}`
+    — по умолчанию scaler=0 (не меняет поведение старых тестов, которые
+    задают сырые значения без масштаба)."""
 
     def handler(conn: socket.socket) -> None:
         conn.settimeout(5)
@@ -80,6 +94,8 @@ def make_hdlc_dlms_handler(
             load_profile_obis=load_profile_obis,
             load_profile_rows=load_profile_rows,
             load_profile_block_size=load_profile_block_size,
+            load_profile_capture_period_seconds=load_profile_capture_period_seconds,
+            register_scalers=register_scalers,
             action_state=action_state,
             action_force_result=action_force_result,
         )
@@ -98,6 +114,8 @@ def serve_hdlc_dlms_session(
     load_profile_obis: bytes | None = None,
     load_profile_rows: list[list[bytes]] | None = None,
     load_profile_block_size: int = 40,
+    load_profile_capture_period_seconds: int = 900,
+    register_scalers: dict[bytes, int] | None = None,
     action_state: dict[bytes, int] | None = None,
     action_force_result: int | None = None,
 ) -> None:
@@ -134,18 +152,50 @@ def serve_hdlc_dlms_session(
     tag = payload[0] if payload else None
 
     has_access_selection = len(payload) > 12 and payload[12] == 0x01
-    if (
+    is_load_profile_obis = (
         load_profile_obis is not None
         and tag == dlms.GET_REQUEST_TAG
-        and has_access_selection
         and payload[5:11] == load_profile_obis
-    ):
+    )
+    if is_load_profile_obis and has_access_selection:
         _serve_load_profile(
             conn, req_frame, invoke_id=payload[2],
             rows=load_profile_rows or [], block_size=load_profile_block_size,
         )
         return
 
+    if is_load_profile_obis and payload[11] == dlms.PROFILE_GENERIC_CAPTURE_PERIOD_ATTRIBUTE:
+        # Gateway читает capture_period ДО запроса диапазона (обычный
+        # GET без access-selection) — см. hdlc_dlms.read_load_profile.
+        info = dlms.build_get_response_data(
+            payload[2],
+            datatypes.encode_double_long_unsigned(load_profile_capture_period_seconds),
+        )
+        response_frame = HdlcFrame(
+            destination=req_frame.source,
+            source=req_frame.destination,
+            control=control_information_frame(1, 2),
+            information=dlms.wrap_llc_response(info),
+        )
+        conn.sendall(response_frame.encode())
+        req_frame = HdlcFrame.decode(_read_frame(conn))
+        payload = dlms.unwrap_llc(req_frame.information)
+        tag = payload[0] if payload else None
+        has_access_selection = len(payload) > 12 and payload[12] == 0x01
+        if (
+            load_profile_obis is not None
+            and tag == dlms.GET_REQUEST_TAG
+            and has_access_selection
+            and payload[5:11] == load_profile_obis
+        ):
+            _serve_load_profile(
+                conn, req_frame, invoke_id=payload[2],
+                rows=load_profile_rows or [], block_size=load_profile_block_size,
+                send_seq=2, recv_seq=3,
+            )
+            return
+
+    awaits_scaler_followup = False
     if tag == dlms.ACTION_REQUEST_TAG:
         action_request = dlms.parse_action_request(payload)
         if action_state is not None:
@@ -159,6 +209,7 @@ def serve_hdlc_dlms_session(
         info = dlms.build_set_response(set_request.invoke_id)
     else:
         get_request = dlms.parse_get_request(payload)
+        awaits_scaler_followup = False
         if get_request.class_id == dlms.REGISTER_CLASS_ID:
             value = obis_values.get(get_request.obis)
             info = (
@@ -168,6 +219,11 @@ def serve_hdlc_dlms_session(
                 if value is not None
                 else dlms.build_get_response_error(get_request.invoke_id, OBJECT_UNDEFINED)
             )
+            # Значение прочитано успешно — Gateway (2026-08-19, найденный
+            # баг) сразу же дочитывает scaler_unit (атрибут 3) тем же
+            # обменом; эмулятор должен дождаться этого второго GET и
+            # ответить на него, иначе клиент зависнет на _recv_i_frame.
+            awaits_scaler_followup = value is not None
         else:
             encoded = (data_values or {}).get(get_request.obis)
             info = (
@@ -196,6 +252,34 @@ def serve_hdlc_dlms_session(
 
     conn.sendall(encoded)
 
+    if awaits_scaler_followup:
+        _serve_register_scaler_followup(
+            conn, req_frame, obis=get_request.obis, register_scalers=register_scalers or {},
+        )
+
+
+def _serve_register_scaler_followup(
+    conn: socket.socket, prev_req_frame: HdlcFrame, *, obis: bytes, register_scalers: dict[bytes, int]
+) -> None:
+    """Отвечает на GET атрибута 3 (scaler_unit), который Gateway шлёт
+    сразу вслед за успешным чтением значения объекта класса Register
+    (см. ``hdlc_dlms.read_register_via_established_link``, 2026-08-19)."""
+    scaler_frame = HdlcFrame.decode(_read_frame(conn))
+    scaler_payload = dlms.unwrap_llc(scaler_frame.information)
+    scaler_request = dlms.parse_get_request(scaler_payload)
+    scaler = register_scalers.get(obis, 0)
+    scaler_value = datatypes.encode_structure(
+        [datatypes.encode_integer(scaler), datatypes.encode_unsigned(0)]
+    )
+    info = dlms.build_get_response_data(scaler_request.invoke_id, scaler_value)
+    response_frame = HdlcFrame(
+        destination=scaler_frame.source,
+        source=scaler_frame.destination,
+        control=control_information_frame(2, 3),
+        information=dlms.wrap_llc_response(info),
+    )
+    conn.sendall(response_frame.encode())
+
 
 def _serve_load_profile(
     conn: socket.socket,
@@ -204,18 +288,21 @@ def _serve_load_profile(
     invoke_id: int,
     rows: list[list[bytes]],
     block_size: int,
+    send_seq: int = 1,
+    recv_seq: int = 2,
 ) -> None:
     """Отдаёт настроенные строки профиля нагрузки ВСЕГДА через серию
     GET.response-with-datablock (даже если всё уместилось бы в одном
     PDU) — намеренно упрощённая, но специально проверяющая механизм
     склейки нескольких датаблоков и GET.request-Next в
-    ``hdlc_dlms.read_load_profile``."""
+    ``hdlc_dlms.read_load_profile``. ``send_seq``/``recv_seq`` — с какого
+    номера кадра начинать (по умолчанию сразу после AARE — 1,2; если
+    перед этим уже был отдельный ответ на GET capture_period, вызывающий
+    код передаёт следующие по порядку номера)."""
     array_bytes = datatypes.encode_array(
         [datatypes.encode_structure(row) for row in rows]
     )
 
-    send_seq = 1
-    recv_seq = 2
     offset = 0
     block_number = 0
     while True:

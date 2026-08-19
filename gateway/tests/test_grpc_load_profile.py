@@ -8,7 +8,7 @@
 
 import json
 import socket
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import grpc
 
@@ -20,12 +20,13 @@ from mmws_gateway.protocols import datatypes, dlms
 
 SERIAL = "202006003607"
 PASSWORD = "12345678"
-LOAD_PROFILE_OBIS = "1.0.63.1.0.ff"  # см. test_load_profile.py — decimal 1-0:99.1.0.255 в hex-нотации
+LOAD_PROFILE_OBIS = "1.1.63.1.0.ff"  # см. test_load_profile.py — decimal 1-1:99.1.0.255 в hex-нотации
+CAPTURE_PERIOD_SECONDS = 900
+FROM_DT = datetime(2026, 8, 1)
 
 
-def _row(dt: datetime, value: int) -> list[bytes]:
-    timestamp = datatypes.encode_octet_string(datatypes.encode_cosem_date_time(dt))
-    return [timestamp, datatypes.encode_double_long_unsigned(value)]
+def _row(value: int) -> list[bytes]:
+    return [datatypes.encode_double_long_unsigned(value)]
 
 
 def _start_emulator(rows: list[list[bytes]], *, block_size: int) -> ThreadedEmulatorServer:
@@ -38,6 +39,7 @@ def _start_emulator(rows: list[list[bytes]], *, block_size: int) -> ThreadedEmul
         load_profile_obis=dlms.parse_obis(LOAD_PROFILE_OBIS),
         load_profile_rows=rows,
         load_profile_block_size=block_size,
+        load_profile_capture_period_seconds=CAPTURE_PERIOD_SECONDS,
     )
     return ThreadedEmulatorServer(handler)
 
@@ -56,7 +58,7 @@ def _free_port() -> int:
 
 
 def test_read_load_profile_streams_rows_over_grpc():
-    rows = [_row(datetime(2026, 8, 1, h), 3000 + h) for h in range(5)]
+    rows = [_row(3000 + h) for h in range(5)]
     grpc_port = _free_port()
 
     with _start_emulator(rows, block_size=12) as emulator:  # маленький block_size — форсирует блочную передачу
@@ -83,7 +85,8 @@ def test_read_load_profile_streams_rows_over_grpc():
     assert len(responses) == 5
     for i, response in enumerate(responses):
         assert response.WhichOneof("result") == "row"
-        assert response.row.timestamp_iso == datetime(2026, 8, 1, i).isoformat()
+        expected_ts = FROM_DT + timedelta(seconds=CAPTURE_PERIOD_SECONDS * i)
+        assert response.row.timestamp_iso == expected_ts.isoformat()
         (value,) = json.loads(response.row.values_json)
         assert value == 3000 + i
 

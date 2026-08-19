@@ -180,17 +180,18 @@ message ReadLoadProfileRequest {
   int32 port = 3;
   string serial = 4;
   string password = 5;
-  string obis = 6;           // рабочая гипотеза "1.0.63.1.0.ff" (decimal
-                              // 1-0:99.1.0.255, стандартный DLMS "Load
-                              // Profile 1") — в словаре OBIS.xlsx адрес
-                              // самого буфера не задокументирован, см.
+  string obis = 6;           // "1.1.63.1.0.ff" (decimal 1-1:99.1.0.255) —
+                              // подтверждено экспортом реальной объектной
+                              // модели счётчика DTZY217 (сервисная
+                              // программа завода, 2026-08-19), в словаре
+                              // OBIS.xlsx адрес не задокументирован, см.
                               // DECISIONS.md
   int32 class_id = 7;        // 0 = дефолт Gateway (Profile Generic, класс 7)
   string from_iso = 8;       // ISO 8601, напр. "2026-08-01T00:00:00"
   string to_iso = 9;
   int32 timeout_ms = 10;
   int32 retries = 11;
-  bool call_home = 12;       // пока не реализовано, см. ReadError
+  bool call_home = 12;       // см. callhome.read_load_profile_via_call_home (2026-08-19)
 }
 
 message ReadLoadProfileResponse {
@@ -220,11 +221,13 @@ message DisconnectMeterResponse {
 }
 
 message LoadProfileRow {
-  // Первая колонка строки буфера по конвенции — метка времени
-  // (octet_string, 12 сырых байт cosem-date-time) — Gateway декодирует
-  // её сам (Backend не реализует протокольную логику, Promt_MMWS.md,
-  // раздел 3, принцип 1) и отдаёт готовым ISO 8601. Остальные колонки —
-  // JSON-совместимый вид (тот же принцип, что и ReadValue.value_json).
+  // Реальный буфер профиля нагрузки не захватывает объект Clock внутри
+  // строки (проверено по экспорту объектной модели счётчика, сервисная
+  // программа завода, 2026-08-19 — см. DECISIONS.md) — Gateway вычисляет
+  // метку времени сам из capture_period (Backend не реализует
+  // протокольную логику, Promt_MMWS.md, раздел 3, принцип 1) и отдаёт
+  // готовым ISO 8601. Остальные колонки — JSON-совместимый вид (тот же
+  // принцип, что и ReadValue.value_json).
   string timestamp_iso = 1;
   string values_json = 2;
 }
