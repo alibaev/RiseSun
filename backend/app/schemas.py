@@ -130,6 +130,10 @@ class ReadTriggerRequest(BaseModel):
     obis: str = Field(description="6-байтная hex-нотация A.B.C.D.E.F")
 
 
+class WriteParameterRequest(BaseModel):
+    value: int = Field(ge=0, le=255, description="Новое значение параметра (1 байт, 0-255)")
+
+
 class ParameterWriteHistoryOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

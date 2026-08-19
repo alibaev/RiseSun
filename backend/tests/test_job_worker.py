@@ -24,7 +24,7 @@ from app.models import (
     UserRole,
 )
 from app.services.gateway_client import ReadResult, WriteResult
-from app.services.job_worker import _run_read_current, _run_write_datetime
+from app.services.job_worker import _run_read_current, _run_write_datetime, _run_write_parameter
 
 
 async def _seed_gateway_and_user(db) -> Gateway:
@@ -207,3 +207,59 @@ async def test_write_datetime_partial_failure_marks_job_failed(db_session):
     # old_value отсутствует — предварительное чтение неудачно, но это не
     # мешает всё равно попытаться записать и зафиксировать результат.
     assert all(h.old_value is None for h in history)
+
+
+@pytest.mark.asyncio
+async def test_write_parameter_settlement_no_records_history(db_session):
+    """Этап 2, итерация 2: запись одиночного параметра из реестра
+    WRITABLE_INT_PARAMETERS (settlement_no) с пользовательским значением."""
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202006003607",
+        ip_address="192.168.1.50",
+        port=4059,
+        protocol_profile=ProtocolProfile.HDLC_DLMS,
+        password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    root = (await db_session.execute(select(User))).scalars().first()
+    job = Job(
+        job_type="write_parameter",
+        meter_id=meter.id,
+        payload={"parameter": "settlement_no", "value": 3},
+        created_by_id=root.id,
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    with (
+        patch(
+            "app.services.job_worker.read_register",
+            new=AsyncMock(return_value=ReadResult(ok=True, value=1)),
+        ),
+        patch(
+            "app.services.job_worker.write_register",
+            new=AsyncMock(return_value=WriteResult(ok=True)),
+        ) as mocked_write,
+    ):
+        await _run_write_parameter(db_session, job)
+
+    kwargs = mocked_write.call_args.kwargs
+    assert kwargs["obis"] == "1.0.0.1.0.ff"
+    assert kwargs["class_id"] == 1
+    assert kwargs["value_bytes"] == bytes([3])
+    assert kwargs["value_type"] == "unsigned"
+
+    assert job.status == JobStatus.SUCCEEDED
+    history = (
+        (await db_session.execute(select(ParameterWriteHistory).where(ParameterWriteHistory.meter_id == meter.id)))
+        .scalars()
+        .all()
+    )
+    assert len(history) == 1
+    assert history[0].parameter == "settlement_no"
+    assert history[0].old_value == 1
+    assert history[0].new_value == 3
+    assert history[0].result == ParameterWriteResult.SUCCESS

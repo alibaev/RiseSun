@@ -30,8 +30,10 @@ from ..schemas import (
     MeterUpdate,
     ParameterWriteHistoryOut,
     ReadTriggerRequest,
+    WriteParameterRequest,
 )
 from ..services.audit import record_audit
+from ..services.write_parameters import WRITABLE_INT_PARAMETERS
 
 router = APIRouter(prefix="/api/meters", tags=["meters"])
 
@@ -219,6 +221,40 @@ async def trigger_write_datetime(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Счётчик не найден")
 
     job = Job(job_type="write_datetime", meter_id=meter_id, payload={}, created_by_id=user.id)
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
+@router.post(
+    "/{meter_id}/write-parameter/{parameter}", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED
+)
+async def trigger_write_parameter(
+    meter_id: int,
+    parameter: str,
+    body: WriteParameterRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.WRITE_PARAMETER)),
+) -> Job:
+    """Ставит запись одиночного параметра из реестра
+    ``WRITABLE_INT_PARAMETERS`` в очередь (Этап 2, ТЗ п.4.2.4 —
+    «Текущий»/«Доступный номер расчётного периода»)."""
+    if parameter not in WRITABLE_INT_PARAMETERS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Неизвестный параметр записи: {parameter!r}. Доступные: {sorted(WRITABLE_INT_PARAMETERS)}",
+        )
+    meter = await db.get(Meter, meter_id)
+    if meter is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Счётчик не найден")
+
+    job = Job(
+        job_type="write_parameter",
+        meter_id=meter_id,
+        payload={"parameter": parameter, "value": body.value},
+        created_by_id=user.id,
+    )
     db.add(job)
     await db.commit()
     await db.refresh(job)

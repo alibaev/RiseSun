@@ -76,12 +76,15 @@ def _do_read(request: gateway_pb2.ReadRegisterRequest, call_home_pool: CallHomeP
 # ``value_type`` из WriteRegisterRequest — Gateway кодирует в DLMS
 # Common-Data-Type, Backend передаёт только "сырые" данные и тип, не
 # зная деталей DLMS-кодировки (Promt_MMWS.md, раздел 3, принцип 1).
-# Пока поддержан только octet-string (нужен для «Установить дату/время»,
-# первая категория параметров записи); остальные типы добавляются по
-# мере реализации следующих категорий (режимы отображения, тарифное
-# расписание, профиль нагрузки, GPRS).
+# octet_string — «Установить дату/время»; unsigned (1 байт значения в
+# value_bytes[0]) — «Текущий/доступный номер расчётного периода»
+# (единственные ещё не реализованные записываемые объекты словаря OBIS,
+# см. DECISIONS.md). Остальные типы добавляются по мере появления в
+# словаре OBIS кодов для оставшихся категорий (режимы отображения,
+# тарифное расписание, профиль нагрузки, GPRS).
 _VALUE_ENCODERS = {
     "octet_string": lambda request: datatypes.encode_octet_string(bytes(request.value_bytes)),
+    "unsigned": lambda request: datatypes.encode_unsigned(request.value_bytes[0]),
 }
 
 

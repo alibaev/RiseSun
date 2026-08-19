@@ -28,6 +28,15 @@ export function MeterDetailPage() {
   const [datetimeJob, setDatetimeJob] = useState<Job | null>(null);
   const datetimeWsRef = useRef<WebSocket | null>(null);
 
+  // Этап 2, итерация 2 (ТЗ п.4.2.4): «Текущий»/«Доступный номер расчётного
+  // периода» — единственные ещё не реализованные записываемые параметры
+  // словаря OBIS (см. DECISIONS.md), оба класс 1, значение 0-255.
+  const [settlementNoInput, setSettlementNoInput] = useState("");
+  const [availableSettlementNoInput, setAvailableSettlementNoInput] = useState("");
+  const [pendingWrite, setPendingWrite] = useState<{ parameter: string; label: string; value: number } | null>(null);
+  const [settlementJob, setSettlementJob] = useState<Job | null>(null);
+  const settlementWsRef = useRef<WebSocket | null>(null);
+
   const loadAll = useCallback(async () => {
     if (!id) return;
     setError(null);
@@ -53,6 +62,7 @@ export function MeterDetailPage() {
 
   useEffect(() => () => wsRef.current?.close(), []);
   useEffect(() => () => datetimeWsRef.current?.close(), []);
+  useEffect(() => () => settlementWsRef.current?.close(), []);
 
   function watchJob(job: Job, wsRef: { current: WebSocket | null }, onUpdate: (job: Job) => void) {
     const token = tokenStorage.getAccess();
@@ -80,6 +90,38 @@ export function MeterDetailPage() {
         watchJob(job, datetimeWsRef, setDatetimeJob);
       })
       .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось запустить установку времени"));
+  }
+
+  function handleConfirmWriteParameter() {
+    if (!id || !pendingWrite) return;
+    const { parameter, value } = pendingWrite;
+    setPendingWrite(null);
+    setError(null);
+    api
+      .post<Job>(`/api/meters/${id}/write-parameter/${parameter}`, { value })
+      .then((job) => {
+        setSettlementJob(job);
+        watchJob(job, settlementWsRef, setSettlementJob);
+      })
+      .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось запустить запись параметра"));
+  }
+
+  function requestWriteSettlementNo() {
+    const value = Number(settlementNoInput);
+    if (!Number.isInteger(value) || value < 0 || value > 255) {
+      setError("Номер расчётного периода должен быть целым числом от 0 до 255");
+      return;
+    }
+    setPendingWrite({ parameter: "settlement_no", label: "Текущий номер расчётного периода", value });
+  }
+
+  function requestWriteAvailableSettlementNo() {
+    const value = Number(availableSettlementNoInput);
+    if (!Number.isInteger(value) || value < 0 || value > 255) {
+      setError("Доступный номер расчётного периода должен быть целым числом от 0 до 255");
+      return;
+    }
+    setPendingWrite({ parameter: "available_settlement_no", label: "Доступный номер расчётного периода", value });
   }
 
   function handleRefreshReadings() {
@@ -169,6 +211,67 @@ export function MeterDetailPage() {
           confirmLabel="Установить"
           onConfirm={handleConfirmSetDatetime}
           onCancel={() => setShowDatetimeConfirm(false)}
+        />
+      )}
+
+      {canWriteParameter(role) && (
+        <section className="card">
+          <h2>Расчётный период</h2>
+          <div className="filters">
+            <label>
+              Текущий номер (0-255)
+              <br />
+              <input
+                type="number"
+                min={0}
+                max={255}
+                value={settlementNoInput}
+                onChange={(e) => setSettlementNoInput(e.target.value)}
+                style={{ width: 100 }}
+              />
+            </label>
+            <button
+              onClick={requestWriteSettlementNo}
+              disabled={settlementJob?.status === "queued" || settlementJob?.status === "running"}
+            >
+              Записать
+            </button>
+            <label>
+              Доступный номер (0-255)
+              <br />
+              <input
+                type="number"
+                min={0}
+                max={255}
+                value={availableSettlementNoInput}
+                onChange={(e) => setAvailableSettlementNoInput(e.target.value)}
+                style={{ width: 100 }}
+              />
+            </label>
+            <button
+              onClick={requestWriteAvailableSettlementNo}
+              disabled={settlementJob?.status === "queued" || settlementJob?.status === "running"}
+            >
+              Записать
+            </button>
+          </div>
+          {(settlementJob?.status === "queued" || settlementJob?.status === "running") && <p>Записываю...</p>}
+          {settlementJob?.status === "succeeded" && <p className="hint">Параметр записан.</p>}
+          {settlementJob?.status === "failed" && (
+            <div className="error-message">
+              Ошибка записи: {settlementJob.error?.code} — {settlementJob.error?.message}
+            </div>
+          )}
+        </section>
+      )}
+
+      {pendingWrite && (
+        <ConfirmModal
+          title={pendingWrite.label}
+          message={`Будет записано значение "${pendingWrite.value}" на счётчик. Подтвердите операцию.`}
+          confirmLabel="Записать"
+          onConfirm={handleConfirmWriteParameter}
+          onCancel={() => setPendingWrite(null)}
         />
       )}
 

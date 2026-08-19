@@ -290,6 +290,53 @@ async def test_observer_cannot_trigger_write_datetime_but_engineer_can(client, d
 
 
 @pytest.mark.asyncio
+async def test_write_parameter_rejects_unknown_parameter_and_accepts_known(client, db_session):
+    """Этап 2, итерация 2: /write-parameter/{parameter} — 400 для параметра
+    вне реестра WRITABLE_INT_PARAMETERS, 202 для известного (settlement_no)."""
+    root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    db_session.add(
+        Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    )
+    await db_session.commit()
+    root_token = await _login(client, "root", "pass1234")
+    await client.post(
+        "/api/meters",
+        json={
+            "serial_number": "202006003607",
+            "ip_address": "127.0.0.1",
+            "port": 4059,
+            "protocol_profile": "hdlc_dlms",
+            "password": "12345678",
+            "gateway_id": 1,
+        },
+        headers={"Authorization": f"Bearer {root_token}"},
+    )
+
+    unknown_resp = await client.post(
+        "/api/meters/1/write-parameter/tariff_schedule",
+        json={"value": 1},
+        headers={"Authorization": f"Bearer {root_token}"},
+    )
+    assert unknown_resp.status_code == 400
+
+    known_resp = await client.post(
+        "/api/meters/1/write-parameter/settlement_no",
+        json={"value": 3},
+        headers={"Authorization": f"Bearer {root_token}"},
+    )
+    assert known_resp.status_code == 202, known_resp.text
+    body = known_resp.json()
+    assert body["job_type"] == "write_parameter"
+
+    out_of_range_resp = await client.post(
+        "/api/meters/1/write-parameter/settlement_no",
+        json={"value": 256},
+        headers={"Authorization": f"Bearer {root_token}"},
+    )
+    assert out_of_range_resp.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_non_call_home_meter_requires_ip_and_port(client, db_session):
     root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
     db_session.add(

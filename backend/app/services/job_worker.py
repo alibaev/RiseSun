@@ -23,6 +23,7 @@ from ..db import SessionLocal
 from ..models import Job, JobStatus, Meter, MeterReading, ParameterWriteHistory, ParameterWriteResult
 from .audit import record_audit
 from .gateway_client import read_register, write_register
+from .write_parameters import WRITABLE_INT_PARAMETERS
 
 logger = logging.getLogger("mmws_backend.job_worker")
 
@@ -202,9 +203,94 @@ async def _run_write_datetime(db: AsyncSession, job: Job) -> None:
     await db.commit()
 
 
+async def _run_write_parameter(db: AsyncSession, job: Job) -> None:
+    """Запись одиночного параметра из реестра ``WRITABLE_INT_PARAMETERS``
+    (Этап 2, ТЗ п.4.2.4 — «Текущий/доступный номер расчётного периода»,
+    единственные ещё не реализованные записываемые объекты словаря
+    OBIS). Тот же принцип, что и у ``_run_write_datetime``: старое
+    значение читается best-effort, запись фиксируется в
+    parameter_write_history/audit_log безусловно."""
+    meter = await db.get(Meter, job.meter_id)
+    if meter is None:
+        job.status = JobStatus.FAILED
+        job.error = {"code": "METER_NOT_FOUND", "message": f"Счётчик id={job.meter_id} не найден"}
+        job.finished_at = datetime.now(timezone.utc)
+        await db.commit()
+        return
+
+    parameter = job.payload["parameter"]
+    value = job.payload["value"]
+    spec = WRITABLE_INT_PARAMETERS[parameter]
+
+    gateway = meter.gateway
+    grpc_target = gateway.grpc_target if gateway else settings.gateway_grpc_target
+    password = decrypt_secret(meter.password_encrypted).decode("ascii")
+
+    old_read = await read_register(
+        grpc_target=grpc_target,
+        profile=meter.protocol_profile.value,
+        host=meter.ip_address or "",
+        port=meter.port or 0,
+        call_home=meter.is_call_home,
+        serial=meter.serial_number,
+        password=password,
+        obis=spec.obis,
+        class_id=spec.class_id,
+        call_timeout_s=60.0,
+    )
+    old_value = old_read.value if old_read.ok else None
+
+    outcome = await write_register(
+        grpc_target=grpc_target,
+        profile=meter.protocol_profile.value,
+        host=meter.ip_address or "",
+        port=meter.port or 0,
+        call_home=meter.is_call_home,
+        serial=meter.serial_number,
+        password=password,
+        obis=spec.obis,
+        class_id=spec.class_id,
+        value_bytes=bytes([value]),
+        value_type=spec.value_type,
+        call_timeout_s=60.0,
+    )
+    result = ParameterWriteResult.SUCCESS if outcome.ok else ParameterWriteResult.FAILURE
+    db.add(
+        ParameterWriteHistory(
+            user_id=job.created_by_id,
+            meter_id=meter.id,
+            parameter=parameter,
+            obis_code=spec.obis,
+            old_value=old_value,
+            new_value=value,
+            result=result,
+            error_message=None if outcome.ok else outcome.error_message,
+            job_id=job.id,
+        )
+    )
+    await record_audit(
+        db,
+        user_id=job.created_by_id,
+        action="meter.write_parameter",
+        object_type="meter",
+        object_id=str(meter.id),
+        result="success" if outcome.ok else "failure",
+        source="system",
+        details={"parameter": parameter, "obis": spec.obis, "old_value": old_value, "new_value": value},
+    )
+
+    job.status = JobStatus.SUCCEEDED if outcome.ok else JobStatus.FAILED
+    job.result = {"parameter": parameter, "value": value, "ok": outcome.ok}
+    if not outcome.ok:
+        job.error = {"code": outcome.error_code, "message": outcome.error_message}
+    job.finished_at = datetime.now(timezone.utc)
+    await db.commit()
+
+
 _JOB_HANDLERS = {
     "read_current": _run_read_current,
     "write_datetime": _run_write_datetime,
+    "write_parameter": _run_write_parameter,
 }
 
 
