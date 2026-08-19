@@ -337,6 +337,39 @@ async def test_write_parameter_rejects_unknown_parameter_and_accepts_known(clien
 
 
 @pytest.mark.asyncio
+async def test_write_parameter_accepts_all_registered_parameters(client, db_session):
+    """Этап 2, итерация 3: параметры, найденные в Read_Tree_полное_дерево
+    (режимы отображения, тарифное расписание, профиль нагрузки) — все
+    принимаются эндпоинтом наравне с settlement_no/available_settlement_no."""
+    root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    db_session.add(
+        Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    )
+    await db_session.commit()
+    root_token = await _login(client, "root", "pass1234")
+    await client.post(
+        "/api/meters",
+        json={
+            "serial_number": "202006003607",
+            "ip_address": "127.0.0.1",
+            "port": 4059,
+            "protocol_profile": "hdlc_dlms",
+            "password": "12345678",
+            "gateway_id": 1,
+        },
+        headers={"Authorization": f"Bearer {root_token}"},
+    )
+
+    for parameter in ("load_profile_interval", "display_mode_count", "weekend_rate_type"):
+        resp = await client.post(
+            f"/api/meters/1/write-parameter/{parameter}",
+            json={"value": 5},
+            headers={"Authorization": f"Bearer {root_token}"},
+        )
+        assert resp.status_code == 202, f"{parameter}: {resp.text}"
+
+
+@pytest.mark.asyncio
 async def test_non_call_home_meter_requires_ip_and_port(client, db_session):
     root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
     db_session.add(

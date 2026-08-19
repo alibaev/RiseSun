@@ -28,11 +28,18 @@ export function MeterDetailPage() {
   const [datetimeJob, setDatetimeJob] = useState<Job | null>(null);
   const datetimeWsRef = useRef<WebSocket | null>(null);
 
-  // Этап 2, итерация 2 (ТЗ п.4.2.4): «Текущий»/«Доступный номер расчётного
-  // периода» — единственные ещё не реализованные записываемые параметры
-  // словаря OBIS (см. DECISIONS.md), оба класс 1, значение 0-255.
-  const [settlementNoInput, setSettlementNoInput] = useState("");
-  const [availableSettlementNoInput, setAvailableSettlementNoInput] = useState("");
+  // Этап 2 (ТЗ п.4.2.4): одиночные параметры из реестра
+  // WRITABLE_INT_PARAMETERS (Backend, app/services/write_parameters.py)
+  // — все значение 0-255, один и тот же UI-паттерн (поле + подтверждение).
+  // GPRS-параметры не представлены в словаре OBIS вообще — не реализованы.
+  const WRITABLE_PARAMS: { key: string; label: string }[] = [
+    { key: "settlement_no", label: "Текущий номер расчётного периода" },
+    { key: "available_settlement_no", label: "Доступный номер расчётного периода" },
+    { key: "load_profile_interval", label: "Интервал профиля нагрузки (мин)" },
+    { key: "display_mode_count", label: "Количество режимов отображения" },
+    { key: "weekend_rate_type", label: "Тип тарифа выходного дня" },
+  ];
+  const [paramInputs, setParamInputs] = useState<Record<string, string>>({});
   const [pendingWrite, setPendingWrite] = useState<{ parameter: string; label: string; value: number } | null>(null);
   const [settlementJob, setSettlementJob] = useState<Job | null>(null);
   const settlementWsRef = useRef<WebSocket | null>(null);
@@ -106,22 +113,13 @@ export function MeterDetailPage() {
       .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось запустить запись параметра"));
   }
 
-  function requestWriteSettlementNo() {
-    const value = Number(settlementNoInput);
+  function requestWriteParameter(key: string, label: string) {
+    const value = Number(paramInputs[key]);
     if (!Number.isInteger(value) || value < 0 || value > 255) {
-      setError("Номер расчётного периода должен быть целым числом от 0 до 255");
+      setError(`${label}: значение должно быть целым числом от 0 до 255`);
       return;
     }
-    setPendingWrite({ parameter: "settlement_no", label: "Текущий номер расчётного периода", value });
-  }
-
-  function requestWriteAvailableSettlementNo() {
-    const value = Number(availableSettlementNoInput);
-    if (!Number.isInteger(value) || value < 0 || value > 255) {
-      setError("Доступный номер расчётного периода должен быть целым числом от 0 до 255");
-      return;
-    }
-    setPendingWrite({ parameter: "available_settlement_no", label: "Доступный номер расчётного периода", value });
+    setPendingWrite({ parameter: key, label, value });
   }
 
   function handleRefreshReadings() {
@@ -216,44 +214,28 @@ export function MeterDetailPage() {
 
       {canWriteParameter(role) && (
         <section className="card">
-          <h2>Расчётный период</h2>
+          <h2>Параметры (расчётный период, профиль нагрузки, отображение, тариф)</h2>
           <div className="filters">
-            <label>
-              Текущий номер (0-255)
-              <br />
-              <input
-                type="number"
-                min={0}
-                max={255}
-                value={settlementNoInput}
-                onChange={(e) => setSettlementNoInput(e.target.value)}
-                style={{ width: 100 }}
-              />
-            </label>
-            <button
-              onClick={requestWriteSettlementNo}
-              disabled={settlementJob?.status === "queued" || settlementJob?.status === "running"}
-            >
-              Записать
-            </button>
-            <label>
-              Доступный номер (0-255)
-              <br />
-              <input
-                type="number"
-                min={0}
-                max={255}
-                value={availableSettlementNoInput}
-                onChange={(e) => setAvailableSettlementNoInput(e.target.value)}
-                style={{ width: 100 }}
-              />
-            </label>
-            <button
-              onClick={requestWriteAvailableSettlementNo}
-              disabled={settlementJob?.status === "queued" || settlementJob?.status === "running"}
-            >
-              Записать
-            </button>
+            {WRITABLE_PARAMS.map(({ key, label }) => (
+              <label key={key}>
+                {label} (0-255)
+                <br />
+                <input
+                  type="number"
+                  min={0}
+                  max={255}
+                  value={paramInputs[key] ?? ""}
+                  onChange={(e) => setParamInputs((prev) => ({ ...prev, [key]: e.target.value }))}
+                  style={{ width: 100 }}
+                />{" "}
+                <button
+                  onClick={() => requestWriteParameter(key, label)}
+                  disabled={settlementJob?.status === "queued" || settlementJob?.status === "running"}
+                >
+                  Записать
+                </button>
+              </label>
+            ))}
           </div>
           {(settlementJob?.status === "queued" || settlementJob?.status === "running") && <p>Записываю...</p>}
           {settlementJob?.status === "succeeded" && <p className="hint">Параметр записан.</p>}
