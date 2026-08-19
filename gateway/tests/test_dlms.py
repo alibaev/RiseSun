@@ -132,3 +132,42 @@ def test_datablock_response_last_block_true():
     result = dlms.parse_get_response_datablock(response)
     assert result.last_block is True
     assert result.raw_data == b""
+
+
+def test_disconnect_control_obis_hex_matches_standard_decimal_address():
+    # Стандартный decimal-адрес 0-0:96.3.10.255 -> hex "0.0.60.3.a.ff"
+    # (то же правило перевода, что и в Этапах 2/3 — см. DECISIONS.md).
+    assert dlms.parse_obis(dlms.DISCONNECT_CONTROL_OBIS) == bytes([0x00, 0x00, 0x60, 0x03, 0x0A, 0xFF])
+
+
+def test_action_request_response_round_trip():
+    obis = dlms.parse_obis(dlms.DISCONNECT_CONTROL_OBIS)
+    request = dlms.build_action_request(
+        obis, dlms.METHOD_REMOTE_DISCONNECT, class_id=dlms.DISCONNECT_CONTROL_CLASS_ID, invoke_id=5
+    )
+    parsed_request = dlms.parse_action_request(request)
+    assert parsed_request.invoke_id == 5
+    assert parsed_request.class_id == dlms.DISCONNECT_CONTROL_CLASS_ID
+    assert parsed_request.obis == obis
+    assert parsed_request.method_id == dlms.METHOD_REMOTE_DISCONNECT
+    assert parsed_request.parameters is None
+
+    response = dlms.build_action_response(5)
+    dlms.parse_action_response(response)  # не бросает — успех
+
+
+def test_action_response_failure_raises():
+    response = dlms.build_action_response(5, result=dlms.ACTION_RESULT_SUCCESS + 1)
+    with pytest.raises(GatewayError):
+        dlms.parse_action_response(response)
+
+
+def test_action_request_with_parameters_round_trip():
+    obis = dlms.parse_obis(dlms.DISCONNECT_CONTROL_OBIS)
+    request = dlms.build_action_request(
+        obis, dlms.METHOD_REMOTE_RECONNECT, class_id=dlms.DISCONNECT_CONTROL_CLASS_ID,
+        parameters=datatypes.encode_unsigned(1),
+    )
+    parsed = dlms.parse_action_request(request)
+    assert parsed.method_id == dlms.METHOD_REMOTE_RECONNECT
+    assert parsed.parameters == datatypes.encode_unsigned(1)

@@ -290,6 +290,54 @@ async def test_observer_cannot_trigger_write_datetime_but_engineer_can(client, d
 
 
 @pytest.mark.asyncio
+async def test_disconnect_reconnect_require_write_parameter_permission(client, db_session):
+    """Этап 5 (ТЗ п.4.2.10): ручное отключение/подключение — доступно
+    ролям «Инженер»/«Администратор», не «Наблюдателю»."""
+    root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    await _seed_user(db_session, username="eng", password="pass1234", role=UserRole.ENGINEER)
+    await _seed_user(db_session, username="obs", password="pass1234", role=UserRole.OBSERVER)
+    db_session.add(
+        Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    )
+    await db_session.commit()
+
+    root_token = await _login(client, "root", "pass1234")
+    await client.post(
+        "/api/meters",
+        json={
+            "serial_number": "202006003607",
+            "ip_address": "127.0.0.1",
+            "port": 4059,
+            "protocol_profile": "hdlc_dlms",
+            "password": "12345678",
+            "gateway_id": 1,
+        },
+        headers={"Authorization": f"Bearer {root_token}"},
+    )
+
+    obs_token = await _login(client, "obs", "pass1234")
+    assert (
+        await client.post("/api/meters/1/disconnect", headers={"Authorization": f"Bearer {obs_token}"})
+    ).status_code == 403
+    assert (
+        await client.post("/api/meters/1/reconnect", headers={"Authorization": f"Bearer {obs_token}"})
+    ).status_code == 403
+
+    eng_token = await _login(client, "eng", "pass1234")
+    disconnect_resp = await client.post(
+        "/api/meters/1/disconnect", headers={"Authorization": f"Bearer {eng_token}"}
+    )
+    assert disconnect_resp.status_code == 202, disconnect_resp.text
+    assert disconnect_resp.json()["job_type"] == "disconnect"
+
+    reconnect_resp = await client.post(
+        "/api/meters/1/reconnect", headers={"Authorization": f"Bearer {eng_token}"}
+    )
+    assert reconnect_resp.status_code == 202, reconnect_resp.text
+    assert reconnect_resp.json()["job_type"] == "reconnect"
+
+
+@pytest.mark.asyncio
 async def test_write_parameter_rejects_unknown_parameter_and_accepts_known(client, db_session):
     """Этап 2, итерация 2: /write-parameter/{parameter} — 400 для параметра
     вне реестра WRITABLE_INT_PARAMETERS, 202 для известного (settlement_no)."""

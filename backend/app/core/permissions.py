@@ -27,6 +27,9 @@ class Permission(str, enum.Enum):
     # explicitly в перечне прав «Администратора», не «Инженера».
     MANAGE_PARAMETER_SCHEMES = "manage_parameter_schemes"
     MANAGE_SCHEDULED_JOBS = "manage_scheduled_jobs"
+    # Этап 5 (ТЗ п.4.2.9, API.docx п.3.4): «Выдача, ротация и отзыв
+    # API-ключа выполняются администратором MMWS» — Admin/Super-admin.
+    MANAGE_BILLING_KEYS = "manage_billing_keys"
 
 
 _ROLE_PERMISSIONS: dict[UserRole, set[Permission]] = {
@@ -46,6 +49,7 @@ _ROLE_PERMISSIONS: dict[UserRole, set[Permission]] = {
         Permission.VIEW_AUDIT_LOG,
         Permission.MANAGE_PARAMETER_SCHEMES,
         Permission.MANAGE_SCHEDULED_JOBS,
+        Permission.MANAGE_BILLING_KEYS,
     },
     UserRole.SUPER_ADMIN: {
         Permission.VIEW_METERS,
@@ -55,6 +59,7 @@ _ROLE_PERMISSIONS: dict[UserRole, set[Permission]] = {
         Permission.MANAGE_USERS,
         Permission.VIEW_AUDIT_LOG,
         Permission.MANAGE_GATEWAYS,
+        Permission.MANAGE_BILLING_KEYS,
         Permission.MANAGE_PARAMETER_SCHEMES,
         Permission.MANAGE_SCHEDULED_JOBS,
     },

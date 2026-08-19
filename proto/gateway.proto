@@ -37,6 +37,13 @@ service GatewayService {
   // Gateway не хранит состояние между вызовами (Promt_MMWS.md, раздел
   // 3, принцип 1).
   rpc ReadLoadProfile(ReadLoadProfileRequest) returns (stream ReadLoadProfileResponse);
+
+  // Удалённое отключение/подключение счётчика (Этап 5, ТЗ п.4.2.10) —
+  // ACTION-сервис DLMS на объект Disconnect Control (класс 70, рабочая
+  // гипотеза адреса — см. DECISIONS.md). Синхронный RPC, как
+  // ReadRegister/WriteRegister — асинхронность (job_id, batch_id при
+  // пакетной операции от биллинга) реализуется на стороне Backend.
+  rpc DisconnectMeter(DisconnectMeterRequest) returns (DisconnectMeterResponse);
 }
 
 message ReadRegisterRequest {
@@ -144,6 +151,25 @@ message ReadLoadProfileResponse {
   oneof result {
     LoadProfileRow row = 1;
     ReadError error = 2;     // тот же формат ошибки, что и у ReadRegister
+  }
+}
+
+message DisconnectMeterRequest {
+  string profile = 1;       // Этап 5 реализован только для "hdlc_dlms"
+  string host = 2;           // игнорируется при call_home=true
+  int32 port = 3;
+  string serial = 4;
+  string password = 5;
+  string operation = 6;      // "disconnect" | "reconnect"
+  int32 timeout_ms = 7;
+  int32 retries = 8;
+  bool call_home = 9;        // пока не реализовано, см. ReadError
+}
+
+message DisconnectMeterResponse {
+  oneof result {
+    WriteSuccess success = 1;
+    ReadError error = 2;     // тот же формат ошибки, что и у ReadRegister/WriteRegister
   }
 }
 

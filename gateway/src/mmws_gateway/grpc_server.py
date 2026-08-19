@@ -171,6 +171,45 @@ def _load_profile_row_to_proto(row: object) -> gateway_pb2.LoadProfileRow:
     )
 
 
+_DISCONNECT_METHOD_IDS = {
+    "disconnect": dlms.METHOD_REMOTE_DISCONNECT,
+    "reconnect": dlms.METHOD_REMOTE_RECONNECT,
+}
+
+
+def _do_disconnect(request: gateway_pb2.DisconnectMeterRequest, call_home_pool: CallHomePool | None) -> None:
+    """Удалённое отключение/подключение (Этап 5, ТЗ п.4.2.10) — ACTION
+    на объект Disconnect Control (см. protocols.dlms). ``request.operation``
+    — дискриминатор "disconnect"/"reconnect", Backend не знает про
+    method_id DLMS (Promt_MMWS.md, раздел 3, принцип 1)."""
+    password = request.password.encode("ascii")
+
+    method_id = _DISCONNECT_METHOD_IDS.get(request.operation)
+    if method_id is None:
+        raise GatewayError(f"Неизвестная операция отключения: {request.operation!r}")
+
+    if request.call_home:
+        raise GatewayError("Отключение/подключение через call-home пока не реализовано")
+    if request.profile != "hdlc_dlms":
+        raise GatewayError(
+            f"Отключение/подключение для протокольного профиля {request.profile!r} пока не поддержано",
+        )
+
+    timeout_ms = request.timeout_ms or DEFAULT_TIMEOUT_MS
+    retries = request.retries or DEFAULT_RETRIES
+    config = TransportConfig(host=request.host, port=request.port, timeout_ms=timeout_ms, max_retries=1)
+
+    def operation() -> None:
+        with TcpTransport(config) as transport:
+            hdlc_dlms.execute_action(
+                transport, serial=request.serial, password=password,
+                obis=dlms.DISCONNECT_CONTROL_OBIS, method_id=method_id,
+                class_id=dlms.DISCONNECT_CONTROL_CLASS_ID,
+            )
+
+    run_with_retries(operation, max_retries=retries)
+
+
 class GatewayServiceServicer(gateway_pb2_grpc.GatewayServiceServicer):
     def __init__(self, call_home_pool: CallHomePool | None = None) -> None:
         self._call_home_pool = call_home_pool
@@ -215,6 +254,24 @@ class GatewayServiceServicer(gateway_pb2_grpc.GatewayServiceServicer):
 
     def HealthCheck(self, request, context):
         return gateway_pb2.HealthCheckResponse(ok=True, driver_version=DRIVER_VERSION)
+
+    def DisconnectMeter(self, request, context):
+        try:
+            _do_disconnect(request, self._call_home_pool)
+        except GatewayError as exc:
+            logger.warning(
+                "Ошибка операции %s serial=%s: [%s] %s",
+                request.operation, request.serial, exc.code, exc.message,
+            )
+            return gateway_pb2.DisconnectMeterResponse(
+                error=gateway_pb2.ReadError(
+                    code=exc.code,
+                    message=exc.message,
+                    is_partial=exc.is_partial,
+                    raw_frame_hex=exc.raw_frame.hex() if exc.raw_frame else "",
+                )
+            )
+        return gateway_pb2.DisconnectMeterResponse(success=gateway_pb2.WriteSuccess(ok=True))
 
     def ReadLoadProfile(self, request, context):
         try:

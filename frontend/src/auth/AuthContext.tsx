@@ -66,3 +66,11 @@ const MANAGE_AUTOMATION_ROLES = new Set(["admin", "super_admin"]);
 export function canManageAutomation(role: string | null): boolean {
   return role !== null && MANAGE_AUTOMATION_ROLES.has(role);
 }
+
+// Этап 5 (ТЗ п.4.2.11): журнал аудита, управление пользователями,
+// API-ключи биллинга — тот же набор ролей, что и MANAGE_AUTOMATION_ROLES
+// (Permission.VIEW_AUDIT_LOG/MANAGE_USERS/MANAGE_BILLING_KEYS на
+// Backend — все только Admin/Super-admin).
+export function canManageSystem(role: string | null): boolean {
+  return role !== null && MANAGE_AUTOMATION_ROLES.has(role);
+}

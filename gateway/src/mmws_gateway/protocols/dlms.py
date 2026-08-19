@@ -501,3 +501,90 @@ def parse_get_response_datablock(data: bytes) -> DatablockResult:
     length = int.from_bytes(data[9:11], "big")
     raw_data = data[11 : 11 + length]
     return DatablockResult(last_block=last_block, block_number=block_number, raw_data=raw_data)
+
+
+# --- ACTION-сервис (Этап 5, ТЗ п.4.2.10) — удалённое отключение/
+# подключение счётчика через объект Disconnect Control (класс DLMS 70) ---
+#
+# Адрес объекта нигде не задокументирован в словаре OBIS.xlsx (проверено
+# все 7 листов по ключевым словам disconnect/relay/отключ/реле) — та же
+# ситуация, что была с профилем нагрузки в Этапе 3. По решению
+# пользователя 2026-08-19 используется стандартный DLMS-адрес
+# (decimal `0-0:96.3.10.255`, IEC 62056-6-2) как рабочая гипотеза,
+# подлежащая проверке на реальном оборудовании — см. DECISIONS.md.
+# В hex-нотации проекта (то же правило decimal->hex по полям, что и в
+# Этапе 2/3: C=96->"60", D=3->"3", E=10->"a", F=255->"ff") — "0.0.60.3.a.ff".
+#
+# ACTION-request/response-normal (Green Book) — тот же принцип упрощённого
+# APDU, что и у GET/SET выше: cosem-method-descriptor как фиксированные
+# позиции (class-id, OBIS, method-id) вместо полного BER, единственный
+# байт-результат в ответе (Action-Result, та же нумерация, что и
+# Data-Access-Result у SET — оба перечня ENUMERATED из Green Book с
+# идентичными кодами 0-14 для стандартных причин отказа).
+
+ACTION_REQUEST_TAG = 0xC3
+ACTION_REQUEST_NORMAL = 0x01
+ACTION_RESPONSE_TAG = 0xC7
+ACTION_RESPONSE_NORMAL = 0x01
+
+ACTION_RESULT_SUCCESS = 0
+
+DISCONNECT_CONTROL_CLASS_ID = 70
+DISCONNECT_CONTROL_OBIS = "0.0.60.3.a.ff"
+METHOD_REMOTE_DISCONNECT = 1
+METHOD_REMOTE_RECONNECT = 2
+
+
+def build_action_request(
+    obis: bytes,
+    method_id: int,
+    *,
+    class_id: int,
+    invoke_id: int = 1,
+    parameters: bytes | None = None,
+) -> bytes:
+    if len(obis) != 6:
+        raise GatewayError("OBIS для ACTION.request должен быть ровно 6 байт")
+    descriptor = class_id.to_bytes(2, "big") + obis + bytes([method_id])
+    params_field = bytes([0x00]) if parameters is None else bytes([0x01]) + parameters
+    return bytes([ACTION_REQUEST_TAG, ACTION_REQUEST_NORMAL, invoke_id]) + descriptor + params_field
+
+
+@dataclass
+class ParsedActionRequest:
+    invoke_id: int
+    class_id: int
+    obis: bytes
+    method_id: int
+    parameters: bytes | None
+
+
+def parse_action_request(data: bytes) -> ParsedActionRequest:
+    if len(data) < 13 or data[0] != ACTION_REQUEST_TAG or data[1] != ACTION_REQUEST_NORMAL:
+        raise GatewayError("Ожидался ACTION.request-normal (тег 0xC3 0x01)")
+    invoke_id = data[2]
+    class_id = int.from_bytes(data[3:5], "big")
+    obis = data[5:11]
+    method_id = data[11]
+    has_parameters = data[12] == 0x01
+    parameters = data[13:] if has_parameters and len(data) > 13 else None
+    return ParsedActionRequest(
+        invoke_id=invoke_id, class_id=class_id, obis=obis, method_id=method_id, parameters=parameters
+    )
+
+
+def build_action_response(invoke_id: int, *, result: int = ACTION_RESULT_SUCCESS) -> bytes:
+    # Последний байт — presence-flag return-parameters, всегда 0x00
+    # (отсутствуют): remote_disconnect/remote_reconnect ничего не
+    # возвращают, кроме кода результата.
+    return bytes([ACTION_RESPONSE_TAG, ACTION_RESPONSE_NORMAL, invoke_id, result, 0x00])
+
+
+def parse_action_response(data: bytes) -> None:
+    """Не возвращает значения — бросает GatewayError, если ACTION отклонён."""
+    if len(data) < 4 or data[0] != ACTION_RESPONSE_TAG or data[1] != ACTION_RESPONSE_NORMAL:
+        raise GatewayError("Ожидался ACTION.response-normal (тег 0xC7 0x01)")
+    result = data[3]
+    if result != ACTION_RESULT_SUCCESS:
+        name = _SET_RESULT_NAMES.get(result, f"0x{result:02X}")
+        raise GatewayError(f"Счётчик отклонил ACTION: result={result} ({name})")

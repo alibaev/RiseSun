@@ -37,6 +37,13 @@ export function MeterDetailPage() {
   const [datetimeJob, setDatetimeJob] = useState<Job | null>(null);
   const datetimeWsRef = useRef<WebSocket | null>(null);
 
+  // Этап 5 (ТЗ п.4.2.10): удалённое отключение/подключение — вручную, по
+  // одному счётчику, с обязательным подтверждением (физические
+  // последствия операции — обесточивание потребителя).
+  const [pendingDisconnectOp, setPendingDisconnectOp] = useState<"disconnect" | "reconnect" | null>(null);
+  const [disconnectJob, setDisconnectJob] = useState<Job | null>(null);
+  const disconnectWsRef = useRef<WebSocket | null>(null);
+
   const [paramInputs, setParamInputs] = useState<Record<string, string>>({});
   const [pendingWrite, setPendingWrite] = useState<{ parameter: string; label: string; value: number } | null>(null);
   const [settlementJob, setSettlementJob] = useState<Job | null>(null);
@@ -82,6 +89,7 @@ export function MeterDetailPage() {
   useEffect(() => () => datetimeWsRef.current?.close(), []);
   useEffect(() => () => settlementWsRef.current?.close(), []);
   useEffect(() => () => loadProfileWsRef.current?.close(), []);
+  useEffect(() => () => disconnectWsRef.current?.close(), []);
 
   function watchJob(job: Job, wsRef: { current: WebSocket | null }, onUpdate: (job: Job) => void) {
     const token = tokenStorage.getAccess();
@@ -132,6 +140,22 @@ export function MeterDetailPage() {
       return;
     }
     setPendingWrite({ parameter: key, label, value });
+  }
+
+  function handleConfirmDisconnectOp() {
+    if (!id || !pendingDisconnectOp) return;
+    const op = pendingDisconnectOp;
+    setPendingDisconnectOp(null);
+    setError(null);
+    api
+      .post<Job>(`/api/meters/${id}/${op}`)
+      .then((job) => {
+        setDisconnectJob(job);
+        watchJob(job, disconnectWsRef, setDisconnectJob);
+      })
+      .catch((err) =>
+        setError(err instanceof ApiError ? err.message : `Не удалось запустить операцию "${op}"`)
+      );
   }
 
   function handleReadLoadProfile() {
@@ -195,14 +219,30 @@ export function MeterDetailPage() {
         <div className="card-header">
           <h2>Общая информация</h2>
           {canWriteParameter(role) && (
-            <button
-              onClick={() => setShowDatetimeConfirm(true)}
-              disabled={datetimeJob?.status === "queued" || datetimeJob?.status === "running"}
-            >
-              {datetimeJob?.status === "queued" || datetimeJob?.status === "running"
-                ? "Устанавливаю..."
-                : "Установить время"}
-            </button>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                onClick={() => setShowDatetimeConfirm(true)}
+                disabled={datetimeJob?.status === "queued" || datetimeJob?.status === "running"}
+              >
+                {datetimeJob?.status === "queued" || datetimeJob?.status === "running"
+                  ? "Устанавливаю..."
+                  : "Установить время"}
+              </button>
+              <button
+                className="secondary"
+                onClick={() => setPendingDisconnectOp("disconnect")}
+                disabled={disconnectJob?.status === "queued" || disconnectJob?.status === "running"}
+              >
+                Отключить
+              </button>
+              <button
+                className="secondary"
+                onClick={() => setPendingDisconnectOp("reconnect")}
+                disabled={disconnectJob?.status === "queued" || disconnectJob?.status === "running"}
+              >
+                Подключить
+              </button>
+            </div>
           )}
         </div>
         <dl className="info-grid">
@@ -227,6 +267,17 @@ export function MeterDetailPage() {
             Ошибка установки времени: {datetimeJob.error?.code} — {datetimeJob.error?.message}
           </div>
         )}
+        {(disconnectJob?.status === "queued" || disconnectJob?.status === "running") && (
+          <p className="hint">Выполняю операцию отключения/подключения...</p>
+        )}
+        {disconnectJob?.status === "succeeded" && (
+          <p className="hint">Операция «{String(disconnectJob.result?.operation ?? "")}» выполнена.</p>
+        )}
+        {disconnectJob?.status === "failed" && (
+          <div className="error-message">
+            Ошибка отключения/подключения: {disconnectJob.error?.code} — {disconnectJob.error?.message}
+          </div>
+        )}
       </section>
 
       {showDatetimeConfirm && (
@@ -236,6 +287,20 @@ export function MeterDetailPage() {
           confirmLabel="Установить"
           onConfirm={handleConfirmSetDatetime}
           onCancel={() => setShowDatetimeConfirm(false)}
+        />
+      )}
+
+      {pendingDisconnectOp && (
+        <ConfirmModal
+          title={pendingDisconnectOp === "disconnect" ? "Отключить счётчик" : "Подключить счётчик"}
+          message={
+            pendingDisconnectOp === "disconnect"
+              ? "Счётчик будет удалённо отключён от сети (обесточен потребитель). Подтвердите операцию."
+              : "Счётчик будет удалённо подключён к сети. Подтвердите операцию."
+          }
+          confirmLabel={pendingDisconnectOp === "disconnect" ? "Отключить" : "Подключить"}
+          onConfirm={handleConfirmDisconnectOp}
+          onCancel={() => setPendingDisconnectOp(null)}
         />
       )}
 

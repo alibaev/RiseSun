@@ -9,6 +9,9 @@ from croniter import croniter
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .models import (
+    BillingApiKeyStatus,
+    DisconnectBatchItemStatus,
+    DisconnectBatchStatus,
     GatewayStatus,
     JobStatus,
     NotificationCategory,
@@ -43,6 +46,15 @@ class UserCreate(BaseModel):
     username: str = Field(min_length=3, max_length=64)
     password: str = Field(min_length=8)
     role: UserRole
+
+
+class UserUpdate(BaseModel):
+    role: UserRole | None = None
+    is_active: bool | None = None
+
+
+class UserResetPassword(BaseModel):
+    new_password: str = Field(min_length=8)
 
 
 class GatewayCreate(BaseModel):
@@ -303,3 +315,78 @@ class NotificationOut(BaseModel):
     details: dict | None
     is_read: bool
     created_at: datetime
+
+
+# --- Этап 5: биллинг (ТЗ п.4.2.9/4.2.10, API.docx) ---
+
+
+class BillingApiKeyCreate(BaseModel):
+    client_id: str = Field(min_length=1, max_length=64)
+    description: str | None = None
+    rate_limit_per_minute: int = Field(default=60, ge=1, le=1000)
+
+
+class BillingApiKeyOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    client_id: str
+    description: str | None
+    rate_limit_per_minute: int
+    status: BillingApiKeyStatus
+    created_at: datetime
+    revoked_at: datetime | None
+    last_used_at: datetime | None
+
+
+class BillingApiKeyCreated(BillingApiKeyOut):
+    # Секрет отдаётся ОДИН РАЗ, только в ответ на создание — далее
+    # хранится исключительно в хешированном виде (API.docx п.3.1).
+    api_key: str
+
+
+class MeterReadingBillingOut(BaseModel):
+    meter_serial: str
+    obis_code: str
+    value: object
+    unit: str | None
+    read_at: datetime
+
+
+class MeterTariffBillingOut(BaseModel):
+    meter_serial: str
+    tariff_schedule: list[dict]
+    updated_at: datetime
+
+
+class DisconnectBatchRequest(BaseModel):
+    reason: str | None = None
+    # Верхний лимit размера пакета (API.docx раздел 6, 500 счётчиков)
+    # намеренно НЕ объявлен здесь через Field(max_length=...) — pydantic
+    # отклонил бы превышение как обычную ошибку валидации ДО того, как
+    # управление дойдёт до billing.py, и клиент получил бы общий
+    # VALIDATION_ERROR вместо специфичного BATCH_TOO_LARGE (API.docx
+    # Приложение А.2). Проверяется явно в billing._create_batch.
+    meters: list[str] = Field(min_length=1, description="Серийные номера счётчиков")
+
+
+class DisconnectBatchAccepted(BaseModel):
+    batch_id: str
+    accepted_count: int
+    status: DisconnectBatchStatus
+    status_url: str
+
+
+class DisconnectBatchItemOut(BaseModel):
+    meter_serial: str
+    status: DisconnectBatchItemStatus
+    error_code: str | None = None
+
+
+class DisconnectBatchStatusOut(BaseModel):
+    batch_id: str
+    operation: str
+    status: DisconnectBatchStatus
+    created_at: datetime
+    finished_at: datetime | None
+    items: list[DisconnectBatchItemOut]

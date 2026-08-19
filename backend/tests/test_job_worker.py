@@ -26,8 +26,10 @@ from app.models import (
 )
 from app.services.gateway_client import LoadProfileError, LoadProfileRow, ReadResult, WriteResult
 from app.services.job_worker import (
+    _run_disconnect,
     _run_read_current,
     _run_read_load_profile,
+    _run_reconnect,
     _run_write_datetime,
     _run_write_parameter,
 )
@@ -408,3 +410,68 @@ async def test_read_load_profile_partial_failure_keeps_already_received_rows(db_
     )
     assert len(stored) == 1
     assert stored[0].values_json == [42]
+
+
+@pytest.mark.asyncio
+async def test_disconnect_records_audit_with_web_source(db_session):
+    """Этап 5 (ТЗ п.4.2.10): ручной запуск с карточки счётчика — источник
+    audit_log должен быть "web" (проставляется job.payload["source"])."""
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202006003607", ip_address="192.168.1.50", port=4059,
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    root = (await db_session.execute(select(User))).scalars().first()
+    job = Job(job_type="disconnect", meter_id=meter.id, payload={"source": "web"}, created_by_id=root.id)
+    db_session.add(job)
+    await db_session.commit()
+
+    with patch(
+        "app.services.job_worker.disconnect_meter", new=AsyncMock(return_value=WriteResult(ok=True))
+    ) as mocked:
+        await _run_disconnect(db_session, job)
+
+    assert mocked.await_args.kwargs["operation"] == "disconnect"
+    assert job.status == JobStatus.SUCCEEDED
+
+    audit_rows = (await db_session.execute(select(AuditLog).where(AuditLog.action == "meter.disconnect"))).scalars().all()
+    assert len(audit_rows) == 1
+    assert audit_rows[0].source == "web"
+    assert audit_rows[0].result == "success"
+
+
+@pytest.mark.asyncio
+async def test_reconnect_failure_records_audit_with_billing_source(db_session):
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202006003607", ip_address="192.168.1.50", port=4059,
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    job = Job(
+        job_type="reconnect", meter_id=meter.id,
+        payload={"source": "billing", "batch_id": "b-test123"},
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    with patch(
+        "app.services.job_worker.disconnect_meter",
+        new=AsyncMock(return_value=WriteResult(ok=False, error_code="METER_UNREACHABLE", error_message="таймаут")),
+    ) as mocked:
+        await _run_reconnect(db_session, job)
+
+    assert mocked.await_args.kwargs["operation"] == "reconnect"
+    assert job.status == JobStatus.FAILED
+    assert job.error == {"code": "METER_UNREACHABLE", "message": "таймаут"}
+
+    audit_rows = (await db_session.execute(select(AuditLog).where(AuditLog.action == "meter.reconnect"))).scalars().all()
+    assert len(audit_rows) == 1
+    assert audit_rows[0].source == "billing"
+    assert audit_rows[0].result == "failure"
+    assert audit_rows[0].details["batch_id"] == "b-test123"

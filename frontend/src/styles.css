@@ -272,6 +272,58 @@ select {
   background: var(--color-offline);
 }
 
+.dashboard-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.stat-card {
+  text-align: center;
+}
+
+.stat-value {
+  font-size: 28px;
+  font-weight: 700;
+}
+
+.stat-label {
+  color: var(--color-text-muted);
+  font-size: 13px;
+  margin-top: 4px;
+}
+
+.dashboard-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 160px;
+  padding-top: 8px;
+}
+
+.dashboard-chart-bar-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  height: 100%;
+}
+
+.dashboard-chart-bar {
+  width: 100%;
+  min-height: 2px;
+  background: var(--color-accent, #4f7cff);
+  border-radius: 2px 2px 0 0;
+}
+
+.dashboard-chart-label {
+  font-size: 10px;
+  color: var(--color-text-muted);
+  margin-top: 4px;
+}
+
 .modal-overlay {
   position: fixed;
   inset: 0;

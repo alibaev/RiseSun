@@ -54,6 +54,11 @@ class GatewayServiceStub:
                 request_serializer=gateway__pb2.ReadLoadProfileRequest.SerializeToString,
                 response_deserializer=gateway__pb2.ReadLoadProfileResponse.FromString,
                 _registered_method=True)
+        self.DisconnectMeter = channel.unary_unary(
+                '/mmws.gateway.v1.GatewayService/DisconnectMeter',
+                request_serializer=gateway__pb2.DisconnectMeterRequest.SerializeToString,
+                response_deserializer=gateway__pb2.DisconnectMeterResponse.FromString,
+                _registered_method=True)
 
 
 class GatewayServiceServicer:
@@ -104,6 +109,17 @@ class GatewayServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def DisconnectMeter(self, request, context):
+        """Удалённое отключение/подключение счётчика (Этап 5, ТЗ п.4.2.10) —
+        ACTION-сервис DLMS на объект Disconnect Control (класс 70, рабочая
+        гипотеза адреса — см. DECISIONS.md). Синхронный RPC, как
+        ReadRegister/WriteRegister — асинхронность (job_id, batch_id при
+        пакетной операции от биллинга) реализуется на стороне Backend.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_GatewayServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -126,6 +142,11 @@ def add_GatewayServiceServicer_to_server(servicer, server):
                     servicer.ReadLoadProfile,
                     request_deserializer=gateway__pb2.ReadLoadProfileRequest.FromString,
                     response_serializer=gateway__pb2.ReadLoadProfileResponse.SerializeToString,
+            ),
+            'DisconnectMeter': grpc.unary_unary_rpc_method_handler(
+                    servicer.DisconnectMeter,
+                    request_deserializer=gateway__pb2.DisconnectMeterRequest.FromString,
+                    response_serializer=gateway__pb2.DisconnectMeterResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -236,6 +257,33 @@ class GatewayService:
             '/mmws.gateway.v1.GatewayService/ReadLoadProfile',
             gateway__pb2.ReadLoadProfileRequest.SerializeToString,
             gateway__pb2.ReadLoadProfileResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DisconnectMeter(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/mmws.gateway.v1.GatewayService/DisconnectMeter',
+            gateway__pb2.DisconnectMeterRequest.SerializeToString,
+            gateway__pb2.DisconnectMeterResponse.FromString,
             options,
             channel_credentials,
             insecure,

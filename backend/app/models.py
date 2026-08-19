@@ -404,6 +404,110 @@ class Notification(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
+class BillingApiKeyStatus(str, enum.Enum):
+    ACTIVE = "active"
+    REVOKED = "revoked"
+
+
+class BillingApiKey(Base):
+    """Техническая учётная запись биллинговой системы (ТЗ п.4.2.9,
+    API.docx раздел 3) — отдельная от пользовательских учётных записей
+    веб-интерфейса, без JWT-сессии. Секрет хранится хешированным (тот
+    же bcrypt, что и пароли пользователей, — секрет генерируется
+    случайно на сервере, а не выбирается человеком, поэтому общий
+    механизм хеширования подходит без изменений) и показывается
+    администратору только один раз, в момент выдачи."""
+
+    __tablename__ = "billing_api_keys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    client_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    key_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # ТЗ раздел 6 API.docx: «не более 60 запросов в минуту... конфигурируется
+    # индивидуально по согласованию с Заказчиком» — не общесистемная
+    # константа, а атрибут конкретного ключа.
+    rate_limit_per_minute: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
+    status: Mapped[BillingApiKeyStatus] = mapped_column(
+        Enum(BillingApiKeyStatus, name="billing_api_key_status"), nullable=False, default=BillingApiKeyStatus.ACTIVE
+    )
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DisconnectBatchOperation(str, enum.Enum):
+    DISCONNECT = "disconnect"
+    RECONNECT = "reconnect"
+
+
+class DisconnectBatchStatus(str, enum.Enum):
+    QUEUED = "queued"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    COMPLETED_WITH_ERRORS = "completed_with_errors"
+    FAILED = "failed"
+
+
+class DisconnectBatchItemStatus(str, enum.Enum):
+    QUEUED = "queued"
+    DONE = "done"
+    FAILED = "failed"
+
+
+class DisconnectBatch(Base):
+    """Пакетная операция отключения/подключения от биллинга (ТЗ п.4.2.10,
+    API.docx п.4.3-4.5) — тот же архитектурный принцип, что и
+    ScheduledJobRun (Этап 4): пакет порождает по одной обычной Job на
+    каждый счётчик, сам не читает/не пишет на счётчики напрямую.
+
+    ``idempotency_key`` уникален В ПРЕДЕЛАХ ОДНОГО API-ключа (составной
+    UNIQUE) — повторная отправка того же Idempotency-Key тем же клиентом
+    возвращает уже принятый пакет (API.docx п.2.3), не создавая новый."""
+
+    __tablename__ = "disconnect_batches"
+    __table_args__ = (UniqueConstraint("api_key_id", "idempotency_key", name="uq_disconnect_batch_idempotency"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    operation: Mapped[DisconnectBatchOperation] = mapped_column(
+        Enum(DisconnectBatchOperation, name="disconnect_batch_operation"), nullable=False
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    api_key_id: Mapped[int] = mapped_column(ForeignKey("billing_api_keys.id"), nullable=False, index=True)
+    status: Mapped[DisconnectBatchStatus] = mapped_column(
+        Enum(DisconnectBatchStatus, name="disconnect_batch_status"),
+        nullable=False,
+        default=DisconnectBatchStatus.QUEUED,
+    )
+    reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DisconnectBatchItem(Base):
+    """Один счётчик в составе пакета — ``meter_serial`` хранится ВСЕГДА
+    (как прислал биллинг), ``meter_id`` может быть NULL, если серийный
+    номер не найден в справочнике (статус сразу ``failed``,
+    ``error_code="METER_NOT_FOUND"`` — сам факт присутствия элемента в
+    ответе обязателен по API.docx, п.4.5, даже для ненайденных счётчиков)."""
+
+    __tablename__ = "disconnect_batch_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("disconnect_batches.id"), nullable=False, index=True)
+    meter_serial: Mapped[str] = mapped_column(String(32), nullable=False)
+    meter_id: Mapped[int | None] = mapped_column(ForeignKey("meters.id"), nullable=True)
+    status: Mapped[DisconnectBatchItemStatus] = mapped_column(
+        Enum(DisconnectBatchItemStatus, name="disconnect_batch_item_status"),
+        nullable=False,
+        default=DisconnectBatchItemStatus.QUEUED,
+    )
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), nullable=True)
+
+
 class AuditLog(Base):
     """Неизменяемый журнал аудита (ТЗ п. 4.2.7). Append-only — никаких
     UPDATE/DELETE в прикладном коде поверх этой таблицы."""

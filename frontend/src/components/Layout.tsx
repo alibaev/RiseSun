@@ -1,5 +1,5 @@
 import { Link, Outlet } from "react-router-dom";
-import { useAuth } from "../auth/AuthContext";
+import { canManageSystem, useAuth } from "../auth/AuthContext";
 import { NotificationBell } from "./NotificationBell";
 
 const ROLE_LABELS: Record<string, string> = {
@@ -16,13 +16,17 @@ export function Layout() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <Link to="/meters" className="brand">
+        <Link to="/" className="brand">
           MMWS
         </Link>
         <nav>
+          <Link to="/">Дашборд</Link>
           <Link to="/meters">Счётчики</Link>
           <Link to="/schemes">Схемы параметров</Link>
           <Link to="/scheduled-jobs">Расписания</Link>
+          {canManageSystem(role) && <Link to="/audit-log">Журнал аудита</Link>}
+          {canManageSystem(role) && <Link to="/users">Пользователи</Link>}
+          {canManageSystem(role) && <Link to="/billing-keys">API-ключи биллинга</Link>}
         </nav>
         <div className="topbar-user">
           <NotificationBell />

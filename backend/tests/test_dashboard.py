@@ -1,0 +1,72 @@
+"""ТЗ п.4.2.11 — Дашборд: сводная статистика."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from app.core.security import encrypt_secret, hash_password
+from app.models import Gateway, GatewayStatus, Job, Meter, MeterReading, ProtocolProfile, User, UserRole
+
+
+async def _seed_user(db, *, username: str, password: str, role: UserRole) -> User:
+    user = User(username=username, password_hash=hash_password(password), role=role)
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+async def _login(client, username: str, password: str) -> str:
+    resp = await client.post("/api/auth/login", data={"username": username, "password": password})
+    assert resp.status_code == 200, resp.text
+    return resp.json()["access_token"]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_counts_meters_jobs_readings(client, db_session):
+    root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    gateway = Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    db_session.add(gateway)
+    await db_session.flush()
+
+    now = datetime.now(timezone.utc)
+    online_meter = Meter(
+        serial_number="online1", ip_address="127.0.0.1", port=4059,
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id, last_seen_at=now,
+    )
+    offline_meter = Meter(
+        serial_number="offline1", ip_address="127.0.0.1", port=4060,
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id, last_seen_at=now - timedelta(hours=5),
+    )
+    db_session.add_all([online_meter, offline_meter])
+    await db_session.flush()
+
+    db_session.add(Job(job_type="read_current", meter_id=online_meter.id, payload={}))
+    db_session.add(
+        MeterReading(meter_id=online_meter.id, obis_code="1.0.1.8.0.ff", value_json=1, unit="kWh", read_at=now)
+    )
+    await db_session.commit()
+
+    token = await _login(client, "root", "pass1234")
+    resp = await client.get("/api/dashboard", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["meters_total"] == 2
+    assert body["meters_online"] == 1
+    assert body["meters_offline"] == 1
+    assert body["jobs_active"] == 1
+    assert body["tamper_events_24h"] == 0
+    assert len(body["readings_by_hour"]) == 1
+    assert body["readings_by_hour"][0]["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_observer_can_view_dashboard(client, db_session):
+    await _seed_user(db_session, username="obs", password="pass1234", role=UserRole.OBSERVER)
+    token = await _login(client, "obs", "pass1234")
+    resp = await client.get("/api/dashboard", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200

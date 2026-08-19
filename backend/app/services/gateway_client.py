@@ -130,6 +130,46 @@ async def write_register(
     return WriteResult(ok=False, error_code=error.code, error_message=error.message)
 
 
+async def disconnect_meter(
+    *,
+    grpc_target: str,
+    profile: str,
+    serial: str,
+    password: str,
+    operation: str,
+    host: str = "",
+    port: int = 0,
+    call_home: bool = False,
+    timeout_ms: int = 0,
+    retries: int = 0,
+    call_timeout_s: float = 60.0,
+) -> WriteResult:
+    """Удалённое отключение/подключение счётчика (Этап 5, ТЗ п.4.2.10).
+    ``operation`` — "disconnect" | "reconnect"; Gateway транслирует это в
+    ACTION.request DLMS (Backend не реализует протокольную логику —
+    Promt_MMWS.md, раздел 3, принцип 1)."""
+    async with grpc.aio.insecure_channel(grpc_target) as channel:
+        stub = gateway_pb2_grpc.GatewayServiceStub(channel)
+        request = gateway_pb2.DisconnectMeterRequest(
+            profile=profile,
+            host=host,
+            port=port,
+            serial=serial,
+            password=password,
+            operation=operation,
+            timeout_ms=timeout_ms,
+            retries=retries,
+            call_home=call_home,
+        )
+        response = await stub.DisconnectMeter(request, timeout=call_timeout_s)
+
+    which = response.WhichOneof("result")
+    if which == "success":
+        return WriteResult(ok=True)
+    error = response.error
+    return WriteResult(ok=False, error_code=error.code, error_message=error.message)
+
+
 @dataclass
 class LoadProfileRow:
     timestamp_iso: str

@@ -8,7 +8,7 @@ import pytest
 
 from mmws_gateway.emulators.common import ConnectionCounter, ErrorInjection, ThreadedEmulatorServer
 from mmws_gateway.emulators.hdlc_dlms_emulator import make_hdlc_dlms_handler
-from mmws_gateway.errors import AuthFailedError, ConnectionLostError, MeterTimeoutError
+from mmws_gateway.errors import AuthFailedError, ConnectionLostError, GatewayError, MeterTimeoutError
 from mmws_gateway.protocols import datatypes, dlms, hdlc_dlms
 from mmws_gateway.session import run_with_retries
 from mmws_gateway.transport import TcpTransport, TransportConfig
@@ -104,6 +104,43 @@ def test_write_register_then_read_back_value():
             value = hdlc_dlms.read_register(transport, serial=SERIAL, password=PASSWORD, obis=obis, class_id=1)
 
     assert value == bytes([12, 30, 0])
+
+
+def test_execute_action_disconnect_round_trip():
+    """Этап 5 (ТЗ п.4.2.10): ACTION.request remote_disconnect на объект
+    Disconnect Control (класс 70) поверх эмулятора — эмулятор
+    записывает вызванный method_id в ``action_state``."""
+    counter = ConnectionCounter()
+    action_state: dict[bytes, int] = {}
+    handler = make_hdlc_dlms_handler(
+        password=PASSWORD, obis_values=OBIS_VALUES, error_injection=ErrorInjection(),
+        counter=counter, action_state=action_state,
+    )
+    with ThreadedEmulatorServer(handler) as server:
+        config = TransportConfig(host=server.host, port=server.port, timeout_ms=1000, max_retries=1)
+        with TcpTransport(config) as transport:
+            hdlc_dlms.execute_action(
+                transport, serial=SERIAL, password=PASSWORD, obis=dlms.DISCONNECT_CONTROL_OBIS,
+                method_id=dlms.METHOD_REMOTE_DISCONNECT, class_id=dlms.DISCONNECT_CONTROL_CLASS_ID,
+            )
+
+    assert action_state[dlms.parse_obis(dlms.DISCONNECT_CONTROL_OBIS)] == dlms.METHOD_REMOTE_DISCONNECT
+
+
+def test_execute_action_failure_raises_gateway_error():
+    counter = ConnectionCounter()
+    handler = make_hdlc_dlms_handler(
+        password=PASSWORD, obis_values=OBIS_VALUES, error_injection=ErrorInjection(),
+        counter=counter, action_force_result=3,  # read-write-denied
+    )
+    with ThreadedEmulatorServer(handler) as server:
+        config = TransportConfig(host=server.host, port=server.port, timeout_ms=1000, max_retries=1)
+        with TcpTransport(config) as transport:
+            with pytest.raises(GatewayError):
+                hdlc_dlms.execute_action(
+                    transport, serial=SERIAL, password=PASSWORD, obis=dlms.DISCONNECT_CONTROL_OBIS,
+                    method_id=dlms.METHOD_REMOTE_RECONNECT, class_id=dlms.DISCONNECT_CONTROL_CLASS_ID,
+                )
 
 
 def test_write_register_wrong_password_raises_auth_failed():

@@ -22,6 +22,8 @@ from ..config import settings
 from ..core.security import decrypt_secret
 from ..db import SessionLocal
 from ..models import (
+    DisconnectBatchItem,
+    DisconnectBatchItemStatus,
     Job,
     JobStatus,
     LoadProfileData,
@@ -35,7 +37,8 @@ from ..models import (
     ScheduledJobRunStatus,
 )
 from .audit import record_audit
-from .gateway_client import LoadProfileError, read_load_profile, read_register, write_register
+from .disconnect_batches import finalize_batch_if_complete
+from .gateway_client import LoadProfileError, disconnect_meter, read_load_profile, read_register, write_register
 from .load_profile import DEFAULT_LOAD_PROFILE_OBIS
 from .notifications import create_notification
 from .write_parameters import WRITABLE_INT_PARAMETERS
@@ -379,11 +382,77 @@ async def _run_read_load_profile(db: AsyncSession, job: Job) -> None:
     await db.commit()
 
 
+async def _run_disconnect_operation(db: AsyncSession, job: Job, *, operation: str) -> None:
+    """Удалённое отключение/подключение (Этап 5, ТЗ п.4.2.10) — общий
+    обработчик для job_type «disconnect»/«reconnect», используется и
+    ручным запуском с карточки счётчика, и пакетной операцией от
+    биллинга (см. app/api/billing.py). ``job.payload["source"]`` —
+    "web" | "billing", проставляется на этапе постановки задачи в
+    очередь, определяет категорию источника в audit_log (ТЗ п.4.2.10:
+    «указанием источника инициации — пользователь веб-интерфейса либо
+    идентификатор пакета от биллинга»)."""
+    meter = await db.get(Meter, job.meter_id)
+    if meter is None:
+        job.status = JobStatus.FAILED
+        job.error = {"code": "METER_NOT_FOUND", "message": f"Счётчик id={job.meter_id} не найден"}
+        job.finished_at = datetime.now(timezone.utc)
+        await db.commit()
+        return
+
+    gateway = meter.gateway
+    grpc_target = gateway.grpc_target if gateway else settings.gateway_grpc_target
+    password = decrypt_secret(meter.password_encrypted).decode("ascii")
+
+    outcome = await disconnect_meter(
+        grpc_target=grpc_target,
+        profile=meter.protocol_profile.value,
+        host=meter.ip_address or "",
+        port=meter.port or 0,
+        call_home=meter.is_call_home,
+        serial=meter.serial_number,
+        password=password,
+        operation=operation,
+        call_timeout_s=160.0 if meter.is_call_home else 60.0,
+    )
+
+    job.status = JobStatus.SUCCEEDED if outcome.ok else JobStatus.FAILED
+    job.result = {"operation": operation, "ok": outcome.ok}
+    if not outcome.ok:
+        job.error = {"code": outcome.error_code, "message": outcome.error_message}
+    job.finished_at = datetime.now(timezone.utc)
+
+    await record_audit(
+        db,
+        user_id=job.created_by_id,
+        action=f"meter.{operation}",
+        object_type="meter",
+        object_id=str(meter.id),
+        result="success" if outcome.ok else "failure",
+        source=job.payload.get("source", "web"),
+        details={
+            "serial": meter.serial_number,
+            "batch_id": job.payload.get("batch_id"),
+            "error": None if outcome.ok else outcome.error_message,
+        },
+    )
+    await db.commit()
+
+
+async def _run_disconnect(db: AsyncSession, job: Job) -> None:
+    await _run_disconnect_operation(db, job, operation="disconnect")
+
+
+async def _run_reconnect(db: AsyncSession, job: Job) -> None:
+    await _run_disconnect_operation(db, job, operation="reconnect")
+
+
 _JOB_HANDLERS = {
     "read_current": _run_read_current,
     "write_datetime": _run_write_datetime,
     "write_parameter": _run_write_parameter,
     "read_load_profile": _run_read_load_profile,
+    "disconnect": _run_disconnect,
+    "reconnect": _run_reconnect,
 }
 
 
@@ -433,6 +502,27 @@ async def _maybe_finalize_scheduled_job_run(db: AsyncSession, scheduled_job_run_
     await db.commit()
 
 
+async def _maybe_finalize_disconnect_batch_item(db: AsyncSession, job: Job) -> None:
+    """Этап 5 (ТЗ п.4.2.10, API.docx п.4.5) — если задача была порождена
+    пакетной операцией биллинга (см. app/api/billing.py), обновляет
+    статус соответствующего DisconnectBatchItem и, если это была
+    последняя незавершённая задача пакета, финализирует сам пакет (тот
+    же принцип, что и у _maybe_finalize_scheduled_job_run в Этапе 4).
+    Для job'ов без связанного DisconnectBatchItem (ручной запуск с
+    карточки счётчика) — no-op."""
+    item = (
+        await db.execute(select(DisconnectBatchItem).where(DisconnectBatchItem.job_id == job.id))
+    ).scalar_one_or_none()
+    if item is None:
+        return
+    item.status = DisconnectBatchItemStatus.DONE if job.status == JobStatus.SUCCEEDED else DisconnectBatchItemStatus.FAILED
+    if job.status == JobStatus.FAILED and job.error:
+        item.error_code = job.error.get("code")
+    await db.flush()
+    await finalize_batch_if_complete(db, item.batch_id)
+    await db.commit()
+
+
 async def _process_one(db: AsyncSession) -> bool:
     job = await _claim_next_job(db)
     if job is None:
@@ -451,6 +541,8 @@ async def _process_one(db: AsyncSession) -> bool:
 
     if job.scheduled_job_run_id is not None:
         await _maybe_finalize_scheduled_job_run(db, job.scheduled_job_run_id)
+    if job.job_type in ("disconnect", "reconnect"):
+        await _maybe_finalize_disconnect_batch_item(db, job)
     return True
 
 

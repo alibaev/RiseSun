@@ -140,6 +140,54 @@ def write_register_via_established_link(
     dlms.parse_set_response(dlms.unwrap_llc(response_frame.information))
 
 
+def execute_action(
+    transport: TcpTransport,
+    *,
+    serial: str,
+    password: bytes,
+    obis: str,
+    method_id: int,
+    class_id: int,
+) -> None:
+    """Удалённое отключение/подключение счётчика (Этап 5, ТЗ п.4.2.10) —
+    SNRM/UA + AARQ/AARE + ACTION. Ничего не возвращает, бросает
+    GatewayError при отказе (в т.ч. AuthFailedError)."""
+    establish_link(transport, serial=serial)
+    execute_action_via_established_link(
+        transport, serial=serial, password=password, obis=obis, method_id=method_id, class_id=class_id,
+    )
+
+
+def execute_action_via_established_link(
+    transport: TcpTransport,
+    *,
+    serial: str,
+    password: bytes,
+    obis: str,
+    method_id: int,
+    class_id: int,
+) -> None:
+    """AARQ/AARE + ACTION поверх УЖЕ установленной (SNRM/UA пройден) HDLC-связи."""
+    server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
+    client_addr = DEFAULT_CLIENT_ADDRESS
+
+    aarq = dlms.build_aarq(password)
+    _send_i_frame(
+        transport, server_addr, client_addr, send_seq=0, recv_seq=0,
+        information=dlms.wrap_llc_command(aarq),
+    )
+    aare_frame = _recv_i_frame(transport)
+    dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))
+
+    request = dlms.build_action_request(dlms.parse_obis(obis), method_id, class_id=class_id)
+    _send_i_frame(
+        transport, server_addr, client_addr, send_seq=1, recv_seq=1,
+        information=dlms.wrap_llc_command(request),
+    )
+    response_frame = _recv_i_frame(transport)
+    dlms.parse_action_response(dlms.unwrap_llc(response_frame.information))
+
+
 def _establish_link(transport: TcpTransport, server_addr: int, client_addr: int) -> None:
     frame = HdlcFrame(
         destination=server_addr,

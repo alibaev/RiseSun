@@ -232,6 +232,45 @@ async def trigger_write_datetime(
     return job
 
 
+@router.post("/{meter_id}/disconnect", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
+async def trigger_disconnect(
+    meter_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.WRITE_PARAMETER)),
+) -> Job:
+    """Удалённое отключение счётчика (ТЗ п.4.2.10) — вручную, по одному
+    счётчику. Явное подтверждение обеспечивает Frontend (ConfirmModal)
+    перед вызовом этого эндпоинта — ввиду физических последствий операции
+    (обесточивание потребителя) обязательно по ТЗ."""
+    meter = await db.get(Meter, meter_id)
+    if meter is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Счётчик не найден")
+
+    job = Job(job_type="disconnect", meter_id=meter_id, payload={"source": "web"}, created_by_id=user.id)
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
+@router.post("/{meter_id}/reconnect", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
+async def trigger_reconnect(
+    meter_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.WRITE_PARAMETER)),
+) -> Job:
+    """Удалённое подключение счётчика (ТЗ п.4.2.10) — вручную, по одному счётчику."""
+    meter = await db.get(Meter, meter_id)
+    if meter is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Счётчик не найден")
+
+    job = Job(job_type="reconnect", meter_id=meter_id, payload={"source": "web"}, created_by_id=user.id)
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
 @router.post(
     "/{meter_id}/write-parameter/{parameter}", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED
 )

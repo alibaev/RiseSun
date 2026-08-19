@@ -33,6 +33,8 @@ def make_hdlc_dlms_handler(
     load_profile_obis: bytes | None = None,
     load_profile_rows: list[list[bytes]] | None = None,
     load_profile_block_size: int = 40,
+    action_state: dict[bytes, int] | None = None,
+    action_force_result: int | None = None,
 ):
     """Возвращает обработчик TCP-подключения для ``ThreadedEmulatorServer``.
 
@@ -52,7 +54,13 @@ def make_hdlc_dlms_handler(
     датаблоков в тестах), не через GET.response-Normal. Реальная
     фильтрация по диапазону дат не эмулируется — отдаются все строки
     целиком, диапазон в запросе не проверяется (эмулятор нужен для
-    проверки МЕХАНИЗМА блочной передачи, не бизнес-логики счётчика)."""
+    проверки МЕХАНИЗМА блочной передачи, не бизнес-логики счётчика).
+
+    ``action_state`` (Этап 5) — если задан, каждый обработанный
+    ACTION.request записывает в него ``{obis: method_id}``, чтобы тест
+    мог проверить, что именно было вызвано (remote_disconnect/
+    remote_reconnect). ``action_force_result`` — принудительный код
+    Action-Result в ответе (для проверки обработки отказа)."""
 
     def handler(conn: socket.socket) -> None:
         conn.settimeout(5)
@@ -72,6 +80,8 @@ def make_hdlc_dlms_handler(
             load_profile_obis=load_profile_obis,
             load_profile_rows=load_profile_rows,
             load_profile_block_size=load_profile_block_size,
+            action_state=action_state,
+            action_force_result=action_force_result,
         )
 
     return handler
@@ -88,6 +98,8 @@ def serve_hdlc_dlms_session(
     load_profile_obis: bytes | None = None,
     load_profile_rows: list[list[bytes]] | None = None,
     load_profile_block_size: int = 40,
+    action_state: dict[bytes, int] | None = None,
+    action_force_result: int | None = None,
 ) -> None:
     """Обслуживает установление HDLC-соединения, AARQ/AARE и один GET либо SET
     (либо — если настроен ``load_profile_obis`` и запрос его затрагивает —
@@ -134,7 +146,13 @@ def serve_hdlc_dlms_session(
         )
         return
 
-    if tag == dlms.SET_REQUEST_TAG:
+    if tag == dlms.ACTION_REQUEST_TAG:
+        action_request = dlms.parse_action_request(payload)
+        if action_state is not None:
+            action_state[action_request.obis] = action_request.method_id
+        result = dlms.ACTION_RESULT_SUCCESS if action_force_result is None else action_force_result
+        info = dlms.build_action_response(action_request.invoke_id, result=result)
+    elif tag == dlms.SET_REQUEST_TAG:
         set_request = dlms.parse_set_request(payload)
         if data_values is not None:
             data_values[set_request.obis] = set_request.encoded_value
