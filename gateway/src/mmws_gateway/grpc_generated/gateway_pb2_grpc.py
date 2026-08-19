@@ -49,6 +49,11 @@ class GatewayServiceStub:
                 request_serializer=gateway__pb2.HealthCheckRequest.SerializeToString,
                 response_deserializer=gateway__pb2.HealthCheckResponse.FromString,
                 _registered_method=True)
+        self.ReadLoadProfile = channel.unary_stream(
+                '/mmws.gateway.v1.GatewayService/ReadLoadProfile',
+                request_serializer=gateway__pb2.ReadLoadProfileRequest.SerializeToString,
+                response_deserializer=gateway__pb2.ReadLoadProfileResponse.FromString,
+                _registered_method=True)
 
 
 class GatewayServiceServicer:
@@ -81,6 +86,24 @@ class GatewayServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ReadLoadProfile(self, request, context):
+        """Профиль нагрузки (Этап 3, ТЗ п. 4.2.3) — server-streaming: каждая
+        строка буфера отдаётся отдельным сообщением сразу, как только она
+        полностью собрана из принятых датаблоков (см.
+        protocols.hdlc_dlms.read_load_profile), а не одним ответом по
+        завершении всей передачи. Именно ради этого сценария изначально
+        выбран gRPC (Promt_MMWS.md — потоковая передача данных профиля
+        нагрузки), а не обычный REST/HTTP между Backend и Gateway. Если
+        соединение со счётчиком обрывается посреди передачи, Backend
+        получает через RpcError все строки, отправленные ДО обрыва (не
+        теряет их) и решает, докачивать ли остаток (is_partial) — сам
+        Gateway не хранит состояние между вызовами (Promt_MMWS.md, раздел
+        3, принцип 1).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_GatewayServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -98,6 +121,11 @@ def add_GatewayServiceServicer_to_server(servicer, server):
                     servicer.HealthCheck,
                     request_deserializer=gateway__pb2.HealthCheckRequest.FromString,
                     response_serializer=gateway__pb2.HealthCheckResponse.SerializeToString,
+            ),
+            'ReadLoadProfile': grpc.unary_stream_rpc_method_handler(
+                    servicer.ReadLoadProfile,
+                    request_deserializer=gateway__pb2.ReadLoadProfileRequest.FromString,
+                    response_serializer=gateway__pb2.ReadLoadProfileResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -181,6 +209,33 @@ class GatewayService:
             '/mmws.gateway.v1.GatewayService/HealthCheck',
             gateway__pb2.HealthCheckRequest.SerializeToString,
             gateway__pb2.HealthCheckResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReadLoadProfile(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/mmws.gateway.v1.GatewayService/ReadLoadProfile',
+            gateway__pb2.ReadLoadProfileRequest.SerializeToString,
+            gateway__pb2.ReadLoadProfileResponse.FromString,
             options,
             channel_credentials,
             insecure,

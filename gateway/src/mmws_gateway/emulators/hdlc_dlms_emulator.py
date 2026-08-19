@@ -30,6 +30,9 @@ def make_hdlc_dlms_handler(
     error_injection: ErrorInjection,
     counter: ConnectionCounter,
     data_values: dict[bytes, bytes] | None = None,
+    load_profile_obis: bytes | None = None,
+    load_profile_rows: list[list[bytes]] | None = None,
+    load_profile_block_size: int = 40,
 ):
     """Возвращает обработчик TCP-подключения для ``ThreadedEmulatorServer``.
 
@@ -38,7 +41,18 @@ def make_hdlc_dlms_handler(
     ключ — OBIS, значение — уже закодированные байты (тег+длина+
     содержимое). SET обновляет запись, GET читает — общий изменяемый
     словарь, переданный вызывающим тестом, чтобы проверить, что именно
-    было записано."""
+    было записано.
+
+    ``load_profile_obis``/``load_profile_rows`` (Этап 3) — эмуляция
+    буфера профиля нагрузки: каждая строка ``load_profile_rows`` — уже
+    закодированный список колонок (см. ``datatypes.encode_*``),
+    оборачивается в structure и отдаётся ВСЕГДА через датаблоки (по
+    ``load_profile_block_size`` байт на датаблок — специально маленький
+    по умолчанию, чтобы гарантированно проверить склейку нескольких
+    датаблоков в тестах), не через GET.response-Normal. Реальная
+    фильтрация по диапазону дат не эмулируется — отдаются все строки
+    целиком, диапазон в запросе не проверяется (эмулятор нужен для
+    проверки МЕХАНИЗМА блочной передачи, не бизнес-логики счётчика)."""
 
     def handler(conn: socket.socket) -> None:
         conn.settimeout(5)
@@ -55,6 +69,9 @@ def make_hdlc_dlms_handler(
             error_injection=error_injection,
             attempt=attempt,
             data_values=data_values,
+            load_profile_obis=load_profile_obis,
+            load_profile_rows=load_profile_rows,
+            load_profile_block_size=load_profile_block_size,
         )
 
     return handler
@@ -68,8 +85,13 @@ def serve_hdlc_dlms_session(
     error_injection: ErrorInjection,
     attempt: int,
     data_values: dict[bytes, bytes] | None = None,
+    load_profile_obis: bytes | None = None,
+    load_profile_rows: list[list[bytes]] | None = None,
+    load_profile_block_size: int = 40,
 ) -> None:
-    """Обслуживает установление HDLC-соединения, AARQ/AARE и один GET либо SET.
+    """Обслуживает установление HDLC-соединения, AARQ/AARE и один GET либо SET
+    (либо — если настроен ``load_profile_obis`` и запрос его затрагивает —
+    серию GET.request-Next/датаблоков для профиля нагрузки).
 
     Вынесено отдельной функцией, чтобы её мог переиспользовать эмулятор
     режима E (``mode_e_emulator``) после собственной идентификационной
@@ -98,6 +120,19 @@ def serve_hdlc_dlms_session(
     req_frame = HdlcFrame.decode(_read_frame(conn))
     payload = dlms.unwrap_llc(req_frame.information)
     tag = payload[0] if payload else None
+
+    has_access_selection = len(payload) > 12 and payload[12] == 0x01
+    if (
+        load_profile_obis is not None
+        and tag == dlms.GET_REQUEST_TAG
+        and has_access_selection
+        and payload[5:11] == load_profile_obis
+    ):
+        _serve_load_profile(
+            conn, req_frame, invoke_id=payload[2],
+            rows=load_profile_rows or [], block_size=load_profile_block_size,
+        )
+        return
 
     if tag == dlms.SET_REQUEST_TAG:
         set_request = dlms.parse_set_request(payload)
@@ -142,6 +177,53 @@ def serve_hdlc_dlms_session(
         return
 
     conn.sendall(encoded)
+
+
+def _serve_load_profile(
+    conn: socket.socket,
+    req_frame: HdlcFrame,
+    *,
+    invoke_id: int,
+    rows: list[list[bytes]],
+    block_size: int,
+) -> None:
+    """Отдаёт настроенные строки профиля нагрузки ВСЕГДА через серию
+    GET.response-with-datablock (даже если всё уместилось бы в одном
+    PDU) — намеренно упрощённая, но специально проверяющая механизм
+    склейки нескольких датаблоков и GET.request-Next в
+    ``hdlc_dlms.read_load_profile``."""
+    array_bytes = datatypes.encode_array(
+        [datatypes.encode_structure(row) for row in rows]
+    )
+
+    send_seq = 1
+    recv_seq = 2
+    offset = 0
+    block_number = 0
+    while True:
+        block_number += 1
+        chunk = array_bytes[offset : offset + block_size]
+        offset += len(chunk)
+        last_block = offset >= len(array_bytes)
+
+        info = dlms.build_get_response_datablock(
+            invoke_id, last_block=last_block, block_number=block_number, raw_data=chunk
+        )
+        response_frame = HdlcFrame(
+            destination=req_frame.source,
+            source=req_frame.destination,
+            control=control_information_frame(send_seq, recv_seq),
+            information=dlms.wrap_llc_response(info),
+        )
+        conn.sendall(response_frame.encode())
+        send_seq += 1
+
+        if last_block:
+            return
+
+        next_frame = HdlcFrame.decode(_read_frame(conn))
+        req_frame = next_frame
+        recv_seq += 1
 
 
 def _read_frame(conn: socket.socket) -> bytes:

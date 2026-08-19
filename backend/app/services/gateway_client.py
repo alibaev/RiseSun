@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from typing import AsyncIterator
 
 import grpc
 
@@ -127,3 +128,71 @@ async def write_register(
         return WriteResult(ok=True)
     error = response.error
     return WriteResult(ok=False, error_code=error.code, error_message=error.message)
+
+
+@dataclass
+class LoadProfileRow:
+    timestamp_iso: str
+    values: list
+
+
+class LoadProfileError(Exception):
+    """Строки, уже отданные генератором ДО этого исключения, не теряются —
+    вызывающий код (job_worker) успевает сохранить их в БД до того, как
+    исключение прервёт итерацию (ТЗ п.4.2.3 — докачка при обрыве)."""
+
+    def __init__(self, code: str, message: str, is_partial: bool) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.is_partial = is_partial
+
+
+async def read_load_profile(
+    *,
+    grpc_target: str,
+    profile: str,
+    serial: str,
+    password: str,
+    obis: str,
+    from_iso: str,
+    to_iso: str,
+    host: str = "",
+    port: int = 0,
+    call_home: bool = False,
+    class_id: int = 0,
+    timeout_ms: int = 0,
+    retries: int = 0,
+    call_timeout_s: float = 180.0,
+) -> AsyncIterator[LoadProfileRow]:
+    """Профиль нагрузки (Этап 3, ТЗ п.4.2.3) — server-streaming RPC, генератор
+    отдаёт каждую строку сразу по получении (не ждёт всего ответа целиком).
+    ``call_timeout_s`` выше, чем у read_register — буфер профиля нагрузки
+    может передаваться несколькими датаблоками дольше, чем чтение одного
+    регистра."""
+    async with grpc.aio.insecure_channel(grpc_target) as channel:
+        stub = gateway_pb2_grpc.GatewayServiceStub(channel)
+        request = gateway_pb2.ReadLoadProfileRequest(
+            profile=profile,
+            host=host,
+            port=port,
+            serial=serial,
+            password=password,
+            obis=obis,
+            class_id=class_id,
+            from_iso=from_iso,
+            to_iso=to_iso,
+            timeout_ms=timeout_ms,
+            retries=retries,
+            call_home=call_home,
+        )
+        async for response in stub.ReadLoadProfile(request, timeout=call_timeout_s):
+            which = response.WhichOneof("result")
+            if which == "row":
+                yield LoadProfileRow(
+                    timestamp_iso=response.row.timestamp_iso,
+                    values=json.loads(response.row.values_json),
+                )
+            else:
+                error = response.error
+                raise LoadProfileError(error.code, error.message, error.is_partial)

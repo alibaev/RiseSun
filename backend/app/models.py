@@ -19,6 +19,7 @@ from sqlalchemy import (
     LargeBinary,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -162,6 +163,32 @@ class MeterReading(Base):
     unit: Mapped[str | None] = mapped_column(String(16), nullable=True)
     read_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), nullable=True)
+
+
+class LoadProfileData(Base):
+    """Строки буфера профиля нагрузки (Этап 3, ТЗ п.4.2.3).
+
+    Уникальность (meter_id, obis_code, timestamp) делает повторное чтение
+    пересекающегося диапазона дат идемпотентным — Backend просто
+    вставляет строки с ``ON CONFLICT DO NOTHING`` (см. job_worker), без
+    отдельного отслеживания "точки докачки": обрыв связи посреди
+    передачи (Job помечается is_partial в error) не оставляет дыр —
+    достаточно поставить новый job с тем же (или чуть более широким)
+    диапазоном дат, уже сохранённые строки просто не продублируются."""
+
+    __tablename__ = "load_profile_data"
+    __table_args__ = (UniqueConstraint("meter_id", "obis_code", "timestamp", name="uq_load_profile_row"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    meter_id: Mapped[int] = mapped_column(ForeignKey("meters.id"), nullable=False, index=True)
+    obis_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    # Остальные колонки буфера (первая — timestamp, уже вынесена в
+    # отдельное поле) — JSON-совместимый вид, тот же принцип, что и
+    # meter_readings.value_json.
+    values_json: Mapped[list] = mapped_column(JSONB, nullable=False)
+    job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class EventLog(Base):

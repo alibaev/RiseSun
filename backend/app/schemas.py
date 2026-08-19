@@ -134,6 +134,29 @@ class WriteParameterRequest(BaseModel):
     value: int = Field(ge=0, le=255, description="Новое значение параметра (1 байт, 0-255)")
 
 
+class ReadLoadProfileTriggerRequest(BaseModel):
+    from_iso: str = Field(description="Начало диапазона, ISO 8601, напр. \"2026-08-01T00:00:00\"")
+    to_iso: str = Field(description="Конец диапазона, ISO 8601")
+    obis: str | None = Field(
+        default=None,
+        description=(
+            "Override адреса буфера профиля нагрузки (6-байтная hex-нотация). "
+            "По умолчанию — рабочая гипотеза DEFAULT_LOAD_PROFILE_OBIS "
+            "(см. app/services/load_profile.py, DECISIONS.md)."
+        ),
+    )
+
+
+class LoadProfileRowOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    meter_id: int
+    obis_code: str
+    timestamp: datetime
+    values_json: list
+
+
 class ParameterWriteHistoryOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

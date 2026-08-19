@@ -50,3 +50,39 @@ def test_decode_truncated_data_raises():
 
 def test_decode_bcd_ascii_number():
     assert datatypes.decode_bcd_ascii_number("001234.567") == pytest.approx(1234.567)
+
+
+def test_structure_round_trip():
+    encoded = datatypes.encode_structure(
+        [datatypes.encode_double_long_unsigned(7), datatypes.encode_unsigned(1)]
+    )
+    decoded, consumed = datatypes.decode_value(encoded)
+    assert decoded == [7, 1]
+    assert consumed == len(encoded)
+
+
+def test_array_round_trip():
+    encoded = datatypes.encode_array([datatypes.encode_unsigned(1), datatypes.encode_unsigned(2)])
+    decoded, consumed = datatypes.decode_value(encoded)
+    assert decoded == [1, 2]
+    assert consumed == len(encoded)
+
+
+def test_array_of_structures_round_trip():
+    row = datatypes.encode_structure(
+        [datatypes.encode_octet_string(b"\x00" * 12), datatypes.encode_double_long_unsigned(1234)]
+    )
+    encoded = datatypes.encode_array([row, row])
+    decoded, consumed = datatypes.decode_value(encoded)
+    assert decoded == [[b"\x00" * 12, 1234], [b"\x00" * 12, 1234]]
+    assert consumed == len(encoded)
+
+
+def test_cosem_date_time_round_trip():
+    from datetime import datetime
+
+    dt = datetime(2026, 8, 19, 12, 30, 45)
+    raw = datatypes.encode_cosem_date_time(dt)
+    assert len(raw) == 12
+    decoded = datatypes.decode_cosem_date_time(raw)
+    assert decoded == dt

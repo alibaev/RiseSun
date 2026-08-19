@@ -23,6 +23,20 @@ service GatewayService {
   // Проверка доступности конкретного экземпляра Gateway (используется
   // Backend'ом для heartbeat в реестре gateways, ТЗ п. 4.1.1).
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Профиль нагрузки (Этап 3, ТЗ п. 4.2.3) — server-streaming: каждая
+  // строка буфера отдаётся отдельным сообщением сразу, как только она
+  // полностью собрана из принятых датаблоков (см.
+  // protocols.hdlc_dlms.read_load_profile), а не одним ответом по
+  // завершении всей передачи. Именно ради этого сценария изначально
+  // выбран gRPC (Promt_MMWS.md — потоковая передача данных профиля
+  // нагрузки), а не обычный REST/HTTP между Backend и Gateway. Если
+  // соединение со счётчиком обрывается посреди передачи, Backend
+  // получает через RpcError все строки, отправленные ДО обрыва (не
+  // теряет их) и решает, докачивать ли остаток (is_partial) — сам
+  // Gateway не хранит состояние между вызовами (Promt_MMWS.md, раздел
+  // 3, принцип 1).
+  rpc ReadLoadProfile(ReadLoadProfileRequest) returns (stream ReadLoadProfileResponse);
 }
 
 message ReadRegisterRequest {
@@ -105,4 +119,40 @@ message HealthCheckRequest {}
 message HealthCheckResponse {
   bool ok = 1;
   string driver_version = 2;
+}
+
+message ReadLoadProfileRequest {
+  string profile = 1;       // Этап 3 реализован только для "hdlc_dlms"
+  string host = 2;           // игнорируется при call_home=true
+  int32 port = 3;
+  string serial = 4;
+  string password = 5;
+  string obis = 6;           // рабочая гипотеза "1.0.63.1.0.ff" (decimal
+                              // 1-0:99.1.0.255, стандартный DLMS "Load
+                              // Profile 1") — в словаре OBIS.xlsx адрес
+                              // самого буфера не задокументирован, см.
+                              // DECISIONS.md
+  int32 class_id = 7;        // 0 = дефолт Gateway (Profile Generic, класс 7)
+  string from_iso = 8;       // ISO 8601, напр. "2026-08-01T00:00:00"
+  string to_iso = 9;
+  int32 timeout_ms = 10;
+  int32 retries = 11;
+  bool call_home = 12;       // пока не реализовано, см. ReadError
+}
+
+message ReadLoadProfileResponse {
+  oneof result {
+    LoadProfileRow row = 1;
+    ReadError error = 2;     // тот же формат ошибки, что и у ReadRegister
+  }
+}
+
+message LoadProfileRow {
+  // Первая колонка строки буфера по конвенции — метка времени
+  // (octet_string, 12 сырых байт cosem-date-time) — Gateway декодирует
+  // её сам (Backend не реализует протокольную логику, Promt_MMWS.md,
+  // раздел 3, принцип 1) и отдаёт готовым ISO 8601. Остальные колонки —
+  // JSON-совместимый вид (тот же принцип, что и ReadValue.value_json).
+  string timestamp_iso = 1;
+  string values_json = 2;
 }

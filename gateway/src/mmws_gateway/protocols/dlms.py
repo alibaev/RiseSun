@@ -79,6 +79,7 @@ USER_INFORMATION_INITIATE = bytes.fromhex("be10040e01000000065f1f040000081d0000"
 
 REGISTER_CLASS_ID = 3
 REGISTER_VALUE_ATTRIBUTE = 2
+PROFILE_GENERIC_CLASS_ID = 7  # буфер профиля нагрузки (Этап 3, ТЗ п.4.2.3)
 
 
 def encode_oid(components: tuple[int, ...]) -> bytes:
@@ -382,3 +383,121 @@ def parse_set_response(data: bytes) -> None:
     if result != SET_RESULT_SUCCESS:
         name = _SET_RESULT_NAMES.get(result, f"0x{result:02X}")
         raise GatewayError(f"Счётчик отклонил запись параметра: data-access-result={result} ({name})")
+
+
+# --- Профиль нагрузки (Этап 3, ТЗ п.4.2.3): GET с access-selection
+# (выборка по диапазону дат) + блочная передача больших ответов ---
+#
+# Объект профиля нагрузки (COSEM Profile Generic, класс 7) в словаре
+# OBIS.xlsx не задокументирован (проверено все 7 листов — есть только
+# настройки интервала записи, не адрес самого буфера). По решению
+# пользователя 2026-08-19 используется стандартный DLMS-адрес Load
+# Profile 1 (`1.0.99.1.0.255`, IEC 62056-6-2) как рабочая гипотеза,
+# подлежащая проверке на реальном оборудовании — см. DECISIONS.md.
+#
+# access-selection в GET.request-Normal — байт "есть/нет" (0x00 —
+# отсутствует, уже используется в build_get_request через явный [0x00]
+# в конце), затем при наличии: [0x01, access-selector, access-parameters].
+# Для профиля нагрузки — access-selector=1 (range-descriptor),
+# access-parameters — структура из 4 полей: restricting_object (обычно
+# ссылка на объект Clock, класс 8, OBIS 0.0.1.0.0.255, атрибут 2 —
+# "время" — используется как колонка сортировки), from_value/to_value
+# (диапазон как octet-string с сырыми 12 байтами cosem-date-time),
+# selected_values (пустой массив = вернуть все захватываемые колонки).
+
+RANGE_DESCRIPTOR_SELECTOR = 1
+CLOCK_CLASS_ID = 8
+CLOCK_OBIS = bytes([0, 0, 1, 0, 0, 0xFF])  # стандартный OBIS объекта Clock
+
+GET_REQUEST_NEXT = 0x02
+GET_RESPONSE_WITH_DATABLOCK = 0x02
+DATABLOCK_RESULT_RAW_DATA = 0x00
+DATABLOCK_RESULT_DATA_ACCESS_ERROR = 0x01
+
+
+def build_get_request_range(
+    obis: bytes,
+    *,
+    class_id: int,
+    from_dt,
+    to_dt,
+    invoke_id: int = 1,
+    attribute_id: int = REGISTER_VALUE_ATTRIBUTE,
+    restricting_class_id: int = CLOCK_CLASS_ID,
+    restricting_obis: bytes = CLOCK_OBIS,
+    restricting_attribute_id: int = 2,
+) -> bytes:
+    """GET.request-Normal с access-selection=range-descriptor — просит
+    у счётчика только записи буфера профиля нагрузки за ``[from_dt,
+    to_dt]`` вместо выгрузки всего буфера целиком."""
+    if len(obis) != 6:
+        raise GatewayError("OBIS для GET.request должен быть ровно 6 байт")
+    descriptor = class_id.to_bytes(2, "big") + obis + bytes([attribute_id])
+
+    restricting_object = datatypes.encode_structure(
+        [
+            datatypes.encode_long_unsigned(restricting_class_id),
+            datatypes.encode_octet_string(restricting_obis),
+            datatypes.encode_integer(restricting_attribute_id),
+            datatypes.encode_long_unsigned(0),
+        ]
+    )
+    from_value = datatypes.encode_octet_string(datatypes.encode_cosem_date_time(from_dt))
+    to_value = datatypes.encode_octet_string(datatypes.encode_cosem_date_time(to_dt))
+    selected_values = datatypes.encode_array([])
+    access_parameters = datatypes.encode_structure(
+        [restricting_object, from_value, to_value, selected_values]
+    )
+    access_selection = bytes([0x01, RANGE_DESCRIPTOR_SELECTOR]) + access_parameters
+
+    return (
+        bytes([GET_REQUEST_TAG, GET_REQUEST_NORMAL, invoke_id])
+        + descriptor
+        + access_selection
+    )
+
+
+def build_get_request_next(block_number: int, *, invoke_id: int = 1) -> bytes:
+    """GET.request-Next — запрашивает следующий датаблок ответа, который
+    не поместился целиком в предыдущий (см. parse_get_response_datablock)."""
+    return bytes([GET_REQUEST_TAG, GET_REQUEST_NEXT, invoke_id]) + block_number.to_bytes(4, "big")
+
+
+def build_get_response_datablock(
+    invoke_id: int, *, last_block: bool, block_number: int, raw_data: bytes
+) -> bytes:
+    """Ответ-датаблок (используется эмулятором для проверки блочной
+    передачи). Длина ``raw_data`` — 2 байта (до 65535), а не общий 1-байтный
+    формат ``encode_octet_string`` — датаблок может быть заметно больше
+    127 байт."""
+    if len(raw_data) > 0xFFFF:
+        raise GatewayError("Датаблок длиннее 65535 байт не поддержан в Этапе 3")
+    return (
+        bytes([GET_RESPONSE_TAG, GET_RESPONSE_WITH_DATABLOCK, invoke_id])
+        + bytes([1 if last_block else 0])
+        + block_number.to_bytes(4, "big")
+        + bytes([DATABLOCK_RESULT_RAW_DATA])
+        + len(raw_data).to_bytes(2, "big")
+        + raw_data
+    )
+
+
+@dataclass
+class DatablockResult:
+    last_block: bool
+    block_number: int
+    raw_data: bytes
+
+
+def parse_get_response_datablock(data: bytes) -> DatablockResult:
+    if len(data) < 9 or data[0] != GET_RESPONSE_TAG or data[1] != GET_RESPONSE_WITH_DATABLOCK:
+        raise GatewayError("Ожидался GET.response-with-datablock (тег 0xC4 0x02)")
+    last_block = data[3] != 0
+    block_number = int.from_bytes(data[4:8], "big")
+    result_choice = data[8]
+    if result_choice == DATABLOCK_RESULT_DATA_ACCESS_ERROR:
+        code = data[9] if len(data) > 9 else -1
+        raise GatewayError(f"Счётчик вернул data-access-result={code} на датаблоке #{block_number}")
+    length = int.from_bytes(data[9:11], "big")
+    raw_data = data[11 : 11 + length]
+    return DatablockResult(last_block=last_block, block_number=block_number, raw_data=raw_data)

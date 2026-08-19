@@ -27,6 +27,14 @@ export interface MeterReading {
   read_at: string;
 }
 
+export interface LoadProfileRow {
+  id: number;
+  meter_id: number;
+  obis_code: string;
+  timestamp: string;
+  values_json: unknown[];
+}
+
 export interface LogEntry {
   id: number;
   category: string;

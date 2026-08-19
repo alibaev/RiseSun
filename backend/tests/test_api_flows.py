@@ -370,6 +370,47 @@ async def test_write_parameter_accepts_all_registered_parameters(client, db_sess
 
 
 @pytest.mark.asyncio
+async def test_read_load_profile_trigger_and_list(client, db_session):
+    """Этап 3 (ТЗ п.4.2.3): POST .../read-load-profile ставит job в очередь
+    (202, job_type='read_load_profile'), GET .../load-profile отдаёт уже
+    сохранённые строки (пусто, пока воркер не выполнил job — этот тест не
+    поднимает воркер, только проверяет форму API)."""
+    root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    db_session.add(
+        Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    )
+    await db_session.commit()
+    root_token = await _login(client, "root", "pass1234")
+    await client.post(
+        "/api/meters",
+        json={
+            "serial_number": "202006003607",
+            "ip_address": "127.0.0.1",
+            "port": 4059,
+            "protocol_profile": "hdlc_dlms",
+            "password": "12345678",
+            "gateway_id": 1,
+        },
+        headers={"Authorization": f"Bearer {root_token}"},
+    )
+
+    trigger_resp = await client.post(
+        "/api/meters/1/read-load-profile",
+        json={"from_iso": "2026-08-01T00:00:00", "to_iso": "2026-08-19T00:00:00"},
+        headers={"Authorization": f"Bearer {root_token}"},
+    )
+    assert trigger_resp.status_code == 202, trigger_resp.text
+    assert trigger_resp.json()["job_type"] == "read_load_profile"
+
+    list_resp = await client.get(
+        "/api/meters/1/load-profile?from_iso=2026-08-01T00:00:00&to_iso=2026-08-19T00:00:00",
+        headers={"Authorization": f"Bearer {root_token}"},
+    )
+    assert list_resp.status_code == 200
+    assert list_resp.json() == []
+
+
+@pytest.mark.asyncio
 async def test_non_call_home_meter_requires_ip_and_port(client, db_session):
     root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
     db_session.add(

@@ -17,6 +17,7 @@ import json
 import logging
 import os
 from concurrent import futures
+from datetime import datetime
 
 import grpc
 
@@ -124,6 +125,52 @@ def _do_write(request: gateway_pb2.WriteRegisterRequest, call_home_pool: CallHom
     run_with_retries(operation, max_retries=retries)
 
 
+def _do_read_load_profile(request: gateway_pb2.ReadLoadProfileRequest, call_home_pool: CallHomePool | None):
+    """Генератор строк профиля нагрузки (Этап 3, ТЗ п.4.2.3). Без
+    ``run_with_retries`` — повтор ПОСЕРЕДИНЕ уже начатой потоковой
+    передачи неоднозначен (какие строки повторно запрашивать), поэтому
+    решение «докачивать ли остаток после обрыва» (is_partial) отдано
+    на откуп Backend'у (см. ReadLoadProfile в gateway.proto), а не
+    реализовано здесь неявным повтором всей операции заново."""
+    password = request.password.encode("ascii")
+
+    if request.call_home:
+        raise GatewayError("Профиль нагрузки через call-home пока не реализован")
+    if request.profile != "hdlc_dlms":
+        raise GatewayError(f"Профиль нагрузки для протокольного профиля {request.profile!r} пока не реализован")
+
+    timeout_ms = request.timeout_ms or DEFAULT_TIMEOUT_MS
+    config = TransportConfig(host=request.host, port=request.port, timeout_ms=timeout_ms, max_retries=1)
+    from_dt = datetime.fromisoformat(request.from_iso)
+    to_dt = datetime.fromisoformat(request.to_iso)
+
+    with TcpTransport(config) as transport:
+        yield from hdlc_dlms.read_load_profile(
+            transport, serial=request.serial, password=password, obis=request.obis,
+            class_id=request.class_id or dlms.PROFILE_GENERIC_CLASS_ID,
+            from_dt=from_dt, to_dt=to_dt,
+        )
+
+
+def _load_profile_row_to_proto(row: object) -> gateway_pb2.LoadProfileRow:
+    """Первая колонка строки буфера по конвенции — метка времени
+    (octet_string, 12 сырых байт cosem-date-time); Gateway декодирует
+    её сам (Backend не реализует протокольную логику — Promt_MMWS.md,
+    раздел 3, принцип 1). Если строка не в этой форме — гипотеза о
+    структуре буфера профиля нагрузки (см. DECISIONS.md) не
+    подтвердилась, это должно упасть явной ошибкой, а не молча отдать
+    мусор."""
+    if not isinstance(row, list) or not row or not isinstance(row[0], bytes) or len(row[0]) != 12:
+        raise GatewayError(
+            "Первая колонка строки профиля нагрузки не похожа на cosem-date-time "
+            "(12 сырых байт) — гипотеза о структуре буфера не подтвердилась"
+        )
+    timestamp = datatypes.decode_cosem_date_time(row[0])
+    return gateway_pb2.LoadProfileRow(
+        timestamp_iso=timestamp.isoformat(), values_json=json.dumps(_jsonable(row[1:]))
+    )
+
+
 class GatewayServiceServicer(gateway_pb2_grpc.GatewayServiceServicer):
     def __init__(self, call_home_pool: CallHomePool | None = None) -> None:
         self._call_home_pool = call_home_pool
@@ -168,6 +215,24 @@ class GatewayServiceServicer(gateway_pb2_grpc.GatewayServiceServicer):
 
     def HealthCheck(self, request, context):
         return gateway_pb2.HealthCheckResponse(ok=True, driver_version=DRIVER_VERSION)
+
+    def ReadLoadProfile(self, request, context):
+        try:
+            for row in _do_read_load_profile(request, self._call_home_pool):
+                yield gateway_pb2.ReadLoadProfileResponse(row=_load_profile_row_to_proto(row))
+        except GatewayError as exc:
+            logger.warning(
+                "Ошибка чтения профиля нагрузки serial=%s obis=%s: [%s] %s",
+                request.serial, request.obis, exc.code, exc.message,
+            )
+            yield gateway_pb2.ReadLoadProfileResponse(
+                error=gateway_pb2.ReadError(
+                    code=exc.code,
+                    message=exc.message,
+                    is_partial=exc.is_partial,
+                    raw_frame_hex=exc.raw_frame.hex() if exc.raw_frame else "",
+                )
+            )
 
 
 def _jsonable(value: object) -> object:

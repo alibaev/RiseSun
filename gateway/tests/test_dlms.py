@@ -90,3 +90,45 @@ def test_encode_oid_matches_manual_encoding():
     assert dlms.encode_oid((2, 16, 756, 5, 8, 1, 1)) == bytes(
         [0x60, 0x85, 0x74, 0x05, 0x08, 0x01, 0x01]
     )
+
+
+def test_get_request_range_has_access_selection_present_flag():
+    from datetime import datetime
+
+    obis = dlms.parse_obis("1.0.63.1.0.ff")
+    request = dlms.build_get_request_range(
+        obis, class_id=7, from_dt=datetime(2026, 8, 1), to_dt=datetime(2026, 8, 19), invoke_id=9
+    )
+    assert request[0] == dlms.GET_REQUEST_TAG
+    assert request[1] == dlms.GET_REQUEST_NORMAL
+    assert request[2] == 9
+    descriptor_end = 3 + 2 + 6 + 1
+    assert request[descriptor_end] == 0x01  # access-selection присутствует
+    assert request[descriptor_end + 1] == dlms.RANGE_DESCRIPTOR_SELECTOR
+    # access-parameters — структура из 4 элементов
+    assert request[descriptor_end + 2] == datatypes.TAG_STRUCTURE
+    assert request[descriptor_end + 3] == 4
+
+
+def test_get_request_next_round_trip_shape():
+    request = dlms.build_get_request_next(3, invoke_id=5)
+    assert request == bytes([dlms.GET_REQUEST_TAG, dlms.GET_REQUEST_NEXT, 5, 0, 0, 0, 3])
+
+
+def test_datablock_response_round_trip():
+    response = dlms.build_get_response_datablock(
+        7, last_block=False, block_number=2, raw_data=b"\x01\x02\x03"
+    )
+    result = dlms.parse_get_response_datablock(response)
+    assert result.last_block is False
+    assert result.block_number == 2
+    assert result.raw_data == b"\x01\x02\x03"
+
+
+def test_datablock_response_last_block_true():
+    response = dlms.build_get_response_datablock(
+        7, last_block=True, block_number=3, raw_data=b""
+    )
+    result = dlms.parse_get_response_datablock(response)
+    assert result.last_block is True
+    assert result.raw_data == b""

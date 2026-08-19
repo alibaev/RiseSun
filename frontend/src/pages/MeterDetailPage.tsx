@@ -4,7 +4,7 @@ import { api, ApiError } from "../api/client";
 import { tokenStorage } from "../auth/tokenStorage";
 import { useAuth, canTriggerRead, canWriteParameter } from "../auth/AuthContext";
 import { ConfirmModal } from "../components/ConfirmModal";
-import type { Job, LogEntry, Meter, MeterReading } from "../api/types";
+import type { Job, LoadProfileRow, LogEntry, Meter, MeterReading } from "../api/types";
 
 const DEFAULT_OBIS = "1.1.1.8.0.ff"; // активная энергия, приём, всего (ТЗ Приложение Г.3)
 
@@ -12,6 +12,14 @@ function formatValue(value: unknown): string {
   if (value === null || value === undefined) return "—";
   if (Array.isArray(value)) return value.join(" / ");
   return String(value);
+}
+
+// <input type="datetime-local"> ждёт "YYYY-MM-DDTHH:mm" в локальном
+// времени пользователя, без секунд/зоны — обрезаем toISOString() (UTC)
+// до минут, этого достаточно для выбора диапазона профиля нагрузки.
+function toDatetimeLocal(date: Date): string {
+  const offsetMs = date.getTimezoneOffset() * 60000;
+  return new Date(date.getTime() - offsetMs).toISOString().slice(0, 16);
 }
 
 export function MeterDetailPage() {
@@ -44,20 +52,33 @@ export function MeterDetailPage() {
   const [settlementJob, setSettlementJob] = useState<Job | null>(null);
   const settlementWsRef = useRef<WebSocket | null>(null);
 
+  // Этап 3 (ТЗ п.4.2.3): профиль нагрузки — асинхронная задача с
+  // потенциально долгой передачей (блочная передача на стороне
+  // Gateway, см. gateway/src/mmws_gateway/protocols/hdlc_dlms.py). По
+  // умолчанию выбираются последние сутки — типичный диапазон для
+  // проверки, диапазон правится вручную перед запуском.
+  const [loadProfileRows, setLoadProfileRows] = useState<LoadProfileRow[]>([]);
+  const [loadProfileFrom, setLoadProfileFrom] = useState(() => toDatetimeLocal(new Date(Date.now() - 86400000)));
+  const [loadProfileTo, setLoadProfileTo] = useState(() => toDatetimeLocal(new Date()));
+  const [loadProfileJob, setLoadProfileJob] = useState<Job | null>(null);
+  const loadProfileWsRef = useRef<WebSocket | null>(null);
+
   const loadAll = useCallback(async () => {
     if (!id) return;
     setError(null);
     try {
-      const [m, r, e, t] = await Promise.all([
+      const [m, r, e, t, lp] = await Promise.all([
         api.get<Meter>(`/api/meters/${id}`),
         api.get<MeterReading[]>(`/api/meters/${id}/readings`),
         api.get<LogEntry[]>(`/api/meters/${id}/event-log`),
         api.get<LogEntry[]>(`/api/meters/${id}/tamper-log`),
+        api.get<LoadProfileRow[]>(`/api/meters/${id}/load-profile`),
       ]);
       setMeter(m);
       setReadings(r);
       setEventLog(e);
       setTamperLog(t);
+      setLoadProfileRows(lp);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Не удалось загрузить данные счётчика");
     }
@@ -70,6 +91,7 @@ export function MeterDetailPage() {
   useEffect(() => () => wsRef.current?.close(), []);
   useEffect(() => () => datetimeWsRef.current?.close(), []);
   useEffect(() => () => settlementWsRef.current?.close(), []);
+  useEffect(() => () => loadProfileWsRef.current?.close(), []);
 
   function watchJob(job: Job, wsRef: { current: WebSocket | null }, onUpdate: (job: Job) => void) {
     const token = tokenStorage.getAccess();
@@ -120,6 +142,21 @@ export function MeterDetailPage() {
       return;
     }
     setPendingWrite({ parameter: key, label, value });
+  }
+
+  function handleReadLoadProfile() {
+    if (!id) return;
+    setError(null);
+    api
+      .post<Job>(`/api/meters/${id}/read-load-profile`, {
+        from_iso: `${loadProfileFrom}:00`,
+        to_iso: `${loadProfileTo}:00`,
+      })
+      .then((job) => {
+        setLoadProfileJob(job);
+        watchJob(job, loadProfileWsRef, setLoadProfileJob);
+      })
+      .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось запустить чтение профиля нагрузки"));
   }
 
   function handleRefreshReadings() {
@@ -293,6 +330,75 @@ export function MeterDetailPage() {
                   <td>{formatValue(r.value_json)}</td>
                   <td>{r.unit ?? "—"}</td>
                   <td>{new Date(r.read_at).toLocaleString("ru-RU")}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+
+      <section className="card">
+        <div className="card-header">
+          <h2>Профиль нагрузки</h2>
+        </div>
+        {canTriggerRead(role) && (
+          <div className="filters">
+            <label>
+              С
+              <br />
+              <input
+                type="datetime-local"
+                value={loadProfileFrom}
+                onChange={(e) => setLoadProfileFrom(e.target.value)}
+              />
+            </label>
+            <label>
+              По
+              <br />
+              <input type="datetime-local" value={loadProfileTo} onChange={(e) => setLoadProfileTo(e.target.value)} />
+            </label>
+            <button
+              onClick={handleReadLoadProfile}
+              disabled={loadProfileJob?.status === "queued" || loadProfileJob?.status === "running"}
+            >
+              {loadProfileJob?.status === "queued" || loadProfileJob?.status === "running" ? "Читаю..." : "Прочитать"}
+            </button>
+          </div>
+        )}
+        {(loadProfileJob?.status === "queued" || loadProfileJob?.status === "running") && (
+          <p className="hint">
+            Читаю профиль нагрузки
+            {typeof loadProfileJob.result?.rows_written === "number"
+              ? ` — принято строк: ${loadProfileJob.result.rows_written}`
+              : "..."}
+          </p>
+        )}
+        {loadProfileJob?.status === "succeeded" && (
+          <p className="hint">
+            Готово, строк принято: {String(loadProfileJob.result?.rows_written ?? loadProfileRows.length)}.
+          </p>
+        )}
+        {loadProfileJob?.status === "failed" && (
+          <div className="error-message">
+            Ошибка чтения профиля нагрузки: {loadProfileJob.error?.code} — {loadProfileJob.error?.message}
+            {loadProfileJob.error?.is_partial && " (часть данных успела сохраниться — можно повторить для докачки)"}
+          </div>
+        )}
+        {loadProfileRows.length === 0 ? (
+          <p>Данных профиля нагрузки пока нет.</p>
+        ) : (
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Время</th>
+                <th>Значения</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loadProfileRows.map((r) => (
+                <tr key={r.id}>
+                  <td>{new Date(r.timestamp).toLocaleString("ru-RU")}</td>
+                  <td>{formatValue(r.values_json)}</td>
                 </tr>
               ))}
             </tbody>

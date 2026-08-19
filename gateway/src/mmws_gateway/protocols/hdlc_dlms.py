@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import logging
 
+from typing import Iterator
+
 from ..addressing import HDLC_DLMS, physical_address
 from ..errors import GatewayError
 from ..transport import TcpTransport
-from . import dlms
+from . import datatypes, dlms
+from .datatypes import DlmsDataError
 from .hdlc import (
     CONTROL_SNRM,
     CONTROL_UA,
@@ -195,3 +198,101 @@ def _recv_i_frame(transport: TcpTransport) -> HdlcFrame:
     raise GatewayError(
         "Счётчик прислал слишком много супервизорных кадров подряд без ответа приложения"
     )
+
+
+def read_load_profile(
+    transport: TcpTransport,
+    *,
+    serial: str,
+    password: bytes,
+    obis: str,
+    class_id: int,
+    from_dt,
+    to_dt,
+) -> Iterator[object]:
+    """Профиль нагрузки (Этап 3, ТЗ п.4.2.3) — GET с выборкой по датам,
+    при необходимости через несколько датаблоков (см. dlms.py).
+
+    Генератор: отдаёт КАЖДУЮ строку буфера сразу, как только она
+    полностью собрана из накопленных байт (не дожидаясь всего ответа
+    целиком) — обрыв соединения посреди передачи не теряет уже
+    отданные вызывающему коду строки (ТЗ п.4.2.3 — докачка при обрыве,
+    is_partial). Каждая строка — то, что вернул ``datatypes.decode_value``
+    для одного элемента массива (обычно список значений колонок,
+    первая колонка по конвенции — метка времени)."""
+    server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
+    client_addr = DEFAULT_CLIENT_ADDRESS
+
+    _establish_link(transport, server_addr, client_addr)
+
+    aarq = dlms.build_aarq(password)
+    _send_i_frame(
+        transport, server_addr, client_addr, send_seq=0, recv_seq=0,
+        information=dlms.wrap_llc_command(aarq),
+    )
+    aare_frame = _recv_i_frame(transport)
+    dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))
+
+    request = dlms.build_get_request_range(
+        dlms.parse_obis(obis), class_id=class_id, from_dt=from_dt, to_dt=to_dt,
+    )
+    _send_i_frame(
+        transport, server_addr, client_addr, send_seq=1, recv_seq=1,
+        information=dlms.wrap_llc_command(request),
+    )
+
+    send_seq = 2
+    buf = bytearray()
+    cursor = 0
+    total_count: int | None = None
+    decoded_count = 0
+
+    while True:
+        response_frame = _recv_i_frame(transport)
+        payload = dlms.unwrap_llc(response_frame.information)
+        response_type = payload[1] if len(payload) > 1 else None
+
+        if response_type == dlms.GET_RESPONSE_NORMAL:
+            # Весь ответ уместился в одном PDU — блочная передача не
+            # понадобилась (короткий диапазон дат).
+            value = dlms.parse_get_response(payload)
+            for row in value:
+                yield row
+            return
+
+        if response_type != dlms.GET_RESPONSE_WITH_DATABLOCK:
+            raise GatewayError(
+                f"Неожиданный тип GET.response при чтении профиля нагрузки: {payload[:2].hex()}"
+            )
+
+        block = dlms.parse_get_response_datablock(payload)
+        buf.extend(block.raw_data)
+
+        if total_count is None and len(buf) >= 2 and buf[0] == datatypes.TAG_ARRAY:
+            total_count = buf[1]
+            cursor = 2
+
+        if total_count is not None:
+            while decoded_count < total_count:
+                try:
+                    row, consumed = datatypes.decode_value(bytes(buf), offset=cursor)
+                except DlmsDataError:
+                    break  # строка ещё не собрана целиком — ждём следующий датаблок
+                yield row
+                cursor += consumed
+                decoded_count += 1
+
+        if block.last_block:
+            if total_count is None or decoded_count < total_count:
+                raise GatewayError(
+                    "Буфер профиля нагрузки собран не полностью — данные оборвались "
+                    "раньше заявленного количества строк"
+                )
+            return
+
+        request_next = dlms.build_get_request_next(block.block_number + 1)
+        _send_i_frame(
+            transport, server_addr, client_addr, send_seq=send_seq, recv_seq=send_seq,
+            information=dlms.wrap_llc_command(request_next),
+        )
+        send_seq += 1

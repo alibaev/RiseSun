@@ -48,15 +48,22 @@ async def stream_job(websocket: WebSocket, job_id: int) -> None:
     await websocket.accept()
     try:
         last_status: JobStatus | None = None
+        last_result: dict | None = None
         while True:
             async with SessionLocal() as db:
                 job = await db.get(Job, job_id)
             if job is None:
                 await websocket.send_json({"error": "job_not_found"})
                 break
-            if job.status != last_status:
+            # job.result меняется по ходу выполнения долгих задач (Этап 3 —
+            # профиль нагрузки обновляет rows_written каждые N сохранённых
+            # строк, см. job_worker._run_read_load_profile), не только при
+            # смене статуса — иначе прогресс-бар на Frontend не обновлялся
+            # бы до самого конца задачи.
+            if job.status != last_status or job.result != last_result:
                 await websocket.send_json(JobOut.model_validate(job).model_dump(mode="json"))
                 last_status = job.status
+                last_result = job.result
             if job.status in (JobStatus.SUCCEEDED, JobStatus.FAILED):
                 break
             await asyncio.sleep(_POLL_INTERVAL_S)

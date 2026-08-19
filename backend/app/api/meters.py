@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -16,6 +18,7 @@ from ..models import (
     Gateway,
     GatewayStatus,
     Job,
+    LoadProfileData,
     Meter,
     MeterReading,
     ParameterWriteHistory,
@@ -24,11 +27,13 @@ from ..models import (
 )
 from ..schemas import (
     JobOut,
+    LoadProfileRowOut,
     MeterCreate,
     MeterOut,
     MeterReadingOut,
     MeterUpdate,
     ParameterWriteHistoryOut,
+    ReadLoadProfileTriggerRequest,
     ReadTriggerRequest,
     WriteParameterRequest,
 )
@@ -293,6 +298,53 @@ async def list_readings(
         .order_by(MeterReading.read_at.desc())
         .limit(limit)
     )
+    return list(result.scalars().all())
+
+
+@router.post("/{meter_id}/read-load-profile", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
+async def trigger_read_load_profile(
+    meter_id: int,
+    body: ReadLoadProfileTriggerRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.TRIGGER_READ)),
+) -> Job:
+    """Ставит чтение профиля нагрузки за диапазон дат в очередь (Этап 3,
+    ТЗ п.4.2.3). Долгая, потенциально многоминутная операция —
+    выполняется асинхронно воркером (job_worker._run_read_load_profile),
+    строки сохраняются по мере поступления и доступны через
+    GET /{meter_id}/load-profile ещё до завершения job (не нужно ждать
+    JobStatus.SUCCEEDED, чтобы увидеть уже принятые данные)."""
+    meter = await db.get(Meter, meter_id)
+    if meter is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Счётчик не найден")
+
+    job = Job(
+        job_type="read_load_profile",
+        meter_id=meter_id,
+        payload={"from_iso": body.from_iso, "to_iso": body.to_iso, "obis": body.obis},
+        created_by_id=user.id,
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
+@router.get("/{meter_id}/load-profile", response_model=list[LoadProfileRowOut])
+async def list_load_profile(
+    meter_id: int,
+    from_iso: str | None = None,
+    to_iso: str | None = None,
+    limit: int = 1000,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.VIEW_METERS)),
+) -> list[LoadProfileData]:
+    query = select(LoadProfileData).where(LoadProfileData.meter_id == meter_id)
+    if from_iso:
+        query = query.where(LoadProfileData.timestamp >= datetime.fromisoformat(from_iso))
+    if to_iso:
+        query = query.where(LoadProfileData.timestamp <= datetime.fromisoformat(to_iso))
+    result = await db.execute(query.order_by(LoadProfileData.timestamp).limit(limit))
     return list(result.scalars().all())
 
 

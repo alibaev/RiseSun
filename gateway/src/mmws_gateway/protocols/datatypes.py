@@ -97,6 +97,53 @@ def encode_visible_string(value: str) -> bytes:
     return bytes([TAG_VISIBLE_STRING, len(raw)]) + raw
 
 
+def encode_structure(items: list[bytes]) -> bytes:
+    """Этап 3 — нужно для access-selection (range-descriptor) при чтении
+    профиля нагрузки. Как и у ``decode_value`` ниже, счётчик элементов —
+    один байт (0-255), без полной BER-длины произвольного размера (тот
+    же упрощённый принцип, что и у остальных Common-Data-Types здесь)."""
+    if len(items) > 0xFF:
+        raise DlmsDataError("Структуры свыше 255 элементов не поддержаны в Этапе 3")
+    return bytes([TAG_STRUCTURE, len(items)]) + b"".join(items)
+
+
+def encode_array(items: list[bytes]) -> bytes:
+    if len(items) > 0xFF:
+        raise DlmsDataError("Массивы свыше 255 элементов не поддержаны в Этапе 3")
+    return bytes([TAG_ARRAY, len(items)]) + b"".join(items)
+
+
+# DLMS cosem-date-time (12 сырых байт, Green Book): год(2, BE) + месяц +
+# день + день_недели(1=Пн..7=Вс, 0xff=не задан) + час + минута + секунда
+# + сотые_доли(0xff=не заданы) + отклонение_от_UTC(2, BE, минуты,
+# 0x8000=не задано) + статус(0xff=не задан). Используется как СЫРОЕ
+# содержимое octet-string (тег 0x09) в параметрах range-descriptor —
+# не отдельный Common-Data-Type тег (нестандартно, но это общепринятая
+# практика реализаций DLMS для access-selection, не выгружено из ТЗ/
+# словаря OBIS напрямую — сверить при живой проверке Этапа 3).
+def encode_cosem_date_time(dt) -> bytes:
+    dow = dt.isoweekday()
+    return (
+        dt.year.to_bytes(2, "big")
+        + bytes([dt.month, dt.day, dow, dt.hour, dt.minute, dt.second, 0xFF])
+        + (0x8000).to_bytes(2, "big")
+        + bytes([0xFF])
+    )
+
+
+def decode_cosem_date_time(raw: bytes):
+    """Обратное преобразование — используется при разборе строк буфера
+    профиля нагрузки, где первой колонкой обычно идёт метка времени."""
+    from datetime import datetime
+
+    if len(raw) != 12:
+        raise DlmsDataError(f"cosem-date-time должен быть ровно 12 байт, получено {len(raw)}")
+    year = int.from_bytes(raw[0:2], "big")
+    month, day = raw[2], raw[3]
+    hour, minute, second = raw[5], raw[6], raw[7]
+    return datetime(year, month, day, hour, minute, second)
+
+
 def decode_value(data: bytes, offset: int = 0) -> tuple[object, int]:
     """Декодирует одно значение Common-Data-Type из ``data`` начиная с ``offset``.
 

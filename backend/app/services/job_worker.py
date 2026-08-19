@@ -15,14 +15,24 @@ import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..core.security import decrypt_secret
 from ..db import SessionLocal
-from ..models import Job, JobStatus, Meter, MeterReading, ParameterWriteHistory, ParameterWriteResult
+from ..models import (
+    Job,
+    JobStatus,
+    LoadProfileData,
+    Meter,
+    MeterReading,
+    ParameterWriteHistory,
+    ParameterWriteResult,
+)
 from .audit import record_audit
-from .gateway_client import read_register, write_register
+from .gateway_client import LoadProfileError, read_load_profile, read_register, write_register
+from .load_profile import DEFAULT_LOAD_PROFILE_OBIS
 from .write_parameters import WRITABLE_INT_PARAMETERS
 
 logger = logging.getLogger("mmws_backend.job_worker")
@@ -287,10 +297,88 @@ async def _run_write_parameter(db: AsyncSession, job: Job) -> None:
     await db.commit()
 
 
+_LOAD_PROFILE_COMMIT_BATCH = 20
+
+
+async def _run_read_load_profile(db: AsyncSession, job: Job) -> None:
+    """Читает профиль нагрузки (Этап 3, ТЗ п.4.2.3) и сохраняет строки по
+    мере поступления (не дожидаясь конца передачи — генератор
+    ``gateway_client.read_load_profile`` отдаёт их сразу же). Периодический
+    коммит каждые ``_LOAD_PROFILE_COMMIT_BATCH`` строк ограничивает, сколько
+    уже принятых данных можно потерять при аварийном падении самого
+    процесса воркера (не просто пойманном исключении — на пойманное
+    исключение ``ON CONFLICT DO NOTHING`` уже вставленные, но
+    незакоммиченные строки всё равно сохранит commit в конце). Вставка
+    идемпотентна (уникальность meter_id+obis_code+timestamp) — повторный
+    job с тем же диапазоном дат («докачка» после обрыва, is_partial) не
+    создаёт дублей."""
+    meter = await db.get(Meter, job.meter_id)
+    if meter is None:
+        job.status = JobStatus.FAILED
+        job.error = {"code": "METER_NOT_FOUND", "message": f"Счётчик id={job.meter_id} не найден"}
+        job.finished_at = datetime.now(timezone.utc)
+        await db.commit()
+        return
+
+    gateway = meter.gateway
+    grpc_target = gateway.grpc_target if gateway else settings.gateway_grpc_target
+    password = decrypt_secret(meter.password_encrypted).decode("ascii")
+    obis = job.payload.get("obis") or DEFAULT_LOAD_PROFILE_OBIS
+    from_iso = job.payload["from_iso"]
+    to_iso = job.payload["to_iso"]
+
+    rows_written = 0
+    error_info: dict | None = None
+    try:
+        async for row in read_load_profile(
+            grpc_target=grpc_target,
+            profile=meter.protocol_profile.value,
+            host=meter.ip_address or "",
+            port=meter.port or 0,
+            call_home=meter.is_call_home,
+            serial=meter.serial_number,
+            password=password,
+            obis=obis,
+            from_iso=from_iso,
+            to_iso=to_iso,
+            call_timeout_s=160.0 if meter.is_call_home else 180.0,
+        ):
+            stmt = (
+                pg_insert(LoadProfileData)
+                .values(
+                    meter_id=meter.id,
+                    obis_code=obis,
+                    timestamp=datetime.fromisoformat(row.timestamp_iso),
+                    values_json=row.values,
+                    job_id=job.id,
+                )
+                .on_conflict_do_nothing(constraint="uq_load_profile_row")
+            )
+            await db.execute(stmt)
+            rows_written += 1
+            if rows_written % _LOAD_PROFILE_COMMIT_BATCH == 0:
+                job.result = {"obis": obis, "rows_written": rows_written}
+                await db.commit()
+    except LoadProfileError as exc:
+        error_info = {"code": exc.code, "message": exc.message, "is_partial": exc.is_partial or rows_written > 0}
+
+    now = datetime.now(timezone.utc)
+    job.result = {"obis": obis, "rows_written": rows_written}
+    if error_info is None:
+        job.status = JobStatus.SUCCEEDED
+        meter.last_seen_at = now
+    else:
+        job.status = JobStatus.FAILED
+        job.error = error_info
+    job.finished_at = now
+    await db.commit()
+
+
 _JOB_HANDLERS = {
     "read_current": _run_read_current,
     "write_datetime": _run_write_datetime,
     "write_parameter": _run_write_parameter,
+    "read_load_profile": _run_read_load_profile,
 }
 
 
