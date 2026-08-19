@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from croniter import croniter
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .models import GatewayStatus, JobStatus, ParameterWriteResult, ProtocolProfile, UserRole
+from .models import (
+    GatewayStatus,
+    JobStatus,
+    NotificationCategory,
+    ParameterWriteResult,
+    ProtocolProfile,
+    ScheduledJobRunStatus,
+    UserRole,
+)
 
 
 class TokenResponse(BaseModel):
@@ -172,6 +182,37 @@ class ParameterWriteHistoryOut(BaseModel):
     created_at: datetime
 
 
+class ParameterSchemeParam(BaseModel):
+    parameter: str
+    value: int = Field(ge=0, le=255, description="1 байт (0-255) — та же область значений, что у WriteParameterRequest")
+
+
+class ParameterSchemeCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    description: str | None = None
+    parameters: list[ParameterSchemeParam] = Field(min_length=1)
+
+
+class ParameterSchemeUpdate(BaseModel):
+    description: str | None = None
+    parameters: list[ParameterSchemeParam] | None = None
+
+
+class ParameterSchemeOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    description: str | None
+    parameters: list[dict]
+    created_at: datetime
+    updated_at: datetime | None
+
+
+class ApplySchemeRequest(BaseModel):
+    meter_ids: list[int] = Field(min_length=1)
+
+
 class JobOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -184,3 +225,81 @@ class JobOut(BaseModel):
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+
+
+ScheduledJobType = Literal["read_current", "read_load_profile"]
+
+
+class ScheduledJobCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    cron_expression: str
+    job_type: ScheduledJobType
+    # read_current -> {"obis": "..."} (по умолчанию — активная энергия,
+    # приём, всего); read_load_profile -> {"window_hours": N, "obis": "..."}
+    # — каждый запуск запрашивает последние N часов от текущего момента.
+    operation_params: dict = Field(default_factory=dict)
+    meter_ids: list[int] = Field(min_length=1)
+    is_enabled: bool = True
+
+    @field_validator("cron_expression")
+    @classmethod
+    def _validate_cron(cls, value: str) -> str:
+        if not croniter.is_valid(value):
+            raise ValueError(f"Некорректное cron-выражение: {value!r}")
+        return value
+
+
+class ScheduledJobUpdate(BaseModel):
+    name: str | None = None
+    cron_expression: str | None = None
+    operation_params: dict | None = None
+    meter_ids: list[int] | None = Field(default=None, min_length=1)
+    is_enabled: bool | None = None
+
+    @field_validator("cron_expression")
+    @classmethod
+    def _validate_cron(cls, value: str | None) -> str | None:
+        if value is not None and not croniter.is_valid(value):
+            raise ValueError(f"Некорректное cron-выражение: {value!r}")
+        return value
+
+
+class ScheduledJobOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    cron_expression: str
+    job_type: str
+    operation_params: dict
+    meter_ids: list[int]
+    is_enabled: bool
+    created_at: datetime
+    last_run_at: datetime | None
+    next_run_at: datetime | None = None  # вычисляется, не хранится — см. services/scheduler.py
+
+
+class ScheduledJobRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    scheduled_job_id: int
+    status: ScheduledJobRunStatus
+    meters_total: int
+    meters_succeeded: int
+    meters_failed: int
+    started_at: datetime
+    finished_at: datetime | None
+
+
+class NotificationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    category: NotificationCategory
+    message: str
+    meter_id: int | None
+    scheduled_job_id: int | None
+    details: dict | None
+    is_read: bool
+    created_at: datetime

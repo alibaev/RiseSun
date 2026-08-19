@@ -21,6 +21,12 @@ class Permission(str, enum.Enum):
     MANAGE_USERS = "manage_users"
     MANAGE_GATEWAYS = "manage_gateways"
     VIEW_AUDIT_LOG = "view_audit_log"
+    # Этап 4 (ТЗ Приложение Б TABLE 0): «Инженер» лишь ПРИМЕНЯЕТ схемы
+    # (в том числе массово — уже покрыто WRITE_PARAMETER), а вот
+    # создание/редактирование/удаление схем и расписаний автоопроса —
+    # explicitly в перечне прав «Администратора», не «Инженера».
+    MANAGE_PARAMETER_SCHEMES = "manage_parameter_schemes"
+    MANAGE_SCHEDULED_JOBS = "manage_scheduled_jobs"
 
 
 _ROLE_PERMISSIONS: dict[UserRole, set[Permission]] = {
@@ -38,6 +44,8 @@ _ROLE_PERMISSIONS: dict[UserRole, set[Permission]] = {
         Permission.MANAGE_METERS,
         Permission.MANAGE_USERS,
         Permission.VIEW_AUDIT_LOG,
+        Permission.MANAGE_PARAMETER_SCHEMES,
+        Permission.MANAGE_SCHEDULED_JOBS,
     },
     UserRole.SUPER_ADMIN: {
         Permission.VIEW_METERS,
@@ -47,6 +55,8 @@ _ROLE_PERMISSIONS: dict[UserRole, set[Permission]] = {
         Permission.MANAGE_USERS,
         Permission.VIEW_AUDIT_LOG,
         Permission.MANAGE_GATEWAYS,
+        Permission.MANAGE_PARAMETER_SCHEMES,
+        Permission.MANAGE_SCHEDULED_JOBS,
     },
 }
 

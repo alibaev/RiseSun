@@ -57,3 +57,61 @@ export interface Job {
   started_at: string | null;
   finished_at: string | null;
 }
+
+// Этап 4 (ТЗ п.4.2.5) — именованная схема параметров.
+export interface ParameterSchemeParam {
+  parameter: string;
+  value: number;
+}
+
+export interface ParameterScheme {
+  id: number;
+  name: string;
+  description: string | null;
+  parameters: ParameterSchemeParam[];
+  created_at: string;
+  updated_at: string | null;
+}
+
+// Этап 4 (ТЗ п.4.2.6) — расписание автоматического опроса.
+export type ScheduledJobType = "read_current" | "read_load_profile";
+
+export interface ScheduledJob {
+  id: number;
+  name: string;
+  cron_expression: string;
+  job_type: ScheduledJobType;
+  operation_params: Record<string, unknown>;
+  meter_ids: number[];
+  is_enabled: boolean;
+  created_at: string;
+  last_run_at: string | null;
+  next_run_at: string | null;
+}
+
+export type ScheduledJobRunStatus = "running" | "succeeded" | "partial_failure" | "failed";
+
+export interface ScheduledJobRun {
+  id: number;
+  scheduled_job_id: number;
+  status: ScheduledJobRunStatus;
+  meters_total: number;
+  meters_succeeded: number;
+  meters_failed: number;
+  started_at: string;
+  finished_at: string | null;
+}
+
+// Этап 4 (ТЗ п.4.2.8) — уведомления.
+export type NotificationCategory = "meter_offline" | "tamper_event" | "scheduled_job_failed";
+
+export interface Notification {
+  id: number;
+  category: NotificationCategory;
+  message: string;
+  meter_id: number | null;
+  scheduled_job_id: number | null;
+  details: Record<string, unknown> | null;
+  is_read: boolean;
+  created_at: string;
+}

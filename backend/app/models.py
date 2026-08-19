@@ -25,6 +25,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from .config import settings
 from .db import Base
 
 
@@ -148,7 +149,7 @@ class Meter(Base):
             return False
         from datetime import timezone
 
-        return (datetime.now(timezone.utc) - self.last_seen_at).total_seconds() < 3600
+        return (datetime.now(timezone.utc) - self.last_seen_at).total_seconds() < settings.meter_offline_timeout_s
 
 
 class MeterReading(Base):
@@ -248,6 +249,13 @@ class Job(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Этап 4 (ТЗ п.4.2.6) — если задача создана планировщиком по
+    # расписанию (а не вручную оператором), ссылается на конкретный
+    # запуск ScheduledJobRun, к которому она относится (один запуск
+    # расписания порождает по одной Job на каждый счётчик группы).
+    scheduled_job_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("scheduled_job_runs.id"), nullable=True, index=True
+    )
 
 
 class ParameterWriteHistory(Base):
@@ -282,6 +290,117 @@ class ParameterWriteHistory(Base):
     )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class ScheduledJobRunStatus(str, enum.Enum):
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    PARTIAL_FAILURE = "partial_failure"
+    FAILED = "failed"
+
+
+class NotificationCategory(str, enum.Enum):
+    """ТЗ п.4.2.8 — три триггера уведомлений. TAMPER_EVENT заведён как
+    инфраструктура на будущее: чтение журнала вмешательств со счётчика
+    (ТЗ п.4.2.3) ещё не реализовано ни в одном из этапов (словарь OBIS
+    описывает его не как буфер-профиль, а как набор счётчиков/
+    длительностей по категориям событий — отдельная по форме
+    протокольная задача, см. DECISIONS.md), поэтому эта категория пока
+    ничем не порождается — таблица tamper_log всегда пуста."""
+
+    METER_OFFLINE = "meter_offline"
+    TAMPER_EVENT = "tamper_event"
+    SCHEDULED_JOB_FAILED = "scheduled_job_failed"
+
+
+class ParameterScheme(Base):
+    """Именованная схема параметров (ТЗ п.4.2.5 — аналог Save/Load Scheme
+    исходного приложения). Область — параметры из реестра
+    ``WRITABLE_INT_PARAMETERS`` (Этап 2); ``write_datetime`` (не имеет
+    пользовательского значения — всегда «сейчас») в схемы не входит."""
+
+    __tablename__ = "parameter_schemes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # [{"parameter": "settlement_no", "value": 3}, ...] — ключи parameter
+    # сверяются с WRITABLE_INT_PARAMETERS при сохранении и применении
+    # (тот же принцип валидации, что у POST /write-parameter/{parameter}).
+    parameters: Mapped[list] = mapped_column(JSONB, nullable=False)
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now(), nullable=True
+    )
+
+
+class ScheduledJob(Base):
+    """Расписание автоматического опроса группы счётчиков (ТЗ п.4.2.6).
+
+    ``next_run_at`` сознательно НЕ хранится как столбец — вычисляется на
+    лету из ``cron_expression`` и ``last_run_at`` (croniter) там, где
+    нужен (API-сериализация, планировщик); отдельное персистентное поле
+    только создавало бы риск рассинхронизации с самим cron-выражением
+    при его редактировании."""
+
+    __tablename__ = "scheduled_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    cron_expression: Mapped[str] = mapped_column(String(64), nullable=False)
+    job_type: Mapped[str] = mapped_column(String(32), nullable=False)  # "read_current" | "read_load_profile"
+    # read_current -> {"obis": "..."}; read_load_profile ->
+    # {"window_hours": N} — каждый запуск запрашивает последние N часов
+    # (скользящее окно от текущего момента, а не от прошлого запуска —
+    # проще и устойчивее к пропущенным/задержанным тикам планировщика).
+    operation_params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    meter_ids: Mapped[list] = mapped_column(JSONB, nullable=False)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ScheduledJobRun(Base):
+    """Журнал одного запуска расписания (ТЗ п.4.2.6/4.2.11 — «журнал
+    выполнения каждого запуска»). Один запуск порождает по одной ``Job``
+    на каждый счётчик группы (см. ``Job.scheduled_job_run_id``);
+    ``status`` — сводный итог по завершении всех дочерних Job."""
+
+    __tablename__ = "scheduled_job_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    scheduled_job_id: Mapped[int] = mapped_column(ForeignKey("scheduled_jobs.id"), nullable=False, index=True)
+    status: Mapped[ScheduledJobRunStatus] = mapped_column(
+        Enum(ScheduledJobRunStatus, name="scheduled_job_run_status"),
+        nullable=False,
+        default=ScheduledJobRunStatus.RUNNING,
+    )
+    meters_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    meters_succeeded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    meters_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Notification(Base):
+    """ТЗ п.4.2.8. Уведомления общесистемные (не персональный inbox на
+    пользователя — ТЗ не описывает разный набор уведомлений по ролям),
+    ``is_read`` — общий флаг «кто-то из пользователей уже видел»."""
+
+    __tablename__ = "notifications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    category: Mapped[NotificationCategory] = mapped_column(
+        Enum(NotificationCategory, name="notification_category"), nullable=False, index=True
+    )
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    meter_id: Mapped[int | None] = mapped_column(ForeignKey("meters.id"), nullable=True)
+    scheduled_job_id: Mapped[int | None] = mapped_column(ForeignKey("scheduled_jobs.id"), nullable=True)
+    details: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    is_read: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 

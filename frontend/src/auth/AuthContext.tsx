@@ -54,3 +54,15 @@ const WRITE_PARAMETER_ROLES = new Set(["engineer", "admin", "super_admin"]);
 export function canWriteParameter(role: string | null): boolean {
   return role !== null && WRITE_PARAMETER_ROLES.has(role);
 }
+
+// Этап 4 (ТЗ Приложение Б TABLE 0): создание/редактирование/удаление схем
+// параметров и расписаний автоопроса — только «Администратор»/«Супер-
+// администратор» («Инженер» лишь ПРИМЕНЯЕТ готовые схемы, см.
+// canWriteParameter/Permission.WRITE_PARAMETER на apply-эндпоинте); тот же
+// набор ролей, что у Permission.MANAGE_PARAMETER_SCHEMES/MANAGE_SCHEDULED_JOBS
+// на Backend.
+const MANAGE_AUTOMATION_ROLES = new Set(["admin", "super_admin"]);
+
+export function canManageAutomation(role: string | null): boolean {
+  return role !== null && MANAGE_AUTOMATION_ROLES.has(role);
+}

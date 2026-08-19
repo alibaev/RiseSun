@@ -27,6 +27,13 @@ class Settings(BaseSettings):
 
     job_poll_interval_s: float = 1.0
 
+    # Этап 4 (ТЗ п.4.2.8) — «настраиваемый таймаут» перехода счётчика в
+    # offline; та же величина используется и в Meter.is_online (единая
+    # точка настройки вместо разъехавшихся хардкодов).
+    meter_offline_timeout_s: int = 3600
+    notification_check_interval_s: float = 60.0
+    scheduler_check_interval_s: float = 30.0
+
     cors_allow_origins: list[str] = ["http://localhost:5173"]
 
 

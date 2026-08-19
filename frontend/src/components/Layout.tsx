@@ -1,5 +1,6 @@
 import { Link, Outlet } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
+import { NotificationBell } from "./NotificationBell";
 
 const ROLE_LABELS: Record<string, string> = {
   operator: "Оператор",
@@ -20,8 +21,11 @@ export function Layout() {
         </Link>
         <nav>
           <Link to="/meters">Счётчики</Link>
+          <Link to="/schemes">Схемы параметров</Link>
+          <Link to="/scheduled-jobs">Расписания</Link>
         </nav>
         <div className="topbar-user">
+          <NotificationBell />
           <span>{role ? ROLE_LABELS[role] ?? role : ""}</span>
           <button onClick={logout}>Выйти</button>
         </div>

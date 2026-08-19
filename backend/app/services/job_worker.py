@@ -27,12 +27,17 @@ from ..models import (
     LoadProfileData,
     Meter,
     MeterReading,
+    NotificationCategory,
     ParameterWriteHistory,
     ParameterWriteResult,
+    ScheduledJob,
+    ScheduledJobRun,
+    ScheduledJobRunStatus,
 )
 from .audit import record_audit
 from .gateway_client import LoadProfileError, read_load_profile, read_register, write_register
 from .load_profile import DEFAULT_LOAD_PROFILE_OBIS
+from .notifications import create_notification
 from .write_parameters import WRITABLE_INT_PARAMETERS
 
 logger = logging.getLogger("mmws_backend.job_worker")
@@ -382,6 +387,52 @@ _JOB_HANDLERS = {
 }
 
 
+async def _maybe_finalize_scheduled_job_run(db: AsyncSession, scheduled_job_run_id: int) -> None:
+    """Этап 4 (ТЗ п.4.2.6/4.2.11 — «журнал выполнения каждого запуска»):
+    один запуск расписания порождает по одной Job на каждый счётчик
+    группы; как только ПОСЛЕДНЯЯ из них завершается (успешно или с
+    ошибкой), сводим итог по всему запуску и — при наличии ошибок —
+    создаём уведомление (ТЗ п.4.2.8). При нескольких экземплярах Backend
+    возможна редкая гонка (два экземпляра почти одновременно видят
+    «все дочерние задачи завершены») — проверка ``run.status !=
+    RUNNING`` защищает от двойной финализации/уведомления в
+    подавляющем большинстве случаев; для PoC-масштаба системы
+    дополнительная блокировка сочтена избыточной."""
+    siblings = (
+        await db.execute(select(Job).where(Job.scheduled_job_run_id == scheduled_job_run_id))
+    ).scalars().all()
+    if any(j.status in (JobStatus.QUEUED, JobStatus.RUNNING) for j in siblings):
+        return
+
+    run = await db.get(ScheduledJobRun, scheduled_job_run_id)
+    if run is None or run.status != ScheduledJobRunStatus.RUNNING:
+        return
+
+    succeeded = sum(1 for j in siblings if j.status == JobStatus.SUCCEEDED)
+    failed = sum(1 for j in siblings if j.status == JobStatus.FAILED)
+    run.meters_succeeded = succeeded
+    run.meters_failed = failed
+    run.finished_at = datetime.now(timezone.utc)
+    if failed == 0:
+        run.status = ScheduledJobRunStatus.SUCCEEDED
+    elif succeeded == 0:
+        run.status = ScheduledJobRunStatus.FAILED
+    else:
+        run.status = ScheduledJobRunStatus.PARTIAL_FAILURE
+
+    if failed > 0:
+        scheduled_job = await db.get(ScheduledJob, run.scheduled_job_id)
+        name = scheduled_job.name if scheduled_job is not None else str(run.scheduled_job_id)
+        await create_notification(
+            db,
+            category=NotificationCategory.SCHEDULED_JOB_FAILED,
+            message=f"Расписание «{name}»: {failed} из {len(siblings)} задач завершились с ошибкой",
+            scheduled_job_id=run.scheduled_job_id,
+            details={"run_id": run.id, "succeeded": succeeded, "failed": failed},
+        )
+    await db.commit()
+
+
 async def _process_one(db: AsyncSession) -> bool:
     job = await _claim_next_job(db)
     if job is None:
@@ -397,6 +448,9 @@ async def _process_one(db: AsyncSession) -> bool:
         job.error = {"code": "WORKER_ERROR", "message": str(exc)}
         job.finished_at = datetime.now(timezone.utc)
         await db.commit()
+
+    if job.scheduled_job_run_id is not None:
+        await _maybe_finalize_scheduled_job_run(db, job.scheduled_job_run_id)
     return True
 
 

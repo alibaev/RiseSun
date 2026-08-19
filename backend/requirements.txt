@@ -12,3 +12,4 @@ python-multipart==0.0.32
 pydantic-settings==2.15.0
 grpcio==1.83.0
 websockets==16.1.1
+croniter==2.0.5
