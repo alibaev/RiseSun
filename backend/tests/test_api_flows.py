@@ -338,6 +338,35 @@ async def test_disconnect_reconnect_require_write_parameter_permission(client, d
 
 
 @pytest.mark.asyncio
+async def test_job_endpoints_reject_installed_meter(client, db_session):
+    """Этап 6 (обнаружение новых счётчиков): счётчик со статусом
+    INSTALLED (обнаружен по call-home, ещё не активирован — нет пароля/
+    протокола) не должен допускать постановку задач — иначе job_worker
+    упал бы на decrypt_secret(None) вместо понятной ошибки."""
+    root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    gateway = Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    db_session.add(gateway)
+    await db_session.flush()
+    from app.models import Meter, MeterStatus
+
+    installed_meter = Meter(
+        serial_number="900000000099", is_call_home=True, status=MeterStatus.INSTALLED, gateway_id=gateway.id,
+    )
+    db_session.add(installed_meter)
+    await db_session.commit()
+    await db_session.refresh(installed_meter)
+
+    token = await _login(client, "root", "pass1234")
+    resp = await client.post(
+        f"/api/meters/{installed_meter.id}/read",
+        json={"obis": "1.1.1.8.0.ff"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 400
+    assert "активирован" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_write_parameter_rejects_unknown_parameter_and_accepts_known(client, db_session):
     """Этап 2, итерация 2: /write-parameter/{parameter} — 400 для параметра
     вне реестра WRITABLE_INT_PARAMETERS, 202 для известного (settlement_no)."""

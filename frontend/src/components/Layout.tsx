@@ -1,5 +1,5 @@
 import { Link, Outlet } from "react-router-dom";
-import { canManageSystem, useAuth } from "../auth/AuthContext";
+import { canManageGateways, canManageSystem, useAuth } from "../auth/AuthContext";
 import { NotificationBell } from "./NotificationBell";
 
 const ROLE_LABELS: Record<string, string> = {
@@ -27,6 +27,7 @@ export function Layout() {
           {canManageSystem(role) && <Link to="/audit-log">Журнал аудита</Link>}
           {canManageSystem(role) && <Link to="/users">Пользователи</Link>}
           {canManageSystem(role) && <Link to="/billing-keys">API-ключи биллинга</Link>}
+          {canManageGateways(role) && <Link to="/gateways">Gateway</Link>}
         </nav>
         <div className="topbar-user">
           <NotificationBell />

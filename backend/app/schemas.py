@@ -14,6 +14,7 @@ from .models import (
     DisconnectBatchStatus,
     GatewayStatus,
     JobStatus,
+    MeterStatus,
     NotificationCategory,
     ParameterWriteResult,
     ProtocolProfile,
@@ -65,6 +66,10 @@ class GatewayCreate(BaseModel):
     supported_operations: dict = Field(default_factory=dict)
 
 
+class GatewayCallHomePortRequest(BaseModel):
+    port: int = Field(ge=1, le=65535)
+
+
 class GatewayOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -76,6 +81,7 @@ class GatewayOut(BaseModel):
     supported_operations: dict
     status: GatewayStatus
     last_heartbeat_at: datetime | None
+    call_home_port: int | None
     is_online: bool
     created_at: datetime
 
@@ -126,15 +132,33 @@ class MeterOut(BaseModel):
     ip_address: str | None
     port: int | None
     is_call_home: bool
-    protocol_profile: ProtocolProfile
+    # NULL для status=MeterStatus.INSTALLED — счётчик обнаружен
+    # автоматически по call-home, протокол ещё не указан администратором.
+    protocol_profile: ProtocolProfile | None
     location: str | None
     model: str | None
     is_active: bool
+    status: MeterStatus
     is_online: bool
     gateway_id: int
     last_seen_at: datetime | None
     last_read_at: datetime | None
     created_at: datetime
+
+
+class ActivateMeterRequest(BaseModel):
+    """Этап 6 — перевод счётчика, обнаруженного по call-home
+    (status=INSTALLED), в рабочее состояние (status=ACTIVE). Пароль и
+    протокольный профиль обязательны — они принципиально не могут быть
+    узнаны из самого факта звонка домой (DL/T645-анонс несёт только
+    адрес)."""
+
+    password: str = Field(description="Пароль доступа (LLS) — будет зашифрован перед сохранением")
+    protocol_profile: ProtocolProfile
+    ip_address: str | None = None
+    port: int | None = Field(default=None, gt=0, le=65535)
+    location: str | None = None
+    model: str | None = None
 
 
 class MeterReadingOut(BaseModel):

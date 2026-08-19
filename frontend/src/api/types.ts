@@ -2,15 +2,37 @@ export type UserRole = "operator" | "engineer" | "observer" | "admin" | "super_a
 
 export type ProtocolProfile = "mode_c" | "mode_e" | "hdlc_dlms";
 
+// Этап 6 — обнаружение новых счётчиков по call-home. INSTALLED: найден
+// автоматически, ещё не активирован (нет пароля/протокола). ACTIVE:
+// полностью настроен, доступен для операций.
+export type MeterStatus = "installed" | "active";
+
+export type GatewayStatus = "pending" | "approved" | "disabled";
+
+export interface Gateway {
+  id: number;
+  name: string;
+  manufacturer: string;
+  driver_version: string | null;
+  grpc_target: string;
+  supported_operations: Record<string, unknown>;
+  status: GatewayStatus;
+  last_heartbeat_at: string | null;
+  call_home_port: number | null;
+  is_online: boolean;
+  created_at: string;
+}
+
 export interface Meter {
   id: number;
   serial_number: string;
-  ip_address: string;
-  port: number;
-  protocol_profile: ProtocolProfile;
+  ip_address: string | null;
+  port: number | null;
+  protocol_profile: ProtocolProfile | null;
   location: string | null;
   model: string | null;
   is_active: boolean;
+  status: MeterStatus;
   is_online: boolean;
   gateway_id: number;
   last_seen_at: string | null;

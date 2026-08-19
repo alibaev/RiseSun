@@ -56,6 +56,24 @@ class GatewayStatus(str, enum.Enum):
     DISABLED = "disabled"
 
 
+class MeterStatus(str, enum.Enum):
+    """Этап 6 — обнаружение новых счётчиков. Счётчик, самостоятельно
+    позвонивший на call-home порт Gateway и опознанный по серийному
+    номеру (см. Gateway.ListCallHomeSerials), заводится в справочник
+    автоматически со статусом INSTALLED — Backend ещё не знает пароль
+    доступа и протокольный профиль, работать с таким счётчиком нельзя.
+    Администратор переводит его в ACTIVE, одновременно заполняя
+    обязательные для реальной работы поля (см. POST /activate).
+
+    Не путать с ``Meter.is_active`` — тот управляет ОРТОГОНАЛЬНЫМ
+    смыслом «включён/выключен из обслуживания» для уже полностью
+    настроенного (ACTIVE) счётчика, применяется вместо удаления при
+    наличии истории (см. delete_meter)."""
+
+    INSTALLED = "installed"
+    ACTIVE = "active"
+
+
 class JobStatus(str, enum.Enum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -94,6 +112,13 @@ class Gateway(Base):
         Enum(GatewayStatus, name="gateway_status"), nullable=False, default=GatewayStatus.PENDING
     )
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Этап 6 — фактический порт call-home пула этого экземпляра Gateway,
+    # отражается на каждом heartbeat (см. services/heartbeat.py) вне
+    # зависимости от того, менялся ли он через панель суперадминистратора
+    # или переменной окружения при перезапуске контейнера. NULL — ещё ни
+    # разу не получен heartbeat с этим полем (старый Gateway/только что
+    # зарегистрирован) либо call-home на этом экземпляре не запущен.
+    call_home_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     registered_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     approved_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -125,17 +150,27 @@ class Meter(Base):
     ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
     port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_call_home: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    protocol_profile: Mapped[ProtocolProfile] = mapped_column(
-        Enum(ProtocolProfile, name="protocol_profile"), nullable=False
+    # NULL только для только что автообнаруженных (status=INSTALLED)
+    # счётчиков — Gateway опознаёт звонящий call-home по серийному
+    # номеру, но НЕ по протокольному профилю; администратор указывает
+    # его при активации (см. POST /{id}/activate).
+    protocol_profile: Mapped[ProtocolProfile | None] = mapped_column(
+        Enum(ProtocolProfile, name="protocol_profile"), nullable=True
     )
     master_address: Mapped[str | None] = mapped_column(String(32), nullable=True)
     physical_address: Mapped[str | None] = mapped_column(String(32), nullable=True)
     logical_address: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    password_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    # NULL для status=INSTALLED — пароль доступа не может быть узнан из
+    # самого факта звонка домой (DL/T645-анонс несёт только адрес, не
+    # пароль DLMS), заполняется администратором при активации.
+    password_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     aes_key_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     location: Mapped[str | None] = mapped_column(String(255), nullable=True)
     model: Mapped[str | None] = mapped_column(String(64), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    status: Mapped[MeterStatus] = mapped_column(
+        Enum(MeterStatus, name="meter_status"), nullable=False, default=MeterStatus.ACTIVE
+    )
     gateway_id: Mapped[int] = mapped_column(ForeignKey("gateways.id"), nullable=False)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

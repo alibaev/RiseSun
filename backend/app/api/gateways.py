@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import grpc
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,8 +17,9 @@ from ..auth.deps import require_permission
 from ..core.permissions import Permission
 from ..db import get_db
 from ..models import Gateway, GatewayStatus, User
-from ..schemas import GatewayCreate, GatewayOut
+from ..schemas import GatewayCallHomePortRequest, GatewayCreate, GatewayOut
 from ..services.audit import record_audit
+from ..services.gateway_client import set_call_home_port
 
 router = APIRouter(prefix="/api/gateways", tags=["gateways"])
 
@@ -99,6 +101,47 @@ async def disable_gateway(
     await record_audit(
         db, user_id=user.id, action="gateway.disable", object_type="gateway",
         object_id=str(gateway.id), ip_address=request.client.host if request.client else None,
+    )
+    await db.commit()
+    await db.refresh(gateway)
+    return gateway
+
+
+@router.put("/{gateway_id}/call-home-port", response_model=GatewayOut)
+async def set_gateway_call_home_port(
+    gateway_id: int,
+    body: GatewayCallHomePortRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.MANAGE_GATEWAYS)),
+) -> Gateway:
+    """Этап 6 (панель суперадминистратора) — живая смена порта, который
+    слушает call-home пул конкретного экземпляра Gateway, БЕЗ
+    перезапуска процесса/контейнера (Gateway.SetCallHomePort — stop()+
+    start() пула на лету, см. gateway/src/mmws_gateway/grpc_server.py).
+    Значение сохраняется, только если Gateway подтвердил успешное
+    переслушивание — иначе БД разошлась бы с реальным состоянием."""
+    gateway = await db.get(Gateway, gateway_id)
+    if gateway is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gateway не найден")
+
+    try:
+        result = await set_call_home_port(grpc_target=gateway.grpc_target, port=body.port)
+    except grpc.RpcError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Gateway {gateway.grpc_target} недоступен: {exc}"
+        )
+    if not result.ok:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Gateway отклонил смену порта: {result.error_code} — {result.error_message}",
+        )
+
+    gateway.call_home_port = result.port
+    await record_audit(
+        db, user_id=user.id, action="gateway.set_call_home_port", object_type="gateway",
+        object_id=str(gateway.id), ip_address=request.client.host if request.client else None,
+        details={"port": result.port},
     )
     await db.commit()
     await db.refresh(gateway)

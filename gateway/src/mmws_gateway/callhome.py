@@ -207,6 +207,19 @@ class CallHomePool:
         self._listener: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
         self._stop = threading.Event()
+        # Этап 6 (обнаружение новых счётчиков) — сколько раз/когда впервые
+        # опознан каждый серийный номер, НЕЗАВИСИМО от скользящего окна
+        # held-соединений (которое вытесняет старые записи после
+        # window_size новых подключений). Backend периодически опрашивает
+        # этот список (см. ListCallHomeSerials в grpc_server.py), чтобы
+        # завести счётчик в справочник ещё до того, как оператор узнает
+        # его серийный номер откуда-то ещё. Хранится только в памяти
+        # процесса Gateway — источник истины после обнаружения переходит
+        # в Backend (таблица meters), перезапуск Gateway не теряет уже
+        # заведённые счётчики, только временно "забывает", что именно
+        # он уже сообщал о них (Backend всё равно не заведёт дубликат —
+        # ищет по serial_number).
+        self._seen_serials: dict[str, float] = {}
 
     def start(self) -> None:
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -299,6 +312,8 @@ class CallHomePool:
                 rest += more
             addr6 = header[1:7]
             pc.serial = serial_from_dlt645_address(addr6)
+            with self._lock:
+                self._seen_serials.setdefault(pc.serial, time.time())
             logger.info("Call-home: соединение #%d опознано как счётчик %s", pc.conn_no, pc.serial)
         except (socket.timeout, OSError):
             return
@@ -336,6 +351,14 @@ class CallHomePool:
             if serial is None:
                 return len(self._pool)
             return sum(1 for pc in self._pool.values() if pc.serial == serial)
+
+    def list_seen_serials(self) -> dict[str, float]:
+        """Этап 6 — все серийные номера, опознанные этим Gateway с
+        момента запуска процесса (первый момент опознания, unix-время),
+        независимо от того, вытеснены ли уже их held-соединения из
+        скользящего окна."""
+        with self._lock:
+            return dict(self._seen_serials)
 
 
 def read_via_call_home(

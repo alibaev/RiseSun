@@ -44,6 +44,20 @@ service GatewayService {
   // ReadRegister/WriteRegister — асинхронность (job_id, batch_id при
   // пакетной операции от биллинга) реализуется на стороне Backend.
   rpc DisconnectMeter(DisconnectMeterRequest) returns (DisconnectMeterResponse);
+
+  // Этап 6 (обнаружение новых счётчиков) — все серийные номера,
+  // опознанные call-home пулом этого Gateway с момента запуска процесса
+  // (см. callhome.CallHomePool.list_seen_serials), независимо от того,
+  // уже ли Backend знает о них. Backend периодически опрашивает этот
+  // метод и заводит в справочник ранее неизвестные серийники со
+  // статусом "installed" — оператор видит их и решает, принимать ли в
+  // работу, вместо того чтобы заранее знать серийный номер откуда-то ещё.
+  rpc ListCallHomeSerials(ListCallHomeSerialsRequest) returns (ListCallHomeSerialsResponse);
+
+  // Этап 6 — живая смена порта, который слушает call-home пул Gateway,
+  // БЕЗ перезапуска процесса/контейнера (CallHomePool.stop()+start() на
+  // новом порту). Используется панелью суперадминистратора.
+  rpc SetCallHomePort(SetCallHomePortRequest) returns (SetCallHomePortResponse);
 }
 
 message ReadRegisterRequest {
@@ -126,6 +140,38 @@ message HealthCheckRequest {}
 message HealthCheckResponse {
   bool ok = 1;
   string driver_version = 2;
+  // Этап 6 — текущий порт call-home пула этого Gateway (0, если
+  // call-home не запущен на этом экземпляре); Backend сохраняет
+  // фактическое значение при каждом heartbeat, даже если оно было
+  // изменено в обход панели (например, переменной окружения при
+  // перезапуске контейнера).
+  int32 call_home_port = 3;
+}
+
+message ListCallHomeSerialsRequest {}
+
+message ListCallHomeSerialsResponse {
+  repeated SeenSerial serials = 1;
+}
+
+message SeenSerial {
+  string serial = 1;
+  double first_seen_unix = 2;
+}
+
+message SetCallHomePortRequest {
+  int32 port = 1;
+}
+
+message SetCallHomePortResponse {
+  oneof result {
+    SetCallHomePortSuccess success = 1;
+    ReadError error = 2;
+  }
+}
+
+message SetCallHomePortSuccess {
+  int32 port = 1;
 }
 
 message ReadLoadProfileRequest {

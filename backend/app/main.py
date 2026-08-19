@@ -30,6 +30,7 @@ from .config import settings
 from .services.billing_errors import BillingApiError
 from .services.heartbeat import heartbeat_loop
 from .services.job_worker import worker_loop
+from .services.meter_discovery import meter_discovery_loop
 from .services.offline_detector import offline_detector_loop
 from .services.scheduler import scheduler_loop
 
@@ -43,6 +44,7 @@ async def lifespan(app: FastAPI):
     heartbeat_task = asyncio.create_task(heartbeat_loop(stop_event))
     scheduler_task = asyncio.create_task(scheduler_loop(stop_event))
     offline_detector_task = asyncio.create_task(offline_detector_loop(stop_event))
+    meter_discovery_task = asyncio.create_task(meter_discovery_loop(stop_event))
     try:
         yield
     finally:
@@ -51,6 +53,7 @@ async def lifespan(app: FastAPI):
         await heartbeat_task
         await scheduler_task
         await offline_detector_task
+        await meter_discovery_task
 
 
 app = FastAPI(title="MMWS Backend API", version="0.1.0-etap1", lifespan=lifespan)

@@ -88,6 +88,37 @@ def test_pool_sliding_window_evicts_oldest():
         pool.stop()
 
 
+def test_list_seen_serials_persists_after_sliding_window_eviction():
+    """Этап 6 (обнаружение новых счётчиков) — список опознанных
+    серийников не должен теряться при вытеснении held-соединения из
+    скользящего окна (в отличие от самого соединения)."""
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=1)
+    pool.start()
+    try:
+        assert pool.list_seen_serials() == {}
+
+        addr6 = bytes.fromhex("522300012020")  # -> 202001002352 (реальный, подтверждённый адрес)
+        c1 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c1.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.3)  # даём _identify() время обработать анонс-кадр
+
+        c2 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)  # окно=1 -> вытесняет c1
+        time.sleep(0.2)
+        assert pool.pending_count() == 1  # c1 вытеснено
+
+        seen = pool.list_seen_serials()
+        assert "202001002352" in seen
+        assert abs(seen["202001002352"] - time.time()) < 5
+
+        for s in (c1, c2):
+            try:
+                s.close()
+            except OSError:
+                pass
+    finally:
+        pool.stop()
+
+
 def _run_fake_meter(conn: socket.socket, *, addr6: bytes, password: bytes, obis_values: dict, ignore_first_n_snrm: int) -> None:
     """Имитирует реальное поведение счётчика: сначала шлёт DL/T645-анонс,
     затем игнорирует первые ``ignore_first_n_snrm`` попыток SNRM (не

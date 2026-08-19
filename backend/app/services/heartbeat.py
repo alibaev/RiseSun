@@ -26,17 +26,18 @@ _HEARTBEAT_INTERVAL_S = 30.0
 _CALL_TIMEOUT_S = 5.0
 
 
-async def _check_one(gateway_id: int, grpc_target: str) -> bool:
+async def _check_one(gateway_id: int, grpc_target: str) -> object | None:
+    """Возвращает HealthCheckResponse при успехе, иначе None."""
     try:
         async with grpc.aio.insecure_channel(grpc_target) as channel:
             stub = gateway_pb2_grpc.GatewayServiceStub(channel)
             response = await stub.HealthCheck(
                 gateway_pb2.HealthCheckRequest(), timeout=_CALL_TIMEOUT_S
             )
-            return response.ok
+            return response if response.ok else None
     except grpc.RpcError as exc:
         logger.warning("Heartbeat gateway_id=%s (%s) не удался: %s", gateway_id, grpc_target, exc)
-        return False
+        return None
 
 
 async def _run_once() -> None:
@@ -47,17 +48,23 @@ async def _run_once() -> None:
     if not gateways:
         return
 
-    outcomes = await asyncio.gather(
+    responses = await asyncio.gather(
         *(_check_one(g.id, g.grpc_target) for g in gateways), return_exceptions=False
     )
 
     async with SessionLocal() as db:
         now = datetime.now(timezone.utc)
-        for gateway, ok in zip(gateways, outcomes):
-            if ok:
-                db_gateway = await db.get(Gateway, gateway.id)
-                if db_gateway is not None:
-                    db_gateway.last_heartbeat_at = now
+        for gateway, response in zip(gateways, responses):
+            if response is None:
+                continue
+            db_gateway = await db.get(Gateway, gateway.id)
+            if db_gateway is not None:
+                db_gateway.last_heartbeat_at = now
+                # Этап 6 — отражаем ФАКТИЧЕСКИЙ порт call-home (может быть
+                # изменён в обход панели, например переменной окружения
+                # при перезапуске контейнера, не только через
+                # SetCallHomePort — см. app/api/gateways.py).
+                db_gateway.call_home_port = response.call_home_port or None
         await db.commit()
 
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from concurrent import futures
 from datetime import datetime
 
@@ -211,8 +212,14 @@ def _do_disconnect(request: gateway_pb2.DisconnectMeterRequest, call_home_pool: 
 
 
 class GatewayServiceServicer(gateway_pb2_grpc.GatewayServiceServicer):
-    def __init__(self, call_home_pool: CallHomePool | None = None) -> None:
+    def __init__(self, call_home_pool: CallHomePool | None = None, call_home_bind_host: str = "0.0.0.0") -> None:
         self._call_home_pool = call_home_pool
+        self._call_home_bind_host = call_home_bind_host
+        # Защищает SetCallHomePort от одновременных вызовов из нескольких
+        # RPC-потоков (grpc.server использует пул потоков) — без этого
+        # два параллельных вызова могли бы оба запустить новый пул и
+        # потерять ссылку на один из них (утечка потока/сокета).
+        self._call_home_lock = threading.Lock()
 
     def ReadRegister(self, request, context):
         try:
@@ -253,7 +260,36 @@ class GatewayServiceServicer(gateway_pb2_grpc.GatewayServiceServicer):
         return gateway_pb2.WriteRegisterResponse(success=gateway_pb2.WriteSuccess(ok=True))
 
     def HealthCheck(self, request, context):
-        return gateway_pb2.HealthCheckResponse(ok=True, driver_version=DRIVER_VERSION)
+        call_home_port = self._call_home_pool.bind_port if self._call_home_pool is not None else 0
+        return gateway_pb2.HealthCheckResponse(ok=True, driver_version=DRIVER_VERSION, call_home_port=call_home_port)
+
+    def ListCallHomeSerials(self, request, context):
+        seen = self._call_home_pool.list_seen_serials() if self._call_home_pool is not None else {}
+        return gateway_pb2.ListCallHomeSerialsResponse(
+            serials=[
+                gateway_pb2.SeenSerial(serial=serial, first_seen_unix=first_seen)
+                for serial, first_seen in seen.items()
+            ]
+        )
+
+    def SetCallHomePort(self, request, context):
+        try:
+            with self._call_home_lock:
+                old_pool = self._call_home_pool
+                new_pool = CallHomePool(bind_host=self._call_home_bind_host, bind_port=request.port)
+                new_pool.start()
+                self._call_home_pool = new_pool
+            if old_pool is not None:
+                old_pool.stop()
+            logger.info("Call-home пул переслушан на порту %d (без перезапуска процесса)", new_pool.bind_port)
+        except OSError as exc:
+            logger.warning("Не удалось переслушать call-home пул на порту %d: %s", request.port, exc)
+            return gateway_pb2.SetCallHomePortResponse(
+                error=gateway_pb2.ReadError(code="GATEWAY_ERROR", message=str(exc))
+            )
+        return gateway_pb2.SetCallHomePortResponse(
+            success=gateway_pb2.SetCallHomePortSuccess(port=new_pool.bind_port)
+        )
 
     def DisconnectMeter(self, request, context):
         try:
@@ -316,7 +352,7 @@ def serve(
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
     gateway_pb2_grpc.add_GatewayServiceServicer_to_server(
-        GatewayServiceServicer(call_home_pool=call_home_pool), server
+        GatewayServiceServicer(call_home_pool=call_home_pool, call_home_bind_host=host), server
     )
     server.add_insecure_port(f"{host}:{port}")
     server.start()

@@ -236,3 +236,43 @@ async def read_load_profile(
             else:
                 error = response.error
                 raise LoadProfileError(error.code, error.message, error.is_partial)
+
+
+@dataclass
+class SeenSerial:
+    serial: str
+    first_seen_unix: float
+
+
+async def list_call_home_serials(*, grpc_target: str, call_timeout_s: float = 5.0) -> list[SeenSerial]:
+    """Этап 6 (обнаружение новых счётчиков) — все серийные номера,
+    опознанные call-home пулом этого Gateway с момента запуска его
+    процесса, независимо от того, знает ли Backend о них (см.
+    services/meter_discovery.py)."""
+    async with grpc.aio.insecure_channel(grpc_target) as channel:
+        stub = gateway_pb2_grpc.GatewayServiceStub(channel)
+        response = await stub.ListCallHomeSerials(gateway_pb2.ListCallHomeSerialsRequest(), timeout=call_timeout_s)
+    return [SeenSerial(serial=s.serial, first_seen_unix=s.first_seen_unix) for s in response.serials]
+
+
+@dataclass
+class SetCallHomePortResult:
+    ok: bool
+    port: int | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+async def set_call_home_port(*, grpc_target: str, port: int, call_timeout_s: float = 10.0) -> SetCallHomePortResult:
+    """Этап 6 — живая смена порта call-home пула Gateway, без перезапуска
+    процесса/контейнера (см. protocols уровня Gateway, grpc_server.
+    SetCallHomePort — stop()+start() пула на лету)."""
+    async with grpc.aio.insecure_channel(grpc_target) as channel:
+        stub = gateway_pb2_grpc.GatewayServiceStub(channel)
+        response = await stub.SetCallHomePort(gateway_pb2.SetCallHomePortRequest(port=port), timeout=call_timeout_s)
+
+    which = response.WhichOneof("result")
+    if which == "success":
+        return SetCallHomePortResult(ok=True, port=response.success.port)
+    error = response.error
+    return SetCallHomePortResult(ok=False, error_code=error.code, error_message=error.message)

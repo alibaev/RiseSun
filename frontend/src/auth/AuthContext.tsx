@@ -74,3 +74,21 @@ export function canManageAutomation(role: string | null): boolean {
 export function canManageSystem(role: string | null): boolean {
   return role !== null && MANAGE_AUTOMATION_ROLES.has(role);
 }
+
+// Этап 6 (обнаружение новых счётчиков): активация автообнаруженного
+// счётчика, справочник счётчиков вообще (создание/редактирование) — тот
+// же набор ролей, что и Permission.MANAGE_METERS на Backend
+// (Admin/Super-admin).
+export function canManageMeters(role: string | null): boolean {
+  return role !== null && MANAGE_AUTOMATION_ROLES.has(role);
+}
+
+// ТЗ п.4.1.1: регистрация/подтверждение/отключение Gateway, включая
+// настройку call-home порта (Этап 6) — ИСКЛЮЧИТЕЛЬНО «Супер-
+// администратор» (Permission.MANAGE_GATEWAYS на Backend), в отличие от
+// остальных ролей выше, где хватает и «Администратора».
+const MANAGE_GATEWAYS_ROLES = new Set(["super_admin"]);
+
+export function canManageGateways(role: string | null): boolean {
+  return role !== null && MANAGE_GATEWAYS_ROLES.has(role);
+}

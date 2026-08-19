@@ -59,6 +59,16 @@ class GatewayServiceStub:
                 request_serializer=gateway__pb2.DisconnectMeterRequest.SerializeToString,
                 response_deserializer=gateway__pb2.DisconnectMeterResponse.FromString,
                 _registered_method=True)
+        self.ListCallHomeSerials = channel.unary_unary(
+                '/mmws.gateway.v1.GatewayService/ListCallHomeSerials',
+                request_serializer=gateway__pb2.ListCallHomeSerialsRequest.SerializeToString,
+                response_deserializer=gateway__pb2.ListCallHomeSerialsResponse.FromString,
+                _registered_method=True)
+        self.SetCallHomePort = channel.unary_unary(
+                '/mmws.gateway.v1.GatewayService/SetCallHomePort',
+                request_serializer=gateway__pb2.SetCallHomePortRequest.SerializeToString,
+                response_deserializer=gateway__pb2.SetCallHomePortResponse.FromString,
+                _registered_method=True)
 
 
 class GatewayServiceServicer:
@@ -120,6 +130,28 @@ class GatewayServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListCallHomeSerials(self, request, context):
+        """Этап 6 (обнаружение новых счётчиков) — все серийные номера,
+        опознанные call-home пулом этого Gateway с момента запуска процесса
+        (см. callhome.CallHomePool.list_seen_serials), независимо от того,
+        уже ли Backend знает о них. Backend периодически опрашивает этот
+        метод и заводит в справочник ранее неизвестные серийники со
+        статусом "installed" — оператор видит их и решает, принимать ли в
+        работу, вместо того чтобы заранее знать серийный номер откуда-то ещё.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SetCallHomePort(self, request, context):
+        """Этап 6 — живая смена порта, который слушает call-home пул Gateway,
+        БЕЗ перезапуска процесса/контейнера (CallHomePool.stop()+start() на
+        новом порту). Используется панелью суперадминистратора.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_GatewayServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -147,6 +179,16 @@ def add_GatewayServiceServicer_to_server(servicer, server):
                     servicer.DisconnectMeter,
                     request_deserializer=gateway__pb2.DisconnectMeterRequest.FromString,
                     response_serializer=gateway__pb2.DisconnectMeterResponse.SerializeToString,
+            ),
+            'ListCallHomeSerials': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListCallHomeSerials,
+                    request_deserializer=gateway__pb2.ListCallHomeSerialsRequest.FromString,
+                    response_serializer=gateway__pb2.ListCallHomeSerialsResponse.SerializeToString,
+            ),
+            'SetCallHomePort': grpc.unary_unary_rpc_method_handler(
+                    servicer.SetCallHomePort,
+                    request_deserializer=gateway__pb2.SetCallHomePortRequest.FromString,
+                    response_serializer=gateway__pb2.SetCallHomePortResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -284,6 +326,60 @@ class GatewayService:
             '/mmws.gateway.v1.GatewayService/DisconnectMeter',
             gateway__pb2.DisconnectMeterRequest.SerializeToString,
             gateway__pb2.DisconnectMeterResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListCallHomeSerials(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/mmws.gateway.v1.GatewayService/ListCallHomeSerials',
+            gateway__pb2.ListCallHomeSerialsRequest.SerializeToString,
+            gateway__pb2.ListCallHomeSerialsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SetCallHomePort(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/mmws.gateway.v1.GatewayService/SetCallHomePort',
+            gateway__pb2.SetCallHomePortRequest.SerializeToString,
+            gateway__pb2.SetCallHomePortResponse.FromString,
             options,
             channel_credentials,
             insecure,
