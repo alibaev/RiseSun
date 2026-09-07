@@ -18,6 +18,7 @@ from app.models import (
     JobStatus,
     LoadProfileData,
     Meter,
+    MeterReading,
     ParameterWriteHistory,
     ParameterWriteResult,
     ProtocolProfile,
@@ -26,9 +27,11 @@ from app.models import (
 )
 from app.services.gateway_client import LoadProfileError, LoadProfileRow, ReadResult, WriteResult
 from app.services.job_worker import (
+    RATED_CURRENT_OBIS,
     _run_disconnect,
     _run_read_current,
     _run_read_load_profile,
+    _run_read_rated_current,
     _run_reconnect,
     _run_write_datetime,
     _run_write_parameter,
@@ -108,6 +111,67 @@ async def test_regular_meter_passes_host_port_and_call_home_false(db_session):
     assert kwargs["host"] == "192.168.1.50"
     assert kwargs["port"] == 4059
     assert kwargs["call_timeout_s"] == 60.0
+
+
+@pytest.mark.asyncio
+async def test_read_rated_current_stores_value_on_meter_not_reading(db_session):
+    """read_rated_current (2026-09-07) — успешное чтение пишется в
+    Meter.rated_current_amps, а НЕ в отдельную запись meter_readings
+    (это статичный паспортный параметр, а не показание)."""
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202306004113",
+        is_call_home=True,
+        protocol_profile=ProtocolProfile.HDLC_DLMS,
+        password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    job = Job(job_type="read_rated_current", meter_id=meter.id, payload={})
+    db_session.add(job)
+    await db_session.commit()
+
+    with patch(
+        "app.services.job_worker.read_register",
+        new=AsyncMock(return_value=ReadResult(ok=True, value=100)),
+    ) as mocked:
+        await _run_read_rated_current(db_session, job)
+
+    kwargs = mocked.call_args.kwargs
+    assert kwargs["obis"] == RATED_CURRENT_OBIS
+    assert job.status == JobStatus.SUCCEEDED
+    assert job.result == {"obis": RATED_CURRENT_OBIS, "rated_current_amps": 100}
+    assert meter.rated_current_amps == 100.0
+    readings = (await db_session.execute(select(MeterReading))).scalars().all()
+    assert readings == []
+
+
+@pytest.mark.asyncio
+async def test_read_rated_current_failure_leaves_meter_untouched(db_session):
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202306004113",
+        is_call_home=True,
+        protocol_profile=ProtocolProfile.HDLC_DLMS,
+        password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    job = Job(job_type="read_rated_current", meter_id=meter.id, payload={})
+    db_session.add(job)
+    await db_session.commit()
+
+    with patch(
+        "app.services.job_worker.read_register",
+        new=AsyncMock(return_value=ReadResult(ok=False, error_code="TIMEOUT", error_message="Таймаут", is_partial=False)),
+    ):
+        await _run_read_rated_current(db_session, job)
+
+    assert job.status == JobStatus.FAILED
+    assert job.error["code"] == "TIMEOUT"
+    assert meter.rated_current_amps is None
 
 
 @pytest.mark.asyncio

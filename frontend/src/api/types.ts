@@ -39,6 +39,7 @@ export interface Meter {
   last_read_at: string | null;
   created_at: string;
   last_reading_value: unknown | null;
+  rated_current_amps: number | null;
 }
 
 export interface MeterReading {

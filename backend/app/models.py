@@ -15,6 +15,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Integer,
     LargeBinary,
@@ -181,6 +182,13 @@ class Meter(Base):
     gateway_id: Mapped[int] = mapped_column(ForeignKey("gateways.id"), nullable=False)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Токовый класс счётчика (Maximum Current, атрибут "Imax", OBIS
+    # `1.1.0.6.3.ff` — гипотеза, не подтверждена реальным трафиком на
+    # момент добавления поля, см. DECISIONS.md 2026-09-07) — статичный
+    # паспортный параметр, читается один раз (см. job_type
+    # "read_rated_current", services/scheduler.py) и больше не
+    # запрашивается повторно, раз уже известен.
+    rated_current_amps: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     gateway: Mapped[Gateway] = relationship(back_populates="meters", lazy="selectin")

@@ -284,6 +284,27 @@ async def trigger_read(
     return job
 
 
+@router.post("/{meter_id}/read-rated-current", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
+async def trigger_read_rated_current(
+    meter_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.TRIGGER_READ)),
+) -> Job:
+    """Ручной запуск чтения токового класса (Maximum Current, гипотеза
+    OBIS — см. job_worker.RATED_CURRENT_OBIS, DECISIONS.md 2026-09-07)
+    вне очереди ежедневного расписания. В обычном режиме читается
+    автоматически расписанием (job_type="read_rated_current",
+    skip-навсегда после первого успеха) — этот эндпоинт для
+    внепланового/повторного запроса конкретного счётчика."""
+    await _get_active_meter_or_error(db, meter_id)
+
+    job = Job(job_type="read_rated_current", meter_id=meter_id, created_by_id=user.id)
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
 @router.post("/{meter_id}/write-datetime", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
 async def trigger_write_datetime(
     meter_id: int,

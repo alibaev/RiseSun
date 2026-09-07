@@ -20,7 +20,13 @@ Asia/Bishkek (UTC+6, без перехода на летнее), из очере
 00:30, потом на 01:00 и так далее, пока не получится, но не опрашивать
 повторно счётчик, который уже отчитался за эти сутки» — без этого
 флага (по умолчанию выключен) поведение прежнее: расписание всегда
-опрашивает весь список ``meter_ids``."""
+опрашивает весь список ``meter_ids``.
+
+``job_type="read_rated_current"`` (2026-09-07, согласовано с
+пользователем) — аналогичный принцип, но БЕЗ суточного окна: токовый
+класс счётчика (``Meter.rated_current_amps``) — статичный параметр, не
+меняется со временем, поэтому счётчик с уже известным значением
+исключается из группы НАВСЕГДА, не только на текущие сутки."""
 
 from __future__ import annotations
 
@@ -74,6 +80,8 @@ def _build_job_payload(scheduled_job: ScheduledJob) -> dict:
         if scheduled_job.operation_params.get("obis"):
             payload["obis"] = scheduled_job.operation_params["obis"]
         return payload
+    if scheduled_job.job_type == "read_rated_current":
+        return {}  # OBIS фиксирован в job_worker.RATED_CURRENT_OBIS, не параметризуется
     # read_current
     return {"obis": scheduled_job.operation_params.get("obis", "1.1.1.8.0.ff")}
 
@@ -106,18 +114,28 @@ async def _trigger_one(db: AsyncSession, scheduled_job: ScheduledJob) -> None:
     ).scalars().all()
 
     payload = _build_job_payload(scheduled_job)
+    skip_reason = None
     if scheduled_job.job_type == "read_current" and scheduled_job.operation_params.get("skip_if_read_today"):
         already_read = await _already_read_today_meter_ids(
             db, [m.id for m in meters], payload["obis"], now
         )
         meters = [m for m in meters if m.id not in already_read]
+        skip_reason = "все счётчики группы уже опрошены за сегодня (Asia/Bishkek)"
+    elif scheduled_job.job_type == "read_rated_current":
+        # Токовый класс (rated_current_amps) — статичный паспортный
+        # параметр, не меняется у счётчика со временем, поэтому здесь
+        # НЕТ суточного окна — счётчик, у которого он уже известен,
+        # исключается НАВСЕГДА, а не до конца текущих суток (в отличие
+        # от skip_if_read_today выше).
+        meters = [m for m in meters if m.rated_current_amps is None]
+        skip_reason = "у всех счётчиков группы токовый класс уже известен"
 
     scheduled_job.last_run_at = now
     if not meters:
         await db.commit()
         logger.info(
-            "Расписание id=%s (%s) сработало — все счётчики группы уже опрошены за сегодня (Asia/Bishkek), пропуск",
-            scheduled_job.id, scheduled_job.name,
+            "Расписание id=%s (%s) сработало — %s, пропуск",
+            scheduled_job.id, scheduled_job.name, skip_reason or "пустая группа",
         )
         return
 

@@ -143,6 +143,7 @@ class MeterOut(BaseModel):
     gateway_id: int
     last_seen_at: datetime | None
     last_read_at: datetime | None
+    rated_current_amps: float | None
     created_at: datetime
     # Значение последнего показания (meter_readings.value_json на момент
     # last_read_at) — подмешивается отдельным запросом в list_meters, не
@@ -268,7 +269,7 @@ class JobOut(BaseModel):
     finished_at: datetime | None
 
 
-ScheduledJobType = Literal["read_current", "read_load_profile"]
+ScheduledJobType = Literal["read_current", "read_load_profile", "read_rated_current"]
 
 
 class ScheduledJobCreate(BaseModel):
@@ -277,7 +278,8 @@ class ScheduledJobCreate(BaseModel):
     job_type: ScheduledJobType
     # read_current -> {"obis": "..."} (по умолчанию — активная энергия,
     # приём, всего); read_load_profile -> {"window_hours": N, "obis": "..."}
-    # — каждый запуск запрашивает последние N часов от текущего момента.
+    # — каждый запуск запрашивает последние N часов от текущего момента;
+    # read_rated_current -> {} (OBIS фиксирован, см. job_worker.py).
     operation_params: dict = Field(default_factory=dict)
     meter_ids: list[int] = Field(min_length=1)
     is_enabled: bool = True

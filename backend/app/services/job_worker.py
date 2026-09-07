@@ -126,6 +126,65 @@ async def _run_read_current(db: AsyncSession, job: Job) -> None:
     await db.commit()
 
 
+# Maximum Current (Imax), OBIS.xlsx (Read_Tree_полное_дерево, строка 706
+# `0.6.3`) — гипотеза токового класса счётчика (100А vs 5А), переведена
+# в полный OBIS по правилу, подтверждённому на регистре энергии
+# (`C.D.E` -> `1.1.C.D.E.255`), но САМА эта гипотеза live-трафиком не
+# подтверждена (см. DECISIONS.md, 2026-09-07) — читается один раз на
+# счётчик (см. scheduler.py, job_type="read_rated_current"), результат
+# сохраняется на Meter, а не в meter_readings (это не показание, а
+# статичный паспортный параметр).
+RATED_CURRENT_OBIS = "1.1.0.6.3.ff"
+
+
+async def _run_read_rated_current(db: AsyncSession, job: Job) -> None:
+    meter = await db.get(Meter, job.meter_id)
+    if meter is None:
+        job.status = JobStatus.FAILED
+        job.error = {"code": "METER_NOT_FOUND", "message": f"Счётчик id={job.meter_id} не найден"}
+        job.finished_at = datetime.now(timezone.utc)
+        await db.commit()
+        return
+
+    gateway = meter.gateway
+    password = decrypt_secret(meter.password_encrypted).decode("ascii")
+
+    outcome = await read_register(
+        grpc_target=gateway.grpc_target if gateway else settings.gateway_grpc_target,
+        profile=meter.protocol_profile.value,
+        host=meter.ip_address or "",
+        port=meter.port or 0,
+        call_home=meter.is_call_home,
+        serial=meter.serial_number,
+        password=password,
+        obis=RATED_CURRENT_OBIS,
+        call_timeout_s=160.0 if meter.is_call_home else 60.0,
+    )
+
+    now = datetime.now(timezone.utc)
+    if outcome.ok and isinstance(outcome.value, (int, float)):
+        job.status = JobStatus.SUCCEEDED
+        job.result = {"obis": RATED_CURRENT_OBIS, "rated_current_amps": outcome.value}
+        meter.rated_current_amps = float(outcome.value)
+        meter.last_seen_at = now
+    elif outcome.ok:
+        job.status = JobStatus.FAILED
+        job.error = {
+            "code": "UNEXPECTED_VALUE_TYPE",
+            "message": f"Ожидалось число, получено {outcome.value!r}",
+            "is_partial": False,
+        }
+    else:
+        job.status = JobStatus.FAILED
+        job.error = {
+            "code": outcome.error_code,
+            "message": outcome.error_message,
+            "is_partial": outcome.is_partial,
+        }
+    job.finished_at = now
+    await db.commit()
+
+
 async def _run_write_datetime(db: AsyncSession, job: Job) -> None:
     """Устанавливает текущее (системное, UTC) время/дату на счётчике —
     ТЗ п.4.2.4/4.2.11. Перед каждой записью пытается прочитать прежнее
@@ -463,6 +522,7 @@ _JOB_HANDLERS = {
     "read_load_profile": _run_read_load_profile,
     "disconnect": _run_disconnect,
     "reconnect": _run_reconnect,
+    "read_rated_current": _run_read_rated_current,
 }
 
 

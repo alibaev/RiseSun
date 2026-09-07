@@ -203,6 +203,7 @@ export function MetersListPage() {
             <thead>
               <tr>
                 <th>Серийный номер</th>
+                <th>Ампер</th>
                 <th>IP-адрес</th>
                 <th>Протокол</th>
                 <th>Местоположение</th>
@@ -217,6 +218,7 @@ export function MetersListPage() {
                   <td>
                     <Link to={`/meters/${m.id}`}>{m.serial_number}</Link>
                   </td>
+                  <td>{m.rated_current_amps ?? "—"}</td>
                   <td>{m.ip_address ? `${m.ip_address}:${m.port}` : "—"}</td>
                   <td>{m.protocol_profile ? PROFILE_LABELS[m.protocol_profile] : "—"}</td>
                   <td>{m.location ?? "—"}</td>

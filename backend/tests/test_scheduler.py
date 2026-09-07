@@ -15,6 +15,7 @@ from app.models import (
     Job,
     JobStatus,
     Meter,
+    MeterReading,
     ProtocolProfile,
     ScheduledJob,
     ScheduledJobRun,
@@ -95,6 +96,14 @@ def test_build_job_payload_read_load_profile_window():
     assert (to_dt - from_dt) == timedelta(hours=6)
 
 
+def test_build_job_payload_read_rated_current_is_empty():
+    job = ScheduledJob(
+        name="x", cron_expression="* * * * *", job_type="read_rated_current",
+        operation_params={}, meter_ids=[],
+    )
+    assert _build_job_payload(job) == {}
+
+
 @pytest.mark.asyncio
 async def test_trigger_one_creates_run_and_one_job_per_meter(db_session):
     meter_ids = await _seed_gateway_and_meters(db_session, n=3)
@@ -117,6 +126,85 @@ async def test_trigger_one_creates_run_and_one_job_per_meter(db_session):
     assert all(j.status == JobStatus.QUEUED for j in jobs)
     assert all(j.payload == {"obis": "1.1.1.8.0.ff"} for j in jobs)
     assert scheduled_job.last_run_at is not None
+
+
+@pytest.mark.asyncio
+async def test_trigger_one_skip_if_read_today_excludes_already_read_meters(db_session):
+    """skip_if_read_today (2026-09-07) — счётчик, у которого уже есть
+    MeterReading по тому же OBIS за сегодня (Asia/Bishkek), не должен
+    получить новую Job; счётчик без такого чтения — должен."""
+    meter_ids = await _seed_gateway_and_meters(db_session, n=2)
+    already_read_id, pending_id = meter_ids
+    db_session.add(
+        MeterReading(
+            meter_id=already_read_id, obis_code="1.1.1.8.0.ff", value_json=123,
+            read_at=datetime.now(timezone.utc),
+        )
+    )
+    await db_session.commit()
+
+    scheduled_job = ScheduledJob(
+        name="Ежедневный", cron_expression="*/30 * * * *", job_type="read_current",
+        operation_params={"obis": "1.1.1.8.0.ff", "skip_if_read_today": True}, meter_ids=meter_ids,
+    )
+    db_session.add(scheduled_job)
+    await db_session.commit()
+
+    await _trigger_one(db_session, scheduled_job)
+
+    jobs = (await db_session.execute(select(Job))).scalars().all()
+    assert {j.meter_id for j in jobs} == {pending_id}
+
+
+@pytest.mark.asyncio
+async def test_trigger_one_skip_if_read_today_creates_no_run_when_all_covered(db_session):
+    meter_ids = await _seed_gateway_and_meters(db_session, n=1)
+    db_session.add(
+        MeterReading(
+            meter_id=meter_ids[0], obis_code="1.1.1.8.0.ff", value_json=123,
+            read_at=datetime.now(timezone.utc),
+        )
+    )
+    await db_session.commit()
+
+    scheduled_job = ScheduledJob(
+        name="Ежедневный", cron_expression="*/30 * * * *", job_type="read_current",
+        operation_params={"obis": "1.1.1.8.0.ff", "skip_if_read_today": True}, meter_ids=meter_ids,
+    )
+    db_session.add(scheduled_job)
+    await db_session.commit()
+
+    await _trigger_one(db_session, scheduled_job)
+
+    assert (await db_session.execute(select(ScheduledJobRun))).scalars().all() == []
+    assert (await db_session.execute(select(Job))).scalars().all() == []
+    assert scheduled_job.last_run_at is not None  # иначе тик планировщика повторялся бы немедленно
+
+
+@pytest.mark.asyncio
+async def test_trigger_one_read_rated_current_skips_meters_with_known_value(db_session):
+    """read_rated_current (2026-09-07) — в отличие от skip_if_read_today,
+    пропуск НАВСЕГДА (не по суткам): счётчик с уже заполненным
+    rated_current_amps исключается независимо от того, когда это
+    значение было записано."""
+    meter_ids = await _seed_gateway_and_meters(db_session, n=2)
+    known_id, unknown_id = meter_ids
+    known_meter = await db_session.get(Meter, known_id)
+    known_meter.rated_current_amps = 100.0
+    await db_session.commit()
+
+    scheduled_job = ScheduledJob(
+        name="Токовый класс", cron_expression="*/30 * * * *", job_type="read_rated_current",
+        operation_params={}, meter_ids=meter_ids,
+    )
+    db_session.add(scheduled_job)
+    await db_session.commit()
+
+    await _trigger_one(db_session, scheduled_job)
+
+    jobs = (await db_session.execute(select(Job))).scalars().all()
+    assert {j.meter_id for j in jobs} == {unknown_id}
+    assert all(j.payload == {} for j in jobs)
 
 
 @pytest.mark.asyncio
