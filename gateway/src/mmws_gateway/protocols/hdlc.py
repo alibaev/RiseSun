@@ -208,7 +208,14 @@ def read_frame_from_transport(transport: TcpTransport) -> bytes:
     на битовом уровне физического канала; при переносе протокола поверх
     TCP (уже надёжного байтового потока) корректно и достаточно просто
     довериться длине, объявленной в самом кадре, а не искать флаг.
+
+    ``transport.reset_frame_seeking()`` вызывается перед КАЖДЫМ кадром
+    (не только первым) — для call-home-транспорта это даёт счётчику
+    отфильтровать периодический DL/T645-анонс (``0x68...0x16``), если он
+    придёт между двумя HDLC-кадрами уже установленной сессии (найденный
+    баг, 2026-09-07, см. ``transport.TcpTransport.reset_frame_seeking``).
     """
+    transport.reset_frame_seeking()
     first = transport.recv_exact(1)
     if first != bytes([FLAG]):
         raise GatewayError(

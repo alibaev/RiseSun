@@ -95,6 +95,22 @@ class TcpTransport:
         except OSError as exc:
             raise ConnectionLostError(f"Обрыв при отправке данных: {exc}") from exc
 
+    def reset_frame_seeking(self) -> None:
+        """Хук, дающий обёрнутому сокету шанс сбросить фильтрацию
+        "мусора" перед ожиданием НОВОГО HDLC-кадра (см.
+        ``protocols.hdlc.read_frame_from_transport``, вызывается перед
+        КАЖДЫМ кадром). Для обычного сокета (прямое TCP-подключение к
+        счётчику, без call-home-фильтрации) — no-op; для
+        ``callhome.DlT645FilteringSocket`` делегирует в его
+        ``reset_seeking()`` (2026-09-07, найденный баг: раньше фильтрация
+        включалась заново вручную только перед попытками SNRM, поэтому
+        DL/T645-анонс счётчика, пришедший ПОСЛЕ установления HDLC-связи
+        — например, в середине многокадрового чтения профиля нагрузки —
+        не фильтровался и ломал разбор следующего кадра)."""
+        reset = getattr(self._sock, "reset_seeking", None)
+        if reset is not None:
+            reset()
+
     def recv_until(self, terminator: bytes, max_len: int = 8192) -> bytes:
         """Читает байты, пока не встретится ``terminator`` (включительно)."""
         assert self._sock is not None

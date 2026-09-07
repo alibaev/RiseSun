@@ -22,7 +22,8 @@ from mmws_gateway.callhome import (
     serial_from_dlt645_address,
 )
 from mmws_gateway.protocols import datatypes, dlms
-from mmws_gateway.protocols.hdlc import CONTROL_SNRM, CONTROL_UA, HdlcFrame
+from mmws_gateway.protocols.hdlc import CONTROL_SNRM, CONTROL_UA, HdlcFrame, read_frame_from_transport
+from mmws_gateway.transport import TcpServerTransport
 
 
 def test_serial_from_dlt645_address_matches_real_captures():
@@ -58,6 +59,36 @@ def test_filtering_socket_skips_dlt645_frame_and_zero_bytes():
                 break
             collected += chunk
         assert bytes(collected) == b"\x7eHELLO\x7e"
+    finally:
+        client_sock.close()
+
+
+def test_read_frame_from_transport_filters_dlt645_noise_between_frames():
+    """Найденный баг (2026-09-07, сообщение пользователя — при чтении
+    профиля нагрузки счётчик "передаёт что-то нечитаемое, без чёткого
+    начала и конца"): раньше фильтрация DL/T645-шума включалась заново
+    только вручную перед SNRM, поэтому шум между ВТОРЫМ и последующими
+    кадрами уже установленной сессии не отфильтровывался. Этот тест
+    читает через один и тот же ``TcpServerTransport`` ДВА кадра подряд
+    без единого явного вызова ``reset_seeking()`` — фильтрация должна
+    сработать автоматически перед вторым кадром так же, как перед
+    первым (через ``transport.reset_frame_seeking()``, см. hdlc.py)."""
+    server_sock, client_sock = socket.socketpair()
+    try:
+        frame1 = HdlcFrame(destination=1, source=16, control=0x93).encode()
+        frame2 = HdlcFrame(destination=1, source=16, control=0x53).encode()
+        noise = _build_dummy_dlt645_frame(bytes.fromhex("522300012020"))
+        server_sock.sendall(frame1 + b"\x00" + noise + frame2)
+        server_sock.close()
+
+        filtering = DlT645FilteringSocket(client_sock)
+        transport = TcpServerTransport.from_accepted_socket(
+            filtering, peer_host="127.0.0.1", peer_port=1, timeout_ms=2000
+        )
+        got1 = HdlcFrame.decode(read_frame_from_transport(transport))
+        got2 = HdlcFrame.decode(read_frame_from_transport(transport))
+        assert got1.control == 0x93
+        assert got2.control == 0x53
     finally:
         client_sock.close()
 

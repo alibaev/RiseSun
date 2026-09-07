@@ -115,19 +115,39 @@ class DlT645FilteringSocket:
     съедая их байты как будто это keepalive-шум. Поэтому фильтрация
     активна только в режиме "ищу начало нового кадра" (``_seeking``);
     как только найден первый настоящий байт кадра, все ПОСЛЕДУЮЩИЕ
-    байты этого кадра отдаются без какой-либо фильтрации — режим
-    "поиска" нужно явно включить заново перед следующей попыткой через
-    ``reset_seeking()``.
-    """
+    байты этого кадра отдаются без какой-либо фильтрации.
+
+    ВАЖНО (второй баг, найденный 2026-09-07, сообщение пользователя —
+    при чтении профиля нагрузки счётчик "передаёт что-то нечитаемое, без
+    чёткого начала и конца пакета", внешне похожее на кадр DL/T645, о
+    котором см. DECISIONS.md — этот протокол и есть китайский
+    национальный стандарт): раньше режим "поиска" включался заново
+    ВРУЧНУЮ — вызовом ``reset_seeking()`` — и только перед КАЖДОЙ
+    попыткой SNRM. После успешного SNRM/UA фильтрация оставалась
+    выключенной НАВСЕГДА до конца TCP-соединения — если счётчик
+    присылал очередной периодический DL/T645-анонс уже ПОСЛЕ
+    установления HDLC-связи (между AARQ и AARE, между GET и
+    GET-response, а особенно вероятно — в паузах многокадрового чтения
+    профиля нагрузки, самой долгой операции), эти байты шли НАПРЯМУЮ в
+    HDLC-парсер как будто это начало следующего кадра, что либо валило
+    парсер сразу (``GatewayError`` "ожидался флаг 0x7E"), либо, если
+    границы кадров совпадали неудачно, давало на вид нечитаемую мешанину
+    без ясной границы начала/конца — то, что описал пользователь.
+    Исправление: ``reset_seeking()`` теперь вызывается автоматически
+    перед КАЖДЫМ кадром через хук
+    ``transport.TcpTransport.reset_frame_seeking()``
+    (``protocols.hdlc.read_frame_from_transport``) — вызывающему коду
+    (см. ниже) вызывать его вручную больше не нужно."""
 
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
         self._seeking = True
 
     def reset_seeking(self) -> None:
-        """Включает фильтрацию заново перед следующей попыткой чтения
-        кадра — вызывать перед КАЖДОЙ новой попыткой SNRM, не только
-        один раз при подключении (см. docstring класса)."""
+        """Включает фильтрацию заново перед следующим кадром — вызывается
+        автоматически из ``transport.TcpTransport.reset_frame_seeking()``
+        перед КАЖДЫМ кадром на всём протяжении сессии (не только перед
+        SNRM — см. docstring класса, второй найденный баг)."""
         self._seeking = True
 
     def settimeout(self, timeout_s: float) -> None:
@@ -411,7 +431,6 @@ def read_via_call_home(
         for attempt in range(1, max_attempts_per_connection + 1):
             if time.time() >= deadline:
                 break
-            filtering_sock.reset_seeking()
             transport = TcpServerTransport.from_accepted_socket(
                 filtering_sock, peer_host=pc.peer[0], peer_port=pc.peer[1], timeout_ms=per_attempt_timeout_ms
             )
@@ -514,7 +533,6 @@ def read_load_profile_via_call_home(
         for attempt in range(1, max_attempts_per_connection + 1):
             if time.time() >= deadline:
                 break
-            filtering_sock.reset_seeking()
             transport = TcpServerTransport.from_accepted_socket(
                 filtering_sock, peer_host=pc.peer[0], peer_port=pc.peer[1], timeout_ms=per_attempt_timeout_ms
             )
