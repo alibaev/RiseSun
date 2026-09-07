@@ -12,6 +12,7 @@ import { AuditLogPage } from "./pages/AuditLogPage";
 import { UsersPage } from "./pages/UsersPage";
 import { BillingKeysPage } from "./pages/BillingKeysPage";
 import { GatewaysPage } from "./pages/GatewaysPage";
+import { ComingSoonPage } from "./pages/ComingSoonPage";
 
 export function App() {
   return (
@@ -29,6 +30,7 @@ export function App() {
             <Route path="/users" element={<UsersPage />} />
             <Route path="/billing-keys" element={<BillingKeysPage />} />
             <Route path="/gateways" element={<GatewaysPage />} />
+            <Route path="/soon" element={<ComingSoonPage />} />
           </Route>
         </Route>
       </Routes>

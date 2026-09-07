@@ -79,8 +79,6 @@ export function MetersListPage() {
 
   return (
     <div>
-      <h1>Справочник счётчиков</h1>
-
       <div className="filters">
         <input
           placeholder="Поиск по серийному номеру / IP"
@@ -106,7 +104,9 @@ export function MetersListPage() {
 
       {meters !== null && installedRows.length > 0 && (
         <section className="card">
-          <h2>Установленные (ожидают активации) — {installedRows.length}</h2>
+          <div className="card-header">
+            <h2>Установленные (ожидают активации) — {installedRows.length}</h2>
+          </div>
           <p className="hint">
             Эти счётчики сами позвонили на call-home порт Gateway и были опознаны по серийному номеру, но пароль
             доступа и протокольный профиль ещё не известны — операции с ними недоступны до активации.
@@ -140,7 +140,9 @@ export function MetersListPage() {
 
       {activatingMeter && (
         <section className="card">
-          <h2>Активировать счётчик {activatingMeter.serial_number}</h2>
+          <div className="card-header">
+            <h2>Активировать счётчик {activatingMeter.serial_number}</h2>
+          </div>
           <div className="filters">
             <label>
               Протокольный профиль
@@ -173,41 +175,49 @@ export function MetersListPage() {
         </section>
       )}
 
-      <h2>Активные — {activeRows.length}</h2>
-      {meters !== null && activeRows.length === 0 && <p>Активных счётчиков нет.</p>}
+      <section className="card">
+        <div className="card-header">
+          <h2>Активные — {activeRows.length}</h2>
+          <div className="btn-group">
+            <button onClick={load}>Обновить</button>
+          </div>
+        </div>
+        {meters !== null && activeRows.length === 0 && <p>Активных счётчиков нет.</p>}
 
-      {activeRows.length > 0 && (
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th>Серийный номер</th>
-              <th>IP-адрес</th>
-              <th>Протокол</th>
-              <th>Местоположение</th>
-              <th>Статус</th>
-              <th>Последнее чтение</th>
-            </tr>
-          </thead>
-          <tbody>
-            {activeRows.map((m) => (
-              <tr key={m.id}>
-                <td>
-                  <Link to={`/meters/${m.id}`}>{m.serial_number}</Link>
-                </td>
-                <td>{m.ip_address ? `${m.ip_address}:${m.port}` : "—"}</td>
-                <td>{m.protocol_profile ? PROFILE_LABELS[m.protocol_profile] : "—"}</td>
-                <td>{m.location ?? "—"}</td>
-                <td>
-                  <span className={`status-dot ${m.is_online ? "online" : "offline"}`} />
-                  {m.is_online ? "online" : "offline"}
-                  {!m.is_active && " (неактивен)"}
-                </td>
-                <td>{m.last_read_at ? new Date(m.last_read_at).toLocaleString("ru-RU") : "—"}</td>
+        {activeRows.length > 0 && (
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Серийный номер</th>
+                <th>IP-адрес</th>
+                <th>Протокол</th>
+                <th>Местоположение</th>
+                <th>Статус</th>
+                <th>Последнее чтение</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
+            </thead>
+            <tbody>
+              {activeRows.map((m) => (
+                <tr key={m.id}>
+                  <td>
+                    <Link to={`/meters/${m.id}`}>{m.serial_number}</Link>
+                  </td>
+                  <td>{m.ip_address ? `${m.ip_address}:${m.port}` : "—"}</td>
+                  <td>{m.protocol_profile ? PROFILE_LABELS[m.protocol_profile] : "—"}</td>
+                  <td>{m.location ?? "—"}</td>
+                  <td>
+                    <span className={`badge ${m.is_online ? "badge-online" : "badge-offline"}`}>
+                      {m.is_online ? "online" : "offline"}
+                    </span>
+                    {!m.is_active && " · неактивен"}
+                  </td>
+                  <td>{m.last_read_at ? new Date(m.last_read_at).toLocaleString("ru-RU") : "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
     </div>
   );
 }
