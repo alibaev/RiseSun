@@ -103,6 +103,54 @@ def test_register_read_applies_value_obis_override_for_risesun_energy():
     assert value == 4507.7
 
 
+def test_register_read_applies_watt_hour_to_kwh_conversion():
+    """Найденный баг (2026-09-07, сообщение пользователя): показания
+    приходили без дробного разделителя и в 1000 раз больше нужного —
+    напр. счётчик 202308004436 живьём отдал scaler=1, сырое значение
+    1005950, и код (без этого фикса) вернул бы 10059500 вместо верных
+    10059.5. Причина — формула применяла только scaler, не учитывая, что
+    unit=30 (Wh, Green Book) требует ещё /1000 для отображения в кВт·ч
+    (везде в проекте, см. OBIS.xlsx). Числа здесь — из подтверждённого
+    реального захвата (test_real_capture_replay.py,
+    test_decode_real_value_response_and_apply_scaler): raw=66619,
+    scaler=1, unit=30 -> 666.19 кВт·ч."""
+    energy_obis = "1.1.1.8.0.ff"
+    vendor_value_obis = "1.1.60.50.0.ff"
+    counter = ConnectionCounter()
+    handler = make_hdlc_dlms_handler(
+        password=PASSWORD,
+        obis_values={dlms.parse_obis(vendor_value_obis): 66619},
+        error_injection=ErrorInjection(),
+        counter=counter,
+        register_scalers={dlms.parse_obis(energy_obis): 1},
+        register_units={dlms.parse_obis(energy_obis): 30},
+    )
+    with ThreadedEmulatorServer(handler) as server:
+        value = _read(server, obis=energy_obis)
+    assert value == 666.19
+
+
+def test_register_read_applies_watt_hour_conversion_even_with_zero_scaler():
+    """Тот же баг, частный случай scaler=0: счётчик 202302003956 живьём
+    отдавал показание 6101020 вместо верных 6101.02 — при scaler=0
+    старая формула не делала вообще ничего (ранний return), хотя
+    unit=30 (Wh) всё равно требует перевода в кВт·ч."""
+    energy_obis = "1.1.1.8.0.ff"
+    vendor_value_obis = "1.1.60.50.0.ff"
+    counter = ConnectionCounter()
+    handler = make_hdlc_dlms_handler(
+        password=PASSWORD,
+        obis_values={dlms.parse_obis(vendor_value_obis): 6101020},
+        error_injection=ErrorInjection(),
+        counter=counter,
+        register_scalers={dlms.parse_obis(energy_obis): 0},
+        register_units={dlms.parse_obis(energy_obis): 30},
+    )
+    with ThreadedEmulatorServer(handler) as server:
+        value = _read(server, obis=energy_obis)
+    assert value == 6101.02
+
+
 def test_register_read_without_scaler_stays_integer():
     with _start_server(ErrorInjection()) as server:
         value = _read(server)

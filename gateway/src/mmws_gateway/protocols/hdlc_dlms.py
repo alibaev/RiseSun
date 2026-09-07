@@ -155,13 +155,24 @@ def read_register_via_established_link(
                 obis, value_obis, scaler_unit, raw_value,
             )
         return raw_value
-    scaler = scaler_unit[0]
-    if scaler == 0:
+    scaler, unit = scaler_unit[0], scaler_unit[1]
+    # unit=30 (Wh, Green Book) — единственная подтверждённая реальным
+    # трафиком Risesun DTZY217 единица для этого регистра (см.
+    # dlms.UNIT_WATT_HOUR). Везде в проекте энергия отображается в
+    # кВт·ч (OBIS.xlsx), поэтому Вт·ч требует ДОПОЛНИТЕЛЬНОГО перевода
+    # /1000 — эквивалентно вычитанию 3 из показателя степени scaler.
+    # Найденный баг (2026-09-07, сообщение пользователя): без этого
+    # перевода `raw_value * 10**scaler` давало число В 1000 РАЗ БОЛЬШЕ
+    # правильного (напр. 132354 при scaler=1 превращалось в 1323540
+    # вместо верных 1323.54) — то есть формула была неполной даже после
+    # применения самого scaler, не только при его отсутствии/сбое.
+    effective_scaler = scaler - 3 if unit == dlms.UNIT_WATT_HOUR else scaler
+    if effective_scaler == 0:
         return raw_value
-    scaled = round(raw_value * (10**scaler), max(0, -scaler))
+    scaled = round(raw_value * (10**effective_scaler), max(0, -effective_scaler))
     logger.info(
-        "Register %s (value read at %s): scaler=%d, %r -> %r",
-        obis, value_obis, scaler, raw_value, scaled,
+        "Register %s (value read at %s): scaler=%d unit=%d (эффективный показатель степени=%d), %r -> %r",
+        obis, value_obis, scaler, unit, effective_scaler, raw_value, scaled,
     )
     return scaled
 

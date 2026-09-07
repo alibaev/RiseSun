@@ -35,6 +35,7 @@ def make_hdlc_dlms_handler(
     load_profile_block_size: int = 40,
     load_profile_capture_period_seconds: int = 900,
     register_scalers: dict[bytes, int] | None = None,
+    register_units: dict[bytes, int] | None = None,
     action_state: dict[bytes, int] | None = None,
     action_force_result: int | None = None,
 ):
@@ -68,13 +69,13 @@ def make_hdlc_dlms_handler(
     remote_reconnect). ``action_force_result`` — принудительный код
     Action-Result в ответе (для проверки обработки отказа).
 
-    ``register_scalers`` (2026-08-19, найденный баг — см.
-    ``hdlc_dlms.read_register_via_established_link``) — после ответа на
-    GET атрибута 2 (value) объекта класса Register эмулятор сам
-    дочитывает следующий кадр и отвечает на GET атрибута 3
-    (scaler_unit): `{scaler: register_scalers.get(obis, 0), unit: 0}`
-    — по умолчанию scaler=0 (не меняет поведение старых тестов, которые
-    задают сырые значения без масштаба)."""
+    ``register_scalers``/``register_units`` (2026-08-19/2026-09-07, см.
+    ``hdlc_dlms.read_register_via_established_link``) — эмулятор
+    отвечает на GET атрибута 3 (scaler_unit, читается ПЕРЕД value)
+    структурой `{scaler: register_scalers.get(obis, 0), unit:
+    register_units.get(obis, 0)}` — по умолчанию scaler=0, unit=0 (не
+    меняет поведение старых тестов, которые задают сырые значения без
+    масштаба; unit=0 — не Wh, доп. перевод /1000 не применяется)."""
 
     def handler(conn: socket.socket) -> None:
         conn.settimeout(5)
@@ -96,6 +97,7 @@ def make_hdlc_dlms_handler(
             load_profile_block_size=load_profile_block_size,
             load_profile_capture_period_seconds=load_profile_capture_period_seconds,
             register_scalers=register_scalers,
+            register_units=register_units,
             action_state=action_state,
             action_force_result=action_force_result,
         )
@@ -116,6 +118,7 @@ def serve_hdlc_dlms_session(
     load_profile_block_size: int = 40,
     load_profile_capture_period_seconds: int = 900,
     register_scalers: dict[bytes, int] | None = None,
+    register_units: dict[bytes, int] | None = None,
     action_state: dict[bytes, int] | None = None,
     action_force_result: int | None = None,
 ) -> None:
@@ -220,6 +223,7 @@ def serve_hdlc_dlms_session(
             _serve_register_scaler_then_value(
                 conn, req_frame, get_request,
                 obis_values=obis_values, register_scalers=register_scalers or {},
+                register_units=register_units or {},
                 error_injection=error_injection, attempt=attempt,
             )
             return
@@ -268,6 +272,7 @@ def _serve_register_scaler_then_value(
     *,
     obis_values: dict[bytes, int],
     register_scalers: dict[bytes, int],
+    register_units: dict[bytes, int],
     error_injection: ErrorInjection,
     attempt: int,
 ) -> None:
@@ -280,8 +285,9 @@ def _serve_register_scaler_then_value(
     отправляемому серверу кадру — как и раньше, когда первым (и тогда
     единственным) кадром был ответ на value."""
     scaler = register_scalers.get(scaler_request.obis, 0)
+    unit = register_units.get(scaler_request.obis, 0)
     scaler_value = datatypes.encode_structure(
-        [datatypes.encode_integer(scaler), datatypes.encode_unsigned(0)]
+        [datatypes.encode_integer(scaler), datatypes.encode_unsigned(unit)]
     )
     info = dlms.build_get_response_data(scaler_request.invoke_id, scaler_value)
     response_frame = HdlcFrame(

@@ -89,6 +89,19 @@ REGISTER_VALUE_ATTRIBUTE = 2
 # ``hdlc_dlms.read_register_via_established_link``.
 REGISTER_SCALER_UNIT_ATTRIBUTE = 3
 
+# Единица измерения из scaler_unit (Green Book, IEC 62056-62 Table 4).
+# Единственная подтверждённая реальным трафиком Risesun DTZY217 (см.
+# test_real_capture_replay.py, CAPTURED_GET_SCALER_ENERGY_RESP) —
+# `unit=30` (Wh) для суммарной активной энергии. Тот же тест фиксирует
+# ожидаемую формулу перевода в отображаемые (везде в проекте — kWh,
+# см. OBIS.xlsx) единицы: `raw_value * 10**scaler / 1000`, а не просто
+# `raw_value * 10**scaler` — доп. `/1000` переводит Вт·ч в кВт·ч и
+# нужен ДАЖЕ при scaler=0 (найденный баг, 2026-09-07: показание
+# счётчика 202302003956 передавалось как `6101020` вместо `6101.020` —
+# именно случай scaler=0, unit=30, где старая формула ничего не меняла
+# вообще). См. ``hdlc_dlms.read_register_via_established_link``.
+UNIT_WATT_HOUR = 30
+
 # Вендорская особенность Risesun DTZY217 (2026-08-20, найденный баг —
 # показание счётчика 202306004113 по стандартному OBIS суммарной
 # активной энергии `1.1.1.8.0.ff` отображалось как `450770` вместо
