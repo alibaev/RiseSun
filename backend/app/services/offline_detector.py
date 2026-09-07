@@ -7,13 +7,19 @@ Edge-triggered без отдельного состояния в памяти: �
 ещё нет notification — так один и тот же уход в offline не плодит
 уведомление на каждый тик цикла, а следующий уход offline (после того,
 как счётчик снова вышел на связь и ``last_seen_at`` обновился) снова
-создаёт новое уведомление."""
+создаёт новое уведомление.
+
+Условие «не в сети» делегировано ``Meter.is_online`` (не продублировано
+отдельной проверкой ``last_seen_at``/``meter_offline_timeout_s``) —
+иначе при переходе на ежесуточный опрос (2026-09-07) счётчик, уже
+успешно отчитавшийся сегодня, но не «звонивший домой» последний час,
+получал бы уведомление meter_offline каждые сутки, противореча тому,
+что он показан онлайн везде в интерфейсе."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
 
 from sqlalchemy import select
 
@@ -26,7 +32,6 @@ logger = logging.getLogger("mmws_backend.offline_detector")
 
 
 async def _run_once() -> None:
-    now = datetime.now(timezone.utc)
     async with SessionLocal() as db:
         result = await db.execute(
             select(Meter).where(Meter.is_active.is_(True), Meter.last_seen_at.is_not(None))
@@ -34,8 +39,7 @@ async def _run_once() -> None:
         meters = result.scalars().all()
 
         for meter in meters:
-            offline_for = (now - meter.last_seen_at).total_seconds()
-            if offline_for < settings.meter_offline_timeout_s:
+            if meter.is_online:
                 continue
 
             already_notified = await db.execute(

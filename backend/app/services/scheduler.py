@@ -8,13 +8,26 @@
 счётчик группы — сами задачи выполняет обычный ``job_worker`` (планировщик
 только ставит их в очередь, не читает счётчики сам — то же разделение
 ответственности, что и у ручного запуска через API,
-Promt_MMWS.md, раздел 3, принцип 3)."""
+Promt_MMWS.md, раздел 3, принцип 3).
+
+``operation_params.skip_if_read_today`` (2026-09-07, согласовано с
+пользователем для ежедневного опроса всех счётчиков) — опциональный
+флаг для ``job_type="read_current"``: если включён, счётчики, у которых
+уже есть ``MeterReading`` по тому же OBIS за ТЕКУЩИЕ сутки по времени
+Asia/Bishkek (UTC+6, без перехода на летнее), из очередного запуска
+исключаются. Это вместе с частым cron (например, каждые 30 минут)
+реализует «зафиксировать показание на 00:00 Бишкек, если не вышло — на
+00:30, потом на 01:00 и так далее, пока не получится, но не опрашивать
+повторно счётчик, который уже отчитался за эти сутки» — без этого
+флага (по умолчанию выключен) поведение прежнее: расписание всегда
+опрашивает весь список ``meter_ids``."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from croniter import croniter
 from sqlalchemy import select
@@ -22,11 +35,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..db import SessionLocal
-from ..models import Job, Meter, ScheduledJob, ScheduledJobRun, ScheduledJobRunStatus
+from ..models import Job, Meter, MeterReading, ScheduledJob, ScheduledJobRun, ScheduledJobRunStatus
 
 logger = logging.getLogger("mmws_backend.scheduler")
 
 _DEFAULT_LOAD_PROFILE_WINDOW_HOURS = 24
+_BISHKEK_TZ = ZoneInfo("Asia/Bishkek")
 
 
 def next_fire_time(cron_expression: str, base: datetime) -> datetime:
@@ -64,10 +78,49 @@ def _build_job_payload(scheduled_job: ScheduledJob) -> dict:
     return {"obis": scheduled_job.operation_params.get("obis", "1.1.1.8.0.ff")}
 
 
+def _bishkek_day_bounds_utc(now: datetime) -> tuple[datetime, datetime]:
+    day_start_bishkek = now.astimezone(_BISHKEK_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    day_start_utc = day_start_bishkek.astimezone(timezone.utc)
+    return day_start_utc, day_start_utc + timedelta(days=1)
+
+
+async def _already_read_today_meter_ids(
+    db: AsyncSession, meter_ids: list[int], obis: str, now: datetime
+) -> set[int]:
+    day_start_utc, day_end_utc = _bishkek_day_bounds_utc(now)
+    result = await db.execute(
+        select(MeterReading.meter_id).where(
+            MeterReading.meter_id.in_(meter_ids),
+            MeterReading.obis_code == obis,
+            MeterReading.read_at >= day_start_utc,
+            MeterReading.read_at < day_end_utc,
+        )
+    )
+    return set(result.scalars().all())
+
+
 async def _trigger_one(db: AsyncSession, scheduled_job: ScheduledJob) -> None:
+    now = datetime.now(timezone.utc)
     meters = (
         await db.execute(select(Meter).where(Meter.id.in_(scheduled_job.meter_ids)))
     ).scalars().all()
+
+    payload = _build_job_payload(scheduled_job)
+    if scheduled_job.job_type == "read_current" and scheduled_job.operation_params.get("skip_if_read_today"):
+        already_read = await _already_read_today_meter_ids(
+            db, [m.id for m in meters], payload["obis"], now
+        )
+        meters = [m for m in meters if m.id not in already_read]
+
+    scheduled_job.last_run_at = now
+    if not meters:
+        await db.commit()
+        logger.info(
+            "Расписание id=%s (%s) сработало — все счётчики группы уже опрошены за сегодня (Asia/Bishkek), пропуск",
+            scheduled_job.id, scheduled_job.name,
+        )
+        return
+
     run = ScheduledJobRun(
         scheduled_job_id=scheduled_job.id,
         status=ScheduledJobRunStatus.RUNNING,
@@ -76,7 +129,6 @@ async def _trigger_one(db: AsyncSession, scheduled_job: ScheduledJob) -> None:
     db.add(run)
     await db.flush()
 
-    payload = _build_job_payload(scheduled_job)
     for meter in meters:
         db.add(
             Job(
@@ -87,7 +139,6 @@ async def _trigger_one(db: AsyncSession, scheduled_job: ScheduledJob) -> None:
             )
         )
 
-    scheduled_job.last_run_at = datetime.now(timezone.utc)
     await db.commit()
     logger.info(
         "Расписание id=%s (%s) сработало — run id=%s, счётчиков: %d",

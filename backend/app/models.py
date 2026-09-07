@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import enum
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import (
     Boolean,
@@ -27,6 +28,12 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .config import settings
 from .db import Base
+
+_BISHKEK_TZ = ZoneInfo("Asia/Bishkek")
+
+
+def _is_same_bishkek_day(moment: datetime, now: datetime) -> bool:
+    return moment.astimezone(_BISHKEK_TZ).date() == now.astimezone(_BISHKEK_TZ).date()
 
 
 class UserRole(str, enum.Enum):
@@ -180,11 +187,23 @@ class Meter(Base):
 
     @property
     def is_online(self) -> bool:
-        if self.last_seen_at is None:
-            return False
         from datetime import timezone
 
-        return (datetime.now(timezone.utc) - self.last_seen_at).total_seconds() < settings.meter_offline_timeout_s
+        now = datetime.now(timezone.utc)
+        if self.last_seen_at is not None:
+            if (now - self.last_seen_at).total_seconds() < settings.meter_offline_timeout_s:
+                return True
+        # Счётчик, уже успешно передавший показание СЕГОДНЯ (по времени
+        # Asia/Bishkek — тот же календарный день, что использует
+        # scheduler._already_read_today_meter_ids для «не опрашивать
+        # повторно»), считается онлайн весь остаток этих суток — даже
+        # если с последнего чтения прошло больше meter_offline_timeout_s
+        # (согласовано с пользователем 2026-09-07: получение показания —
+        # само по себе доказательство связи, ежесуточный опрос может быть
+        # реже часового таймаута).
+        if self.last_read_at is not None and _is_same_bishkek_day(self.last_read_at, now):
+            return True
+        return False
 
 
 class MeterReading(Base):
