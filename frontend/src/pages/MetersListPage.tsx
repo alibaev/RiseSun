@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError } from "../api/client";
 import { canManageMeters, useAuth } from "../auth/AuthContext";
+import { formatValue } from "../lib/format";
 import type { Meter, ProtocolProfile } from "../api/types";
 
 const PROFILE_LABELS: Record<ProtocolProfile, string> = {
@@ -9,6 +10,19 @@ const PROFILE_LABELS: Record<ProtocolProfile, string> = {
   mode_e: "IEC 62056-21 mode E",
   hdlc_dlms: "HDLC-DLMS",
 };
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+// Свежесть показания — цвет строки в "Активные" (согласовано с
+// пользователем 2026-09-07): ≤2 суток зелёным, 3-5 суток жёлтым,
+// >5 суток серым, показаний не было вовсе — красным.
+function readingAgeClass(lastReadAt: string | null): string {
+  if (!lastReadAt) return "reading-none";
+  const ageDays = (Date.now() - new Date(lastReadAt).getTime()) / MS_PER_DAY;
+  if (ageDays <= 2) return "reading-fresh";
+  if (ageDays <= 5) return "reading-stale";
+  return "reading-old";
+}
 
 export function MetersListPage() {
   const { role } = useAuth();
@@ -193,12 +207,13 @@ export function MetersListPage() {
                 <th>Протокол</th>
                 <th>Местоположение</th>
                 <th>Статус</th>
-                <th>Последнее чтение</th>
+                <th>Показание</th>
+                <th>Дата показания</th>
               </tr>
             </thead>
             <tbody>
               {activeRows.map((m) => (
-                <tr key={m.id}>
+                <tr key={m.id} className={readingAgeClass(m.last_read_at)}>
                   <td>
                     <Link to={`/meters/${m.id}`}>{m.serial_number}</Link>
                   </td>
@@ -211,6 +226,7 @@ export function MetersListPage() {
                     </span>
                     {!m.is_active && " · неактивен"}
                   </td>
+                  <td>{formatValue(m.last_reading_value)}</td>
                   <td>{m.last_read_at ? new Date(m.last_read_at).toLocaleString("ru-RU") : "—"}</td>
                 </tr>
               ))}

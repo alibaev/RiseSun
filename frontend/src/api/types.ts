@@ -38,6 +38,7 @@ export interface Meter {
   last_seen_at: string | null;
   last_read_at: string | null;
   created_at: string;
+  last_reading_value: unknown | null;
 }
 
 export interface MeterReading {

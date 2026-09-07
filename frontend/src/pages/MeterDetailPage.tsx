@@ -5,15 +5,10 @@ import { tokenStorage } from "../auth/tokenStorage";
 import { useAuth, canTriggerRead, canWriteParameter } from "../auth/AuthContext";
 import { ConfirmModal } from "../components/ConfirmModal";
 import { WRITABLE_PARAMS } from "../constants/writableParameters";
+import { formatValue } from "../lib/format";
 import type { Job, LoadProfileRow, LogEntry, Meter, MeterReading } from "../api/types";
 
 const DEFAULT_OBIS = "1.1.1.8.0.ff"; // активная энергия, приём, всего (ТЗ Приложение Г.3)
-
-function formatValue(value: unknown): string {
-  if (value === null || value === undefined) return "—";
-  if (Array.isArray(value)) return value.join(" / ");
-  return String(value);
-}
 
 // <input type="datetime-local"> ждёт "YYYY-MM-DDTHH:mm" в локальном
 // времени пользователя, без секунд/зоны — обрезаем toISOString() (UTC)

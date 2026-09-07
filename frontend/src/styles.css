@@ -367,6 +367,26 @@ select {
   background: var(--color-surface-alt);
 }
 
+/* Свежесть показания в списке счётчиков (Архив → Счётчики → Активные) —
+   насыщенность приглушена под тёмную тему (сплошной пастельный фон убил
+   бы контраст светлого текста), но оттенок сохранён: зелёный/жёлтый/
+   серый/красный по давности last_read_at. */
+.data-table tbody tr.reading-fresh {
+  background: rgba(34, 197, 94, 0.14);
+}
+
+.data-table tbody tr.reading-stale {
+  background: rgba(234, 179, 8, 0.14);
+}
+
+.data-table tbody tr.reading-old {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.data-table tbody tr.reading-none {
+  background: rgba(239, 68, 68, 0.14);
+}
+
 .data-table tbody tr:hover {
   background: rgba(222, 122, 27, 0.08);
 }

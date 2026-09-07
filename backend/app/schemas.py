@@ -144,6 +144,11 @@ class MeterOut(BaseModel):
     last_seen_at: datetime | None
     last_read_at: datetime | None
     created_at: datetime
+    # Значение последнего показания (meter_readings.value_json на момент
+    # last_read_at) — подмешивается отдельным запросом в list_meters, не
+    # ORM-связь (см. app/api/meters.py); нужно списку счётчиков, чтобы не
+    # заставлять фронтенд делать по отдельному запросу на каждый счётчик.
+    last_reading_value: object | None = None
 
 
 class ActivateMeterRequest(BaseModel):

@@ -86,7 +86,22 @@ async def list_meters(
             (Meter.serial_number.ilike(pattern)) | (Meter.ip_address.ilike(pattern))
         )
     result = await db.execute(query.order_by(Meter.serial_number))
-    return list(result.scalars().all())
+    meters = list(result.scalars().all())
+
+    # Последнее показание каждого счётчика — одним запросом (DISTINCT ON,
+    # Postgres) вместо N+1, список счётчиков может быть большим (Этап 6,
+    # 150+ активированных по call-home). Список отображает и других
+    # счётчиков помимо ACTIVE (INSTALLED и т.п.), поэтому не сужаем
+    # выборку по meter_ids — она и так ограничена самой таблицей readings.
+    latest_readings = await db.execute(
+        select(MeterReading.meter_id, MeterReading.value_json)
+        .distinct(MeterReading.meter_id)
+        .order_by(MeterReading.meter_id, MeterReading.read_at.desc())
+    )
+    values_by_meter_id = dict(latest_readings.all())
+    for meter in meters:
+        meter.last_reading_value = values_by_meter_id.get(meter.id)
+    return meters
 
 
 @router.get("/{meter_id}", response_model=MeterOut)
