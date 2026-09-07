@@ -87,7 +87,19 @@ def read_register_via_established_link(
     — вендорская особенность Risesun DTZY217, подтверждённая реальным
     трафиком (см. dlms.py). scaler_unit при этом всегда запрашивается
     по исходному, переданному ``obis`` — именно там он подтверждённо
-    доступен."""
+    доступен.
+
+    Порядок GET-запросов: scaler_unit (атрибут 3) читается ПЕРВЫМ,
+    value (атрибут 2) — ВТОРЫМ. Это не произвольный выбор: легитимный
+    заводской клиент на реальном трафике Risesun (см. dlms.py, докстринг
+    у ``REGISTER_SCALER_UNIT_ATTRIBUTE``) делает ровно так же —
+    отдельный GET scaler_unit ПЕРЕД value. Прежняя реализация читала их
+    в обратном порядке (value первым); показания на реальных счётчиках
+    (2026-09-07, массовая активация 141 счётчика) стабильно приходили
+    сырыми, без применения масштаба, при том что тот же механизм на
+    эмуляторе (порядок запросов эмулятору безразличен) давал корректный
+    результат — то есть на реальном железе именно ПОРЯДОК запросов
+    оказывался значим, а не сама формула масштабирования."""
     server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
     client_addr = DEFAULT_CLIENT_ADDRESS
 
@@ -102,9 +114,31 @@ def read_register_via_established_link(
     parsed_obis = dlms.parse_obis(obis)
     value_obis = dlms.VALUE_OBIS_OVERRIDES.get(obis, obis)
     parsed_value_obis = dlms.parse_obis(value_obis) if value_obis != obis else parsed_obis
+
+    scaler_unit: object = None
+    if class_id == dlms.REGISTER_CLASS_ID:
+        scaler_request = dlms.build_get_request(
+            parsed_obis, class_id=class_id, attribute_id=dlms.REGISTER_SCALER_UNIT_ATTRIBUTE,
+        )
+        _send_i_frame(
+            transport, server_addr, client_addr, send_seq=1, recv_seq=1,
+            information=dlms.wrap_llc_command(scaler_request),
+        )
+        scaler_frame = _recv_i_frame(transport)
+        try:
+            scaler_unit = dlms.parse_get_response(dlms.unwrap_llc(scaler_frame.information))
+        except GatewayError as exc:
+            logger.warning(
+                "Register %s: GET scaler_unit не удался (%s) — значение (OBIS %s) "
+                "будет возвращено без применения масштаба",
+                obis, exc.code, value_obis,
+            )
+            scaler_unit = None
+
+    value_send_seq = 2 if class_id == dlms.REGISTER_CLASS_ID else 1
     request = dlms.build_get_request(parsed_value_obis, class_id=class_id)
     _send_i_frame(
-        transport, server_addr, client_addr, send_seq=1, recv_seq=1,
+        transport, server_addr, client_addr, send_seq=value_send_seq, recv_seq=value_send_seq,
         information=dlms.wrap_llc_command(request),
     )
     response_frame = _recv_i_frame(transport)
@@ -113,25 +147,23 @@ def read_register_via_established_link(
     if class_id != dlms.REGISTER_CLASS_ID or not isinstance(raw_value, (int, float)):
         return raw_value
 
-    scaler_request = dlms.build_get_request(
-        parsed_obis, class_id=class_id, attribute_id=dlms.REGISTER_SCALER_UNIT_ATTRIBUTE,
-    )
-    _send_i_frame(
-        transport, server_addr, client_addr, send_seq=2, recv_seq=2,
-        information=dlms.wrap_llc_command(scaler_request),
-    )
-    scaler_frame = _recv_i_frame(transport)
-    try:
-        scaler_unit = dlms.parse_get_response(dlms.unwrap_llc(scaler_frame.information))
-    except GatewayError:
-        return raw_value  # объект не отдаёт scaler_unit — значение уже финальное
-
     if not (isinstance(scaler_unit, list) and len(scaler_unit) == 2 and isinstance(scaler_unit[0], int)):
+        if scaler_unit is not None:
+            logger.warning(
+                "Register %s (value read at %s): scaler_unit имеет неожиданный вид %r — "
+                "возвращается сырое значение %r без применения масштаба",
+                obis, value_obis, scaler_unit, raw_value,
+            )
         return raw_value
     scaler = scaler_unit[0]
     if scaler == 0:
         return raw_value
-    return round(raw_value * (10**scaler), max(0, -scaler))
+    scaled = round(raw_value * (10**scaler), max(0, -scaler))
+    logger.info(
+        "Register %s (value read at %s): scaler=%d, %r -> %r",
+        obis, value_obis, scaler, raw_value, scaled,
+    )
+    return scaled
 
 
 def write_register(

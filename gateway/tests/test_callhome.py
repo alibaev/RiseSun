@@ -168,36 +168,36 @@ def _serve_rest_of_session(conn: socket.socket, *, password: bytes, obis_values:
     if not accepted:
         return
 
+    from mmws_gateway.protocols import datatypes
+
+    # read_register_via_established_link (2026-09-07: порядок приведён в
+    # соответствие с реальным трафиком легитимного заводского клиента)
+    # сначала запрашивает scaler_unit (атрибут 3), затем value (атрибут 2)
+    # — отвечаем scaler=0 (не меняет ожидаемое сырое значение в этом тесте).
+    scaler_frame = HdlcFrame.decode(_read_frame(conn))
+    scaler_request = dlms.parse_get_request(dlms.unwrap_llc(scaler_frame.information))
+    scaler_value = datatypes.encode_structure(
+        [datatypes.encode_integer(0), datatypes.encode_unsigned(0)]
+    )
+    scaler_info = dlms.build_get_response_data(scaler_request.invoke_id, scaler_value)
+    scaler_response_frame = HdlcFrame(
+        destination=scaler_frame.source, source=scaler_frame.destination,
+        control=control_information_frame(1, 2), information=dlms.wrap_llc_response(scaler_info),
+    )
+    conn.sendall(scaler_response_frame.encode())
+
     get_frame = HdlcFrame.decode(_read_frame(conn))
     get_request = dlms.parse_get_request(dlms.unwrap_llc(get_frame.information))
     value = obis_values.get(get_request.obis)
-    from mmws_gateway.protocols import datatypes
     if value is None:
         info = dlms.build_get_response_error(get_request.invoke_id, OBJECT_UNDEFINED)
     else:
         info = dlms.build_get_response_data(get_request.invoke_id, datatypes.encode_double_long_unsigned(value))
     response_frame = HdlcFrame(
         destination=get_frame.source, source=get_frame.destination,
-        control=control_information_frame(1, 2), information=dlms.wrap_llc_response(info),
+        control=control_information_frame(2, 3), information=dlms.wrap_llc_response(info),
     )
     conn.sendall(response_frame.encode())
-
-    if value is not None:
-        # Значение прочитано успешно — read_register_via_established_link
-        # (2026-08-19, найденный баг со scaler) сразу же дочитывает
-        # scaler_unit (атрибут 3) тем же обменом; отвечаем scaler=0
-        # (не меняет ожидаемое сырое значение в этом тесте).
-        scaler_frame = HdlcFrame.decode(_read_frame(conn))
-        scaler_request = dlms.parse_get_request(dlms.unwrap_llc(scaler_frame.information))
-        scaler_value = datatypes.encode_structure(
-            [datatypes.encode_integer(0), datatypes.encode_unsigned(0)]
-        )
-        scaler_info = dlms.build_get_response_data(scaler_request.invoke_id, scaler_value)
-        scaler_response_frame = HdlcFrame(
-            destination=scaler_frame.source, source=scaler_frame.destination,
-            control=control_information_frame(2, 3), information=dlms.wrap_llc_response(scaler_info),
-        )
-        conn.sendall(scaler_response_frame.encode())
 
 
 def test_read_via_call_home_succeeds_after_ignored_snrm_attempts():

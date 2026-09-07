@@ -195,7 +195,6 @@ def serve_hdlc_dlms_session(
             )
             return
 
-    awaits_scaler_followup = False
     if tag == dlms.ACTION_REQUEST_TAG:
         action_request = dlms.parse_action_request(payload)
         if action_state is not None:
@@ -209,7 +208,21 @@ def serve_hdlc_dlms_session(
         info = dlms.build_set_response(set_request.invoke_id)
     else:
         get_request = dlms.parse_get_request(payload)
-        awaits_scaler_followup = False
+        if (
+            get_request.class_id == dlms.REGISTER_CLASS_ID
+            and get_request.attribute_id == dlms.REGISTER_SCALER_UNIT_ATTRIBUTE
+        ):
+            # scaler_unit (атрибут 3) запрашивается ПЕРВЫМ, ДО value —
+            # см. ``hdlc_dlms.read_register_via_established_link``
+            # (2026-09-07: порядок запросов приведён в соответствие с
+            # подтверждённым реальным трафиком легитимного заводского
+            # клиента, который тоже читает scaler_unit перед value).
+            _serve_register_scaler_then_value(
+                conn, req_frame, get_request,
+                obis_values=obis_values, register_scalers=register_scalers or {},
+                error_injection=error_injection, attempt=attempt,
+            )
+            return
         if get_request.class_id == dlms.REGISTER_CLASS_ID:
             value = obis_values.get(get_request.obis)
             info = (
@@ -219,11 +232,6 @@ def serve_hdlc_dlms_session(
                 if value is not None
                 else dlms.build_get_response_error(get_request.invoke_id, OBJECT_UNDEFINED)
             )
-            # Значение прочитано успешно — Gateway (2026-08-19, найденный
-            # баг) сразу же дочитывает scaler_unit (атрибут 3) тем же
-            # обменом; эмулятор должен дождаться этого второго GET и
-            # ответить на него, иначе клиент зависнет на _recv_i_frame.
-            awaits_scaler_followup = value is not None
         else:
             encoded = (data_values or {}).get(get_request.obis)
             info = (
@@ -252,39 +260,68 @@ def serve_hdlc_dlms_session(
 
     conn.sendall(encoded)
 
-    if awaits_scaler_followup:
-        _serve_register_scaler_followup(
-            conn, req_frame, register_scalers=register_scalers or {},
-        )
 
-
-def _serve_register_scaler_followup(
-    conn: socket.socket, prev_req_frame: HdlcFrame, *, register_scalers: dict[bytes, int]
+def _serve_register_scaler_then_value(
+    conn: socket.socket,
+    scaler_req_frame: HdlcFrame,
+    scaler_request: object,
+    *,
+    obis_values: dict[bytes, int],
+    register_scalers: dict[bytes, int],
+    error_injection: ErrorInjection,
+    attempt: int,
 ) -> None:
-    """Отвечает на GET атрибута 3 (scaler_unit), который Gateway шлёт
-    сразу вслед за успешным чтением значения объекта класса Register
-    (см. ``hdlc_dlms.read_register_via_established_link``, 2026-08-19).
-
-    Ищет scaler по OBIS, реально указанному в ЭТОМ (втором) запросе, а
-    не по OBIS первого (value) запроса — с 2026-08-20 они могут
-    различаться (``dlms.VALUE_OBIS_OVERRIDES``, вендорская особенность
-    Risesun DTZY217: value и scaler_unit одного и того же физического
-    регистра читаются по разным OBIS)."""
-    scaler_frame = HdlcFrame.decode(_read_frame(conn))
-    scaler_payload = dlms.unwrap_llc(scaler_frame.information)
-    scaler_request = dlms.parse_get_request(scaler_payload)
+    """Отвечает на GET атрибута 3 (scaler_unit) объекта класса Register,
+    затем дожидается и обслуживает следующий GET — атрибута 2 (value),
+    возможно по ДРУГОМУ OBIS (``dlms.VALUE_OBIS_OVERRIDES``, вендорская
+    особенность Risesun DTZY217). Порядок «scaler_unit, затем value»
+    соответствует ``hdlc_dlms.read_register_via_established_link``
+    (2026-09-07). ``error_injection`` применяется к этому, ПЕРВОМУ
+    отправляемому серверу кадру — как и раньше, когда первым (и тогда
+    единственным) кадром был ответ на value."""
     scaler = register_scalers.get(scaler_request.obis, 0)
     scaler_value = datatypes.encode_structure(
         [datatypes.encode_integer(scaler), datatypes.encode_unsigned(0)]
     )
     info = dlms.build_get_response_data(scaler_request.invoke_id, scaler_value)
     response_frame = HdlcFrame(
-        destination=scaler_frame.source,
-        source=scaler_frame.destination,
-        control=control_information_frame(2, 3),
+        destination=scaler_req_frame.source,
+        source=scaler_req_frame.destination,
+        control=control_information_frame(1, 2),
         information=dlms.wrap_llc_response(info),
     )
-    conn.sendall(response_frame.encode())
+    encoded = response_frame.encode()
+
+    if error_injection.force_crc_error and attempt <= error_injection.fail_attempts:
+        corrupted = bytearray(encoded)
+        corrupted[-3] ^= 0xFF  # портим младший байт FCS перед закрывающим флагом
+        conn.sendall(bytes(corrupted))
+        return
+
+    if error_injection.force_partial_disconnect and attempt <= error_injection.fail_attempts:
+        conn.sendall(encoded[: len(encoded) // 2])
+        return
+
+    conn.sendall(encoded)
+
+    value_frame = HdlcFrame.decode(_read_frame(conn))
+    value_payload = dlms.unwrap_llc(value_frame.information)
+    value_request = dlms.parse_get_request(value_payload)
+    value = obis_values.get(value_request.obis)
+    value_info = (
+        dlms.build_get_response_data(
+            value_request.invoke_id, datatypes.encode_double_long_unsigned(value)
+        )
+        if value is not None
+        else dlms.build_get_response_error(value_request.invoke_id, OBJECT_UNDEFINED)
+    )
+    value_response_frame = HdlcFrame(
+        destination=value_frame.source,
+        source=value_frame.destination,
+        control=control_information_frame(2, 3),
+        information=dlms.wrap_llc_response(value_info),
+    )
+    conn.sendall(value_response_frame.encode())
 
 
 def _serve_load_profile(
