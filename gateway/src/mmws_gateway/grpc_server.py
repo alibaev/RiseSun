@@ -352,11 +352,24 @@ def _jsonable(value: object) -> object:
     return value
 
 
+# Синхронный gRPC-сервер на ThreadPoolExecutor — ReadRegister/
+# ReadLoadProfile ниже обычные блокирующие def-методы, каждый вызов
+# получает свой поток, поэтому несколько чтений РАЗНЫХ счётчиков уже
+# выполняются параллельно (пул call-home соединений потокобезопасен,
+# см. callhome.CallHomePool._lock) — само по себе это не менялось.
+# Поднято с прежних 10 до 20 (2026-09-07, по решению пользователя) —
+# Backend теперь запускает несколько параллельных воркеров
+# (settings.job_worker_concurrency, см. backend/app/main.py), и число
+# потоков здесь должно быть не меньше их числа, иначе лишние запросы
+# просто встанут в очередь ДО протокольного слоя, а не после него.
+DEFAULT_MAX_WORKERS = int(os.environ.get("MMWS_GATEWAY_MAX_WORKERS", "20"))
+
+
 def serve(
     *,
     host: str = "0.0.0.0",
     port: int = 50051,
-    max_workers: int = 10,
+    max_workers: int = DEFAULT_MAX_WORKERS,
     call_home_port: int | None = DEFAULT_CALL_HOME_PORT,
 ) -> tuple[grpc.Server, CallHomePool | None]:
     """``call_home_port=None`` отключает call-home пул (например, для

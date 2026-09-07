@@ -3,8 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from contextlib import asynccontextmanager
+
+# Без явного basicConfig корневой логгер молчит на уровне INFO (только
+# WARNING+), поэтому все logger.info() по всему backend'у — фоновые
+# циклы, воркер задач и т.п. — нигде не видны, хотя ошибки (warning/
+# exception) видны и создают ложное впечатление, что "логов вообще
+# нет" (найдено 2026-09-07 при проверке параллельных воркеров — не
+# было видно даже сообщения об их запуске).
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -40,7 +49,17 @@ _BILLING_PATH_PREFIX = "/api/v1/billing/"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     stop_event = asyncio.Event()
-    worker_task = asyncio.create_task(worker_loop(stop_event))
+    # settings.job_worker_concurrency параллельных воркеров вместо одного
+    # (2026-09-07, по решению пользователя) — очередь job'ов (особенно
+    # call-home-чтения, десятки-сотни секунд каждое) иначе обрабатывается
+    # строго последовательно и не масштабируется с ростом парка
+    # счётчиков; захват job'а уже был рассчитан на конкуренцию (см.
+    # job_worker._claim_next_job, SKIP LOCKED). Gateway и пул соединений
+    # к БД (db.py) увеличены соответственно.
+    worker_tasks = [
+        asyncio.create_task(worker_loop(stop_event, worker_id=i))
+        for i in range(settings.job_worker_concurrency)
+    ]
     heartbeat_task = asyncio.create_task(heartbeat_loop(stop_event))
     scheduler_task = asyncio.create_task(scheduler_loop(stop_event))
     offline_detector_task = asyncio.create_task(offline_detector_loop(stop_event))
@@ -49,7 +68,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         stop_event.set()
-        await worker_task
+        await asyncio.gather(*worker_tasks)
         await heartbeat_task
         await scheduler_task
         await offline_detector_task

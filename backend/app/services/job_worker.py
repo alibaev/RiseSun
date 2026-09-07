@@ -616,8 +616,14 @@ async def _process_one(db: AsyncSession) -> bool:
     return True
 
 
-async def worker_loop(stop_event: asyncio.Event) -> None:
-    logger.info("Воркер задач запущен (poll interval=%.1fs)", settings.job_poll_interval_s)
+async def worker_loop(stop_event: asyncio.Event, *, worker_id: int = 0) -> None:
+    """``worker_id`` — только для логов: main.py запускает
+    ``settings.job_worker_concurrency`` экземпляров этого цикла
+    параллельно (2026-09-07, было ровно 1 — см. config.py), захват
+    job'а (``_claim_next_job``, ``SELECT ... FOR UPDATE SKIP LOCKED``)
+    уже был рассчитан на несколько одновременных воркеров, просто
+    раньше не запускалось больше одного."""
+    logger.info("Воркер задач #%d запущен (poll interval=%.1fs)", worker_id, settings.job_poll_interval_s)
     while not stop_event.is_set():
         async with SessionLocal() as db:
             processed = await _process_one(db)
@@ -626,4 +632,4 @@ async def worker_loop(stop_event: asyncio.Event) -> None:
                 await asyncio.wait_for(stop_event.wait(), timeout=settings.job_poll_interval_s)
             except asyncio.TimeoutError:
                 pass
-    logger.info("Воркер задач остановлен")
+    logger.info("Воркер задач #%d остановлен", worker_id)
