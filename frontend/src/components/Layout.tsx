@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { Link, NavLink, Outlet } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { canManageGateways, canManageSystem, useAuth } from "../auth/AuthContext";
 import { NotificationBell } from "./NotificationBell";
 import { MENU } from "../constants/menu";
@@ -30,27 +30,38 @@ function isVisible(to: string, role: string | null): boolean {
 
 export function Layout() {
   const { role, logout } = useAuth();
+  const location = useLocation();
   const [openCategory, setOpenCategory] = useState<string | null>(null);
-  const navRef = useRef<HTMLElement | null>(null);
+  const [mobileOpen, setMobileOpen] = useState(false);
+
+  // Раскрыть категорию, в которой лежит текущая страница, чтобы при
+  // прямом переходе по ссылке (не через клик по меню) пункт был виден.
+  useEffect(() => {
+    const owner = MENU.find((category) => category.items.some((item) => item.to === location.pathname));
+    if (owner) setOpenCategory(owner.label);
+  }, [location.pathname]);
 
   useEffect(() => {
-    function onClickOutside(e: MouseEvent) {
-      if (navRef.current && !navRef.current.contains(e.target as Node)) {
-        setOpenCategory(null);
-      }
-    }
-    document.addEventListener("mousedown", onClickOutside);
-    return () => document.removeEventListener("mousedown", onClickOutside);
-  }, []);
+    setMobileOpen(false);
+  }, [location.pathname]);
+
+  const roleLabel = role ? ROLE_LABELS[role] ?? role : "";
+  const initials = roleLabel.slice(0, 2).toUpperCase();
 
   return (
     <div className="app-shell">
-      <header className="topbar">
-        <NavLink to="/" end className="brand">
-          MMWS
-        </NavLink>
-        <nav ref={navRef}>
-          <NavLink to="/" end>
+      <aside className={`sidebar${mobileOpen ? " open" : ""}`}>
+        <div className="brand-block">
+          <div className="brand-mark">M</div>
+          <div className="brand-text">
+            <NavLink to="/" end className="brand">
+              MMWS
+            </NavLink>
+            <div className="brand-sub">Protocol Gateway</div>
+          </div>
+        </div>
+        <nav className="sidebar-nav">
+          <NavLink to="/" end className={({ isActive }) => `nav-item${isActive ? " active" : ""}`}>
             Дашборд
           </NavLink>
           {MENU.map((category) => {
@@ -58,17 +69,26 @@ export function Layout() {
             if (visibleItems.length === 0) return null;
             const open = openCategory === category.label;
             return (
-              <div key={category.label} className={`nav-group${open ? " open" : ""}`}>
-                <button type="button" onClick={() => setOpenCategory(open ? null : category.label)}>
-                  {category.label} <span className="caret">▾</span>
+              <div key={category.label} className={`nav-category${open ? " open" : ""}`}>
+                <button
+                  type="button"
+                  className="nav-category-toggle"
+                  onClick={() => setOpenCategory(open ? null : category.label)}
+                >
+                  <span>{category.label}</span>
+                  <span className="caret">▾</span>
                 </button>
                 {open && (
-                  <div className="nav-dropdown" onClick={() => setOpenCategory(null)}>
+                  <div className="nav-subitems">
                     {visibleItems.map((item) => (
-                      <Link key={item.label} to={item.to}>
+                      <NavLink
+                        key={item.label}
+                        to={item.to}
+                        className={({ isActive }) => `nav-subitem${isActive ? " active" : ""}`}
+                      >
                         <span>{item.label}</span>
                         {!item.implemented && <span className="stub-tag">нет backend</span>}
-                      </Link>
+                      </NavLink>
                     ))}
                   </div>
                 )}
@@ -76,15 +96,31 @@ export function Layout() {
             );
           })}
         </nav>
-        <div className="topbar-user">
-          <NotificationBell />
-          <span>{role ? ROLE_LABELS[role] ?? role : ""}</span>
-          <button onClick={logout}>Выйти</button>
+        <div className="sidebar-foot">© 2026 MMWS</div>
+      </aside>
+
+      {mobileOpen && <div className="sidebar-overlay show" onClick={() => setMobileOpen(false)} />}
+
+      <div className="main">
+        <div className="topbar">
+          <button className="burger" aria-label="Меню" onClick={() => setMobileOpen((v) => !v)}>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+              <path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            </svg>
+          </button>
+          <div className="topbar-user">
+            <NotificationBell />
+            <div className="avatar">{initials}</div>
+            <span className="role-label">{roleLabel}</span>
+            <button className="secondary" onClick={logout}>
+              Выйти
+            </button>
+          </div>
         </div>
-      </header>
-      <main className="content">
-        <Outlet />
-      </main>
+        <main className="content">
+          <Outlet />
+        </main>
+      </div>
     </div>
   );
 }
