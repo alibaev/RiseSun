@@ -254,20 +254,26 @@ def serve_hdlc_dlms_session(
 
     if awaits_scaler_followup:
         _serve_register_scaler_followup(
-            conn, req_frame, obis=get_request.obis, register_scalers=register_scalers or {},
+            conn, req_frame, register_scalers=register_scalers or {},
         )
 
 
 def _serve_register_scaler_followup(
-    conn: socket.socket, prev_req_frame: HdlcFrame, *, obis: bytes, register_scalers: dict[bytes, int]
+    conn: socket.socket, prev_req_frame: HdlcFrame, *, register_scalers: dict[bytes, int]
 ) -> None:
     """Отвечает на GET атрибута 3 (scaler_unit), который Gateway шлёт
     сразу вслед за успешным чтением значения объекта класса Register
-    (см. ``hdlc_dlms.read_register_via_established_link``, 2026-08-19)."""
+    (см. ``hdlc_dlms.read_register_via_established_link``, 2026-08-19).
+
+    Ищет scaler по OBIS, реально указанному в ЭТОМ (втором) запросе, а
+    не по OBIS первого (value) запроса — с 2026-08-20 они могут
+    различаться (``dlms.VALUE_OBIS_OVERRIDES``, вендорская особенность
+    Risesun DTZY217: value и scaler_unit одного и того же физического
+    регистра читаются по разным OBIS)."""
     scaler_frame = HdlcFrame.decode(_read_frame(conn))
     scaler_payload = dlms.unwrap_llc(scaler_frame.information)
     scaler_request = dlms.parse_get_request(scaler_payload)
-    scaler = register_scalers.get(obis, 0)
+    scaler = register_scalers.get(scaler_request.obis, 0)
     scaler_value = datatypes.encode_structure(
         [datatypes.encode_integer(scaler), datatypes.encode_unsigned(0)]
     )

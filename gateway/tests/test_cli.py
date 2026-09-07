@@ -9,7 +9,10 @@ from mmws_gateway.protocols import dlms
 
 SERIAL = "202006003607"
 PASSWORD = "12345678"
-OBIS = "1.1.1.8.0.ff"
+# Родовой OBIS для теста — намеренно НЕ "1.1.1.8.0.ff" (суммарная
+# активная энергия), у которого с 2026-08-20 есть вендорский override
+# value-OBIS (dlms.VALUE_OBIS_OVERRIDES, см. test_integration_hdlc_dlms.py).
+OBIS = "1.1.1.7.0.ff"
 OBIS_VALUES = {dlms.parse_obis(OBIS): 1234567}
 
 

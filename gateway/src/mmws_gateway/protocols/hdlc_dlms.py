@@ -80,7 +80,14 @@ def read_register_via_established_link(
     объект вообще не поддерживает scaler_unit (data-access-error на
     GET атрибута 3 — актуально для параметров класса Data, обычно
     читаемых через этот же путь с явно переданным class_id=1),
-    возвращается сырое значение без изменений."""
+    возвращается сырое значение без изменений.
+
+    Для отдельных регистров (см. ``dlms.VALUE_OBIS_OVERRIDES``) сам
+    атрибут 2 (value) читается по ДРУГОМУ OBIS, чем переданный ``obis``
+    — вендорская особенность Risesun DTZY217, подтверждённая реальным
+    трафиком (см. dlms.py). scaler_unit при этом всегда запрашивается
+    по исходному, переданному ``obis`` — именно там он подтверждённо
+    доступен."""
     server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
     client_addr = DEFAULT_CLIENT_ADDRESS
 
@@ -93,7 +100,9 @@ def read_register_via_established_link(
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))  # бросает AuthFailedError при отказе
 
     parsed_obis = dlms.parse_obis(obis)
-    request = dlms.build_get_request(parsed_obis, class_id=class_id)
+    value_obis = dlms.VALUE_OBIS_OVERRIDES.get(obis, obis)
+    parsed_value_obis = dlms.parse_obis(value_obis) if value_obis != obis else parsed_obis
+    request = dlms.build_get_request(parsed_value_obis, class_id=class_id)
     _send_i_frame(
         transport, server_addr, client_addr, send_seq=1, recv_seq=1,
         information=dlms.wrap_llc_command(request),

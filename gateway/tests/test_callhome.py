@@ -207,7 +207,10 @@ def test_read_via_call_home_succeeds_after_ignored_snrm_attempts():
     serial = "202001002352"
     addr6 = bytes.fromhex("522300012020")
     password = b"12345678"
-    obis = "1.1.1.8.0.ff"
+    # Родовой OBIS для теста — намеренно НЕ "1.1.1.8.0.ff" (суммарная
+    # активная энергия), у которого с 2026-08-20 есть вендорский override
+    # value-OBIS (dlms.VALUE_OBIS_OVERRIDES, см. test_integration_hdlc_dlms.py).
+    obis = "1.1.1.7.0.ff"
     obis_values = {dlms.parse_obis(obis): 1234567}
 
     pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10)

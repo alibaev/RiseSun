@@ -15,7 +15,12 @@ from mmws_gateway.transport import TcpTransport, TransportConfig
 
 SERIAL = "202006003607"
 PASSWORD = b"12345678"
-OBIS = "1.1.1.8.0.ff"
+# Родовой OBIS для тестов, не завязанных на конкретную семантику
+# показания — намеренно НЕ "1.1.1.8.0.ff" (суммарная активная энергия),
+# у которого с 2026-08-20 есть вендорский override value-OBIS
+# (dlms.VALUE_OBIS_OVERRIDES) — см. test_register_read_applies_scaler
+# ниже, где это специально проверяется.
+OBIS = "1.1.1.7.0.ff"
 OBIS_VALUES = {dlms.parse_obis(OBIS): 1234567}
 
 
@@ -36,13 +41,14 @@ def _read(
     password: bytes = PASSWORD,
     timeout_ms: int = 1000,
     retries: int = 1,
+    obis: str = OBIS,
 ):
     config = TransportConfig(host=server.host, port=server.port, timeout_ms=timeout_ms, max_retries=1)
 
     def operation():
         with TcpTransport(config) as transport:
             return hdlc_dlms.read_register(
-                transport, serial=SERIAL, password=password, obis=OBIS
+                transport, serial=SERIAL, password=password, obis=obis
             )
 
     return run_with_retries(operation, max_retries=retries)
@@ -59,16 +65,41 @@ def test_register_read_applies_scaler():
     4507.70 отображалось в MMWS как 450770 — атрибут 3 (scaler_unit)
     читался счётчиком реального трафика, но в коде не применялся. Сырое
     значение 450770 при scaler=-2 (0.01) должно превращаться в 4507.7."""
+    generic_obis = "1.1.1.9.0.ff"
     counter = ConnectionCounter()
     handler = make_hdlc_dlms_handler(
         password=PASSWORD,
-        obis_values={dlms.parse_obis(OBIS): 450770},
+        obis_values={dlms.parse_obis(generic_obis): 450770},
         error_injection=ErrorInjection(),
         counter=counter,
-        register_scalers={dlms.parse_obis(OBIS): -2},
+        register_scalers={dlms.parse_obis(generic_obis): -2},
     )
     with ThreadedEmulatorServer(handler) as server:
-        value = _read(server)
+        value = _read(server, obis=generic_obis)
+    assert value == 4507.7
+
+
+def test_register_read_applies_value_obis_override_for_risesun_energy():
+    """Повторное появление того же бага на живом счётчике 202306004113
+    (2026-08-20): для суммарной активной энергии (`1.1.1.8.0.ff`)
+    value и scaler_unit одного и того же физического регистра на самом
+    деле лежат по РАЗНЫМ OBIS (dlms.VALUE_OBIS_OVERRIDES, подтверждено
+    реальным трафиком легитимного приложения, см. DECISIONS.md) — value
+    по вендорскому `1.1.60.50.0.ff`, scaler_unit по стандартному
+    `1.1.1.8.0.ff`. Эмулятор должен получить два разных GET на разные
+    OBIS и результат должен быть верно масштабирован."""
+    energy_obis = "1.1.1.8.0.ff"
+    vendor_value_obis = "1.1.60.50.0.ff"
+    counter = ConnectionCounter()
+    handler = make_hdlc_dlms_handler(
+        password=PASSWORD,
+        obis_values={dlms.parse_obis(vendor_value_obis): 450770},
+        error_injection=ErrorInjection(),
+        counter=counter,
+        register_scalers={dlms.parse_obis(energy_obis): -2},
+    )
+    with ThreadedEmulatorServer(handler) as server:
+        value = _read(server, obis=energy_obis)
     assert value == 4507.7
 
 
