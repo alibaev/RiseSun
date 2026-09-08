@@ -161,6 +161,71 @@ def test_pool_sliding_window_evicts_oldest():
         pool.stop()
 
 
+def test_pool_per_serial_limit_evicts_oldest_same_serial():
+    """2026-09-08 (по просьбе пользователя) — лимит на ОДИН счётчик,
+    независимый от глобального окна: если один и тот же серийник
+    занимает больше ``max_per_serial`` held-соединений, вытесняется
+    самое старое ИЗ ЕГО ЖЕ соединений (а не глобально самое старое,
+    которое могло бы принадлежать другому счётчику)."""
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10, max_per_serial=2)
+    pool.start()
+    try:
+        addr6 = bytes.fromhex("522300012020")  # -> 202001002352
+        c1 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c1.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.2)
+        c2 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c2.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.2)
+        assert pool.pending_count("202001002352") == 2
+
+        c1.settimeout(2)
+        c3 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c3.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.2)
+
+        # лимит на счётчик = 2 -> c1 (самое старое ИЗ ЭТОГО серийника) вытеснено
+        assert pool.pending_count("202001002352") == 2
+        with pytest.raises((ConnectionResetError, OSError, socket.timeout)):
+            data = c1.recv(1)
+            if data == b"":
+                raise ConnectionResetError("closed")
+        for s in (c1, c2, c3):
+            try:
+                s.close()
+            except OSError:
+                pass
+    finally:
+        pool.stop()
+
+
+def test_pool_per_serial_limit_does_not_affect_other_serials():
+    """Лимит считается ОТДЕЛЬНО по каждому серийнику — held-соединения
+    ДРУГОГО счётчика не вытесняются, даже если первый уже упёрся в свой
+    лимит."""
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10, max_per_serial=1)
+    pool.start()
+    try:
+        addr6_a = bytes.fromhex("522300012020")  # -> 202001002352
+        addr6_b = bytes.fromhex("134100062320")  # -> 202306004113
+        c1 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c1.sendall(_build_dummy_dlt645_frame(addr6_a))
+        time.sleep(0.2)
+        c2 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c2.sendall(_build_dummy_dlt645_frame(addr6_b))
+        time.sleep(0.2)
+
+        assert pool.pending_count("202001002352") == 1
+        assert pool.pending_count("202306004113") == 1
+        for s in (c1, c2):
+            try:
+                s.close()
+            except OSError:
+                pass
+    finally:
+        pool.stop()
+
+
 def test_list_seen_serials_persists_after_sliding_window_eviction():
     """Этап 6 (обнаружение новых счётчиков) — список опознанных
     серийников не должен теряться при вытеснении held-соединения из

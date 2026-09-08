@@ -65,8 +65,19 @@ logger = logging.getLogger("mmws_gateway.callhome")
 # каждые несколько секунд не даёт GPRS-модему счётчика "отдышаться" для
 # полноценного HDLC/DLMS-обмена — правдоподобная причина того, что
 # AARE не приходит даже на УЖЕ claim()-нутых (номинально защищённых от
-# вытеснения) соединениях. Увеличено с запасом на рост парка.
-DEFAULT_WINDOW_SIZE = 300
+# вытеснения) соединениях. Увеличено 300 (с запасом на рост парка) ->
+# 1000 (по прямой просьбе пользователя 2026-09-08, тот же запас с
+# кратно большим потолком — см. DEFAULT_MAX_PER_SERIAL ниже про новый
+# per-meter лимит, введённый тем же изменением).
+DEFAULT_WINDOW_SIZE = 1000
+# По просьбе пользователя 2026-09-08: сколько соединений ОДНОГО и того
+# же счётчика могут одновременно занимать место в пуле — без этого
+# лимита один "шумный" счётчик, агрессивно переоткрывающий соединения
+# (см. docstring класса ниже, п.2 — реальное подтверждённое поведение),
+# мог бы забить своими же повторами весь пул целиком, вытесняя чужие.
+# Проверка — уже ПОСЛЕ опознания серийника (в момент admit серийник ещё
+# не известен), см. ``CallHomePool._identify``.
+DEFAULT_MAX_PER_SERIAL = 10
 # Подтверждено на практике 2026-08-18 на заведомо СВЕЖЕМ (только что
 # принятом, см. DEFAULT_MAX_CLAIM_AGE_S) соединении: ответ на SNRM
 # приходит стабильно и предсказуемо — просто с задержкой около 7-10с
@@ -273,10 +284,12 @@ class CallHomePool:
         bind_host: str = "0.0.0.0",
         bind_port: int,
         window_size: int = DEFAULT_WINDOW_SIZE,
+        max_per_serial: int = DEFAULT_MAX_PER_SERIAL,
     ) -> None:
         self._bind_host = bind_host
         self._bind_port = bind_port
         self._window_size = window_size
+        self._max_per_serial = max_per_serial
         self._lock = threading.Lock()
         self._pool: dict[int, _PooledConnection] = {}  # порядок вставки = порядок подключения
         self._next_conn_no = 0
@@ -388,8 +401,30 @@ class CallHomePool:
                 rest += more
             addr6 = header[1:7]
             pc.serial = serial_from_dlt645_address(addr6)
+            evicted = None
             with self._lock:
                 self._seen_serials.setdefault(pc.serial, time.time())
+                # Лимит на ОДИН счётчик (DEFAULT_MAX_PER_SERIAL) — серийник
+                # известен только теперь, поэтому проверяется здесь, а не в
+                # _admit(). Вытесняем самое старое ЧУЖОЕ (по этому же
+                # серийнику) held-соединение, если лимит уже выбран без pc.
+                same_serial = [
+                    p for p in self._pool.values() if p.serial == pc.serial and p.conn_no != pc.conn_no
+                ]
+                if len(same_serial) >= self._max_per_serial:
+                    oldest = same_serial[0]  # self._pool упорядочен по вставке
+                    del self._pool[oldest.conn_no]
+                    evicted = oldest
+            if evicted is not None:
+                evicted.cancelled.set()
+                try:
+                    evicted.raw_sock.close()
+                except OSError:
+                    pass
+                logger.info(
+                    "Вытеснено соединение #%d — у счётчика %s уже %d held-соединений (лимит на счётчик)",
+                    evicted.conn_no, pc.serial, self._max_per_serial,
+                )
             logger.info("Call-home: соединение #%d опознано как счётчик %s", pc.conn_no, pc.serial)
         except (socket.timeout, OSError):
             return
