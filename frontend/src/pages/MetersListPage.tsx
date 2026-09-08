@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError } from "../api/client";
 import { canManageMeters, useAuth } from "../auth/AuthContext";
+import { exportToExcel } from "../lib/exportExcel";
 import { formatValue } from "../lib/format";
 import type { Meter, ProtocolProfile } from "../api/types";
 
@@ -62,6 +63,24 @@ export function MetersListPage() {
   // сразу видел, что появилось новое оборудование, ждущее активации.
   const installedRows = useMemo(() => rows.filter((m) => m.status === "installed"), [rows]);
   const activeRows = useMemo(() => rows.filter((m) => m.status === "active"), [rows]);
+
+  function handleExportActive() {
+    exportToExcel(
+      "meters-active",
+      "Активные счётчики",
+      activeRows.map((m) => ({
+        "Серийный номер": m.serial_number,
+        "Физический адрес": m.physical_address ?? "",
+        Ампер: m.rated_current_amps ?? "",
+        "IP-адрес": m.ip_address ? (m.port ? `${m.ip_address}:${m.port}` : m.ip_address) : "",
+        Протокол: m.protocol_profile ? PROFILE_LABELS[m.protocol_profile] : "",
+        Местоположение: m.location ?? "",
+        Статус: m.is_online ? "online" : "offline",
+        Показание: formatValue(m.last_reading_value),
+        "Дата показания": m.last_read_at ? new Date(m.last_read_at).toLocaleString("ru-RU") : "",
+      }))
+    );
+  }
 
   function openActivate(meter: Meter) {
     setActivatingMeter(meter);
@@ -194,6 +213,9 @@ export function MetersListPage() {
           <h2>Активные — {activeRows.length}</h2>
           <div className="btn-group">
             <button onClick={load}>Обновить</button>
+            <button onClick={handleExportActive} disabled={activeRows.length === 0}>
+              Экспорт в Excel
+            </button>
           </div>
         </div>
         {meters !== null && activeRows.length === 0 && <p>Активных счётчиков нет.</p>}

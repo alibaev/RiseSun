@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../api/client";
+import { exportToExcel } from "../lib/exportExcel";
 import type { ObisEntry } from "../api/types";
 
 export function ObisCatalogPage() {
@@ -13,9 +14,27 @@ export function ObisCatalogPage() {
       .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось загрузить карту OBIS-кодов"));
   }, []);
 
+  function handleExport() {
+    if (!entries) return;
+    exportToExcel(
+      "obis-catalog",
+      "OBIS-коды",
+      entries.map((e) => ({
+        "№": e.number,
+        "OBIS-код": e.obis,
+        Название: e.label,
+        Описание: e.description,
+        "Источник в коде": e.source,
+      }))
+    );
+  }
+
   return (
     <div>
-      <h1>Карта OBIS-кодов</h1>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <h1>Карта OBIS-кодов</h1>
+        {entries !== null && entries.length > 0 && <button onClick={handleExport}>Экспорт в Excel</button>}
+      </div>
       <p className="hint">
         Все OBIS-коды, реально используемые в системе, с пояснением, что каждый из них означает/опрашивает. Список
         не претендует на полноту словаря производителя (см. OBIS.xlsx) — только коды с подтверждённым или
