@@ -49,7 +49,24 @@ from .errors import GatewayError
 
 logger = logging.getLogger("mmws_gateway.callhome")
 
-DEFAULT_WINDOW_SIZE = 10
+
+# Найдено 2026-09-08 при разборе таймаутов AARQ/AARE: окно в 10
+# ГЛОБАЛЬНО на весь пул (см. `_admit`/`claim` — фильтрация по serial
+# идёт по всему self._pool, вытеснение при переполнении не привязано
+# к конкретному счётчику) подбиралось во времена, когда одновременно
+# было активно на порядок меньше счётчиков. При реальном парке ~150
+# счётчиков (см. DECISIONS.md, «Массовая активация 141 счётчика»)
+# окно=10 держит одновременно held лишь ~7% парка — Gateway вынужден
+# принудительно закрывать (`evicted.raw_sock.close()`) почти каждое
+# новое соединение почти сразу после приёма (подтверждено tcpdump +
+# логами 2026-09-08: ~51к принятых/эвикшенов за 2ч при 138 различных
+# IP, распределение равномерное — каждый счётчик реконнектится каждые
+# ~6-7с, не единичный "шумный" счётчик). Форсированный обрыв TCP-сессии
+# каждые несколько секунд не даёт GPRS-модему счётчика "отдышаться" для
+# полноценного HDLC/DLMS-обмена — правдоподобная причина того, что
+# AARE не приходит даже на УЖЕ claim()-нутых (номинально защищённых от
+# вытеснения) соединениях. Увеличено с запасом на рост парка.
+DEFAULT_WINDOW_SIZE = 300
 # Подтверждено на практике 2026-08-18 на заведомо СВЕЖЕМ (только что
 # принятом, см. DEFAULT_MAX_CLAIM_AGE_S) соединении: ответ на SNRM
 # приходит стабильно и предсказуемо — просто с задержкой около 7-10с
@@ -137,11 +154,32 @@ class DlT645FilteringSocket:
     перед КАЖДЫМ кадром через хук
     ``transport.TcpTransport.reset_frame_seeking()``
     (``protocols.hdlc.read_frame_from_transport``) — вызывающему коду
-    (см. ниже) вызывать его вручную больше не нужно."""
+    (см. ниже) вызывать его вручную больше не нужно.
+
+    ВАЖНО (третий баг, найденный 2026-09-08 экспериментом с ожиданием
+    AARE 150с вместо 45с, см. DECISIONS.md): ``socket.settimeout()`` в
+    Python ограничивает КАЖДЫЙ отдельный ``recv()`` по отдельности, а не
+    операцию целиком. Раньше вызывающий код (``read_via_call_home``)
+    вызывал ``settimeout(association_timeout_ms)`` ОДИН раз перед
+    ожиданием AARE, полагая, что это единый бюджет времени — но если по
+    сокету прилетал ХОТЬ ОДИН байт (даже отфильтровываемый здесь как
+    шум — например, keepalive-заглушка ``0x00``), каждый внутренний
+    ``self._sock.recv()``, понадобившийся, чтобы этот байт съесть,
+    заново получал ПОЛНЫЙ таймаут — реальное ожидание могло растянуться
+    заметно дальше настроенного значения незаметно для логов
+    (подтверждено байтовым разбором: 150с от AARQ фактически стали
+    ~233с из-за одного шумового пакета). ``set_deadline()`` ниже даёт
+    вызывающему коду абсолютный wall-clock дедлайн вместо этого:
+    ``_raw_recv()`` — единственная точка, откуда происходит любое
+    чтение из нижележащего сокета (напрямую или через
+    ``_raw_recv_exact``/``recv``), — пересчитывает остаток времени и
+    выставляет ``settimeout()`` заново ПЕРЕД каждым отдельным вызовом,
+    так что накопленное время не может незаметно продлеваться шумом."""
 
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
         self._seeking = True
+        self._deadline: float | None = None
 
     def reset_seeking(self) -> None:
         """Включает фильтрацию заново перед следующим кадром — вызывается
@@ -150,7 +188,17 @@ class DlT645FilteringSocket:
         SNRM — см. docstring класса, второй найденный баг)."""
         self._seeking = True
 
+    def set_deadline(self, deadline: float | None) -> None:
+        """Включает (``deadline`` — абсолютное unix-время) или выключает
+        (``None``) режим единого дедлайна на всю последовательность
+        чтений — см. docstring класса, третий найденный баг. Пока
+        дедлайн включён, обычные вызовы ``settimeout()`` игнорируются:
+        дедлайн главнее и не должен незаметно продлеваться извне."""
+        self._deadline = deadline
+
     def settimeout(self, timeout_s: float) -> None:
+        if self._deadline is not None:
+            return
         self._sock.settimeout(timeout_s)
 
     def sendall(self, data: bytes) -> None:
@@ -159,10 +207,18 @@ class DlT645FilteringSocket:
     def close(self) -> None:
         self._sock.close()
 
+    def _raw_recv(self, n: int) -> bytes:
+        if self._deadline is not None:
+            remaining = self._deadline - time.time()
+            if remaining <= 0:
+                raise socket.timeout("Дедлайн ожидания ответа счётчика истёк")
+            self._sock.settimeout(remaining)
+        return self._sock.recv(n)
+
     def _raw_recv_exact(self, n: int) -> bytes:
         buf = bytearray()
         while len(buf) < n:
-            chunk = self._sock.recv(n - len(buf))
+            chunk = self._raw_recv(n - len(buf))
             if not chunk:
                 raise ConnectionError("Соединение закрыто во время чтения опережающего кадра")
             buf += chunk
@@ -181,9 +237,9 @@ class DlT645FilteringSocket:
         if not self._seeking:
             # Уже внутри кадра, начало которого нашли ранее — отдаём
             # байты как есть, без какой-либо фильтрации.
-            return self._sock.recv(bufsize)
+            return self._raw_recv(bufsize)
         while True:
-            first = self._sock.recv(1)
+            first = self._raw_recv(1)
             if not first:
                 return b""
             if first == b"\x00":
@@ -453,8 +509,14 @@ def read_via_call_home(
             # SNRM/UA прошёл — доставку AARQ дальше подтверждает сам TCP
             # (ACK), так что смысла пересылать SNRM снова нет. Просто
             # терпеливо ждём AARE/GET-response на том же transport, без
-            # разрыва сессии.
-            filtering_sock.settimeout(association_timeout_ms / 1000)
+            # разрыва сессии. Абсолютный дедлайн (не settimeout()) — см.
+            # DlT645FilteringSocket.set_deadline и DECISIONS.md,
+            # «эксперимент с ожиданием AARE 150с» (2026-09-08): без
+            # этого случайный шумовой байт (например, keepalive) молча
+            # продлевал бы реальное ожидание намного дальше
+            # association_timeout_ms. Дедлайн покрывает AARQ->AARE и
+            # последующий GET->GET-response этой же попытки целиком.
+            filtering_sock.set_deadline(time.time() + association_timeout_ms / 1000)
             try:
                 value = hdlc_dlms.read_register_via_established_link(
                     transport, serial=serial, password=password, obis=obis

@@ -63,6 +63,45 @@ def test_filtering_socket_skips_dlt645_frame_and_zero_bytes():
         client_sock.close()
 
 
+def test_filtering_socket_deadline_is_absolute_not_reset_by_noise():
+    """Регрессия найденного 2026-09-08 бага (см. DECISIONS.md,
+    «эксперимент с ожиданием AARE 150с»): ``socket.settimeout()``
+    ограничивает КАЖДЫЙ ``recv()`` по отдельности, а не операцию
+    целиком — шумовой байт (например, keepalive-заглушка ``0x00``),
+    прилетевший до истечения таймаута, незаметно обнулял отсчёт и
+    продлевал реальное ожидание. ``set_deadline()`` должен держать
+    единый абсолютный дедлайн независимо от того, сколько
+    отфильтровываемых байт прилетает по пути."""
+    server_sock, client_sock = socket.socketpair()
+    try:
+        def trickle() -> None:
+            # 5 нулевых байт с паузами по 0.3с (t=0.3..1.5) — каждый
+            # укладывается в старый per-recv таймаут по отдельности, но
+            # суммарно должен быть отсечён единым дедлайном в 1.0с.
+            for _ in range(5):
+                time.sleep(0.3)
+                try:
+                    server_sock.sendall(b"\x00")
+                except OSError:
+                    return
+
+        threading.Thread(target=trickle, daemon=True).start()
+
+        filtering = DlT645FilteringSocket(client_sock)
+        filtering.set_deadline(time.time() + 1.0)
+        start = time.time()
+        with pytest.raises(socket.timeout):
+            filtering.recv(64)
+        elapsed = time.time() - start
+        # До фикса шум продлевал бы ожидание минимум до последнего
+        # прилетевшего байта (t=1.5) плюс ещё один полный таймаут сверху
+        # (~2.5с); с фиксом должно уложиться в дедлайн (~1.0с).
+        assert elapsed < 1.5
+    finally:
+        client_sock.close()
+        server_sock.close()
+
+
 def test_read_frame_from_transport_filters_dlt645_noise_between_frames():
     """Найденный баг (2026-09-07, сообщение пользователя — при чтении
     профиля нагрузки счётчик "передаёт что-то нечитаемое, без чёткого

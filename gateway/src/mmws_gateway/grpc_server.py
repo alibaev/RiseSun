@@ -47,8 +47,27 @@ def _do_read(request: gateway_pb2.ReadRegisterRequest, call_home_pool: CallHomeP
         # больший общий бюджет времени даёт больше шансов на удачное
         # совпадение по таймингу за счёт большего числа held-соединений,
         # которые успеют смениться за время ожидания.
+        max_wait_s = 150.0
+        extra: dict = {}
+        if request.timeout_ms:
+            # Ручной оверрайд ожидания AARE на ОДНОМ конкретном вызове —
+            # 2026-09-08, эксперимент по DECISIONS.md (байтовая
+            # диагностика tcpdump показала ровно 45с полной тишины после
+            # AARQ, неизвестно — "долго отвечает" это или "никогда").
+            # Поле `timeout_ms` в proto для call_home=true раньше
+            # игнорировалось; ноль (по умолчанию) сохраняет прежнее
+            # поведение без изменений. max_wait_s расширен под тот же
+            # бюджет, чтобы общий цикл не оборвал попытку раньше
+            # собственно AARE-таймаута.
+            extra["association_timeout_ms"] = request.timeout_ms
+            max_wait_s = max(max_wait_s, request.timeout_ms / 1000 + 20)
         return read_via_call_home(
-            call_home_pool, serial=request.serial, password=password, obis=request.obis, max_wait_s=150.0
+            call_home_pool,
+            serial=request.serial,
+            password=password,
+            obis=request.obis,
+            max_wait_s=max_wait_s,
+            **extra,
         )
 
     timeout_ms = request.timeout_ms or DEFAULT_TIMEOUT_MS
