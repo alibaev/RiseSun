@@ -166,6 +166,34 @@ async def test_trigger_one_creates_run_and_one_job_per_meter(db_session):
 
 
 @pytest.mark.asyncio
+async def test_trigger_one_skips_deactivated_meters(db_session):
+    """2026-09-08 — найдено при разборе вкладки «Некорректные данные»:
+    _trigger_one раньше вообще не проверял is_active, поэтому
+    деактивированный счётчик, всё ещё числящийся в scheduled_job.meter_ids,
+    продолжал бы получать job'ы (и впустую тратить попытки воркеров),
+    даже будучи выключенным из обслуживания."""
+    meter_ids = await _seed_gateway_and_meters(db_session, n=3)
+    deactivated = await db_session.get(Meter, meter_ids[0])
+    deactivated.is_active = False
+    await db_session.commit()
+
+    scheduled_job = ScheduledJob(
+        name="Опрос всех", cron_expression="*/5 * * * *", job_type="read_current",
+        operation_params={"obis": "1.1.1.8.0.ff"}, meter_ids=meter_ids,
+    )
+    db_session.add(scheduled_job)
+    await db_session.commit()
+
+    await _trigger_one(db_session, scheduled_job)
+
+    runs = (await db_session.execute(select(ScheduledJobRun))).scalars().all()
+    assert runs[0].meters_total == 2
+
+    jobs = (await db_session.execute(select(Job).where(Job.scheduled_job_run_id == runs[0].id))).scalars().all()
+    assert {j.meter_id for j in jobs} == set(meter_ids[1:])
+
+
+@pytest.mark.asyncio
 async def test_trigger_one_poll_profile_creates_one_job_per_meter_per_obis(db_session):
     """2026-09-08, по просьбе пользователя — расписание с профилем
     опроса создаёт по отдельной Job на каждую пару счётчик×OBIS

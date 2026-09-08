@@ -99,6 +99,65 @@ async def test_activate_requires_manage_meters_permission(client, db_session):
 
 
 @pytest.mark.asyncio
+async def test_activate_invalid_meter_restores_is_active(client, db_session):
+    """Вкладка «Некорректные данные» (2026-09-08) — счётчик, переведённый в
+    MeterStatus.INVALID вместе с is_active=False (повреждённый серийник),
+    должен снова стать активным после исправления данных и повторной
+    активации — иначе он останется невидим для планировщика навсегда."""
+    root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    gateway = Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    db_session.add(gateway)
+    await db_session.flush()
+    meter = Meter(
+        serial_number="20d901230058", is_call_home=True, status=MeterStatus.INVALID,
+        is_active=False, gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.commit()
+    await db_session.refresh(meter)
+    token = await _login(client, "root", "pass1234")
+
+    fix_resp = await client.put(
+        f"/api/meters/{meter.id}",
+        json={"serial_number": "201901230058"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert fix_resp.status_code == 200, fix_resp.text
+    assert fix_resp.json()["serial_number"] == "201901230058"
+
+    resp = await client.post(
+        f"/api/meters/{meter.id}/activate",
+        json={"protocol_profile": "hdlc_dlms", "password": "12345678"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "active"
+    assert body["is_active"] is True
+
+
+@pytest.mark.asyncio
+async def test_update_meter_duplicate_serial_number_conflicts(client, db_session):
+    root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    gateway = Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    db_session.add(gateway)
+    await db_session.flush()
+    db_session.add(Meter(serial_number="900000000099", is_call_home=True, status=MeterStatus.ACTIVE, gateway_id=gateway.id))
+    invalid_meter = Meter(serial_number="20d901230058", is_call_home=True, status=MeterStatus.INVALID, gateway_id=gateway.id)
+    db_session.add(invalid_meter)
+    await db_session.commit()
+    await db_session.refresh(invalid_meter)
+    token = await _login(client, "root", "pass1234")
+
+    resp = await client.put(
+        f"/api/meters/{invalid_meter.id}",
+        json={"serial_number": "900000000099"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_list_meters_includes_status_field(client, db_session):
     root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
     gateway = Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)

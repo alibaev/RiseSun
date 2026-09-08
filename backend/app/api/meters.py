@@ -183,6 +183,11 @@ async def activate_meter(
     if body.model is not None:
         meter.model = body.model
     meter.status = MeterStatus.ACTIVE
+    # Счётчик мог быть переведён в INVALID вместе с is_active=False (см.
+    # MeterStatus.INVALID) — активация должна вернуть его в обслуживание,
+    # иначе он останется невидим для планировщика даже после исправления
+    # serial_number/ip_address.
+    meter.is_active = True
 
     await record_audit(
         db, user_id=user.id, action="meter.activate", object_type="meter",
@@ -219,6 +224,17 @@ async def update_meter(
         object_id=str(meter.id), ip_address=request.client.host if request.client else None,
         details={"changed_fields": list(changes.keys())},
     )
+    try:
+        await db.flush()
+    except IntegrityError:
+        # serial_number уникален (см. вкладку «Некорректные данные»,
+        # 2026-09-08) — без этой проверки правка на уже занятый номер
+        # роняла бы 500 вместо понятной ошибки.
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Счётчик с таким серийным номером уже существует",
+        )
     await db.commit()
     await db.refresh(meter)
     return meter

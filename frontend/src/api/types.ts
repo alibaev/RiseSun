@@ -4,8 +4,11 @@ export type ProtocolProfile = "mode_c" | "mode_e" | "hdlc_dlms";
 
 // Этап 6 — обнаружение новых счётчиков по call-home. INSTALLED: найден
 // автоматически, ещё не активирован (нет пароля/протокола). ACTIVE:
-// полностью настроен, доступен для операций.
-export type MeterStatus = "installed" | "active";
+// полностью настроен, доступен для операций. INVALID (2026-09-08):
+// серийный номер повреждён при обнаружении (буквы вместо цифр) —
+// физический адрес не вычисляется, чтение невозможно, пока не
+// исправлен на вкладке «Некорректные данные».
+export type MeterStatus = "installed" | "active" | "invalid";
 
 export type GatewayStatus = "pending" | "approved" | "disabled";
 

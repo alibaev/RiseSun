@@ -115,6 +115,11 @@ class MeterCreate(BaseModel):
 
 
 class MeterUpdate(BaseModel):
+    # 2026-09-08 — правка серийного номера нужна для вкладки «Некорректные
+    # данные» (счётчики с повреждённым при обнаружении серийником, см.
+    # MeterStatus.INVALID): администратор исправляет serial_number на
+    # настоящий перед повторной активацией.
+    serial_number: str | None = Field(default=None, min_length=1, max_length=32)
     ip_address: str | None = None
     port: int | None = Field(default=None, gt=0, le=65535)
     is_call_home: bool | None = None

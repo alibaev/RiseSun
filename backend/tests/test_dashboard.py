@@ -40,7 +40,9 @@ async def test_dashboard_counts_meters_jobs_readings(client, db_session):
     offline_meter = Meter(
         serial_number="offline1", ip_address="127.0.0.1", port=4060,
         protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
-        gateway_id=gateway.id, last_seen_at=now - timedelta(hours=5),
+        # >24ч — за пределами meter_offline_timeout_s (86400с, поднят с
+        # 3600с 2026-09-08, см. DECISIONS.md) и не сегодняшний день.
+        gateway_id=gateway.id, last_seen_at=now - timedelta(hours=30),
     )
     db_session.add_all([online_meter, offline_meter])
     await db_session.flush()
