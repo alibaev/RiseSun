@@ -242,7 +242,7 @@ export function MeterDetailPage() {
         </div>
         <dl className="info-grid">
           <dt>IP-адрес</dt>
-          <dd>{meter.ip_address ? `${meter.ip_address}:${meter.port}` : "—"}</dd>
+          <dd>{meter.ip_address ? (meter.port ? `${meter.ip_address}:${meter.port}` : meter.ip_address) : "—"}</dd>
           <dt>Протокольный профиль</dt>
           <dd>{meter.protocol_profile ?? "не указан (ожидает активации)"}</dd>
           <dt>Местоположение</dt>
