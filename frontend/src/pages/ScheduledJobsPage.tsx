@@ -9,6 +9,18 @@ const JOB_TYPE_LABELS: Record<ScheduledJobType, string> = {
   read_load_profile: "Профиль нагрузки",
 };
 
+const JOB_STATUS_LABELS: Record<string, string> = {
+  queued: "в очереди",
+  running: "выполняется",
+  succeeded: "успешно",
+  failed: "ошибка",
+};
+
+// Свернуть журнал в сводку "Все — N" вместо построчного списка, когда
+// строк слишком много для чтения (2026-09-08, по просьбе пользователя
+// — профиль опроса на весь парк даёт тысячи задач за один запуск).
+const RUN_JOBS_LIST_THRESHOLD = 30;
+
 const RUN_STATUS_LABELS: Record<string, string> = {
   running: "выполняется",
   succeeded: "успешно",
@@ -383,12 +395,27 @@ export function ScheduledJobsPage() {
                                 {expandedRunId === r.id && (
                                   <tr>
                                     <td colSpan={4}>
-                                      {runJobs.map((rj) => (
-                                        <div key={rj.id}>
-                                          {meters.find((m) => m.id === rj.meter_id)?.serial_number ?? rj.meter_id}: {rj.status}
-                                          {rj.error && ` — ${rj.error.code}: ${rj.error.message}`}
+                                      {runJobs.length > RUN_JOBS_LIST_THRESHOLD ? (
+                                        <div>
+                                          {Object.entries(
+                                            runJobs.reduce<Record<string, number>>((acc, rj) => {
+                                              acc[rj.status] = (acc[rj.status] ?? 0) + 1;
+                                              return acc;
+                                            }, {})
+                                          ).map(([status, count]) => (
+                                            <div key={status}>
+                                              {JOB_STATUS_LABELS[status] ?? status} — Все ({count})
+                                            </div>
+                                          ))}
                                         </div>
-                                      ))}
+                                      ) : (
+                                        runJobs.map((rj) => (
+                                          <div key={rj.id}>
+                                            {meters.find((m) => m.id === rj.meter_id)?.serial_number ?? rj.meter_id}: {rj.status}
+                                            {rj.error && ` — ${rj.error.code}: ${rj.error.message}`}
+                                          </div>
+                                        ))
+                                      )}
                                     </td>
                                   </tr>
                                 )}
