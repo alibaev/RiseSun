@@ -31,6 +31,7 @@ from .api import (
     jobs,
     meters,
     notifications,
+    obis_catalog,
     parameter_schemes,
     poll_profiles,
     scheduled_jobs,
@@ -151,6 +152,7 @@ app.include_router(users.router)
 app.include_router(audit.router)
 app.include_router(parameter_schemes.router)
 app.include_router(poll_profiles.router)
+app.include_router(obis_catalog.router)
 app.include_router(scheduled_jobs.router)
 app.include_router(notifications.router)
 app.include_router(billing.router)

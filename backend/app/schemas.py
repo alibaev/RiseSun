@@ -257,6 +257,16 @@ class ApplySchemeRequest(BaseModel):
     meter_ids: list[int] = Field(min_length=1)
 
 
+class ObisEntryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    number: str
+    obis: str
+    label: str
+    description: str
+    source: str
+
+
 _OBIS_PATTERN = r"^[0-9a-fA-F]{1,2}(\.[0-9a-fA-F]{1,2}){5}$"
 
 
