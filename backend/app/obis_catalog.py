@@ -263,4 +263,40 @@ OBIS_CATALOG: list[ObisEntry] = [
         description="Export Active Energy\\T3 (2.8.3 в obis1.xlsx) — не проверено живым трафиком.",
         source="obis1.xlsx (пользователь, 2026-09-08)",
     ),
+    # 027-030: даны пользователем в чате 2026-09-08 отдельно от obis1.xlsx —
+    # семейство "Total Active Energy (Fundamental)" (D=128/0x80), отличное
+    # от уже занесённого под #010-013 "Total Active Energy" (D=80/0x50);
+    # то же правило перевода C.D.E -> 1.1.<hex(C)>.<hex(D)>.<hex(E)>.ff.
+    ObisEntry(
+        number="027",
+        obis="1.1.60.80.0.ff",
+        label="Суммарная активная энергия (fundamental), всего",
+        description=(
+            "Total Active Energy (Fundamental)\\Total (96.128.0) — вариант основной гармоники "
+            "суммарной активной энергии, отдельный объект от 1.1.60.50.0.ff (#010). Не проверено "
+            "живым трафиком."
+        ),
+        source="пользователь (чат, 2026-09-08)",
+    ),
+    ObisEntry(
+        number="028",
+        obis="1.1.60.80.1.ff",
+        label="Суммарная активная энергия (fundamental), тариф 1",
+        description="Total Active Energy (Fundamental)\\T1 (96.128.1) — не проверено живым трафиком.",
+        source="пользователь (чат, 2026-09-08)",
+    ),
+    ObisEntry(
+        number="029",
+        obis="1.1.60.80.2.ff",
+        label="Суммарная активная энергия (fundamental), тариф 2",
+        description="Total Active Energy (Fundamental)\\T2 (96.128.2) — не проверено живым трафиком.",
+        source="пользователь (чат, 2026-09-08)",
+    ),
+    ObisEntry(
+        number="030",
+        obis="1.1.60.80.3.ff",
+        label="Суммарная активная энергия (fundamental), тариф 3",
+        description="Total Active Energy (Fundamental)\\T3 (96.128.3) — не проверено живым трафиком.",
+        source="пользователь (чат, 2026-09-08)",
+    ),
 ]
