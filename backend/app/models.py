@@ -398,6 +398,31 @@ class ParameterScheme(Base):
     )
 
 
+class PollProfile(Base):
+    """Именованный профиль опроса (по просьбе пользователя, 2026-09-08):
+    набор OBIS-кодов с пояснением, что каждый из них опрашивает, и
+    признаком включён/выключен — используется в ``ScheduledJob``
+    (``operation_params.poll_profile_id`` для ``job_type=read_current``)
+    вместо одного жёстко заданного OBIS, чтобы одно расписание могло
+    опрашивать сразу НЕСКОЛЬКО показателей у каждого счётчика группы за
+    один тик (см. ``services.scheduler._resolve_payloads`` — на каждый
+    включённый пункт профиля создаётся отдельная ``Job``, как и для
+    остальных OBIS, независимо наблюдаемая/переповторяемая)."""
+
+    __tablename__ = "poll_profiles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # [{"obis": "1.1.1.8.0.ff", "label": "Суммарная активная энергия", "enabled": true}, ...]
+    items: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now(), nullable=True
+    )
+
+
 class ScheduledJob(Base):
     """Расписание автоматического опроса группы счётчиков (ТЗ п.4.2.6).
 
@@ -413,10 +438,12 @@ class ScheduledJob(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     cron_expression: Mapped[str] = mapped_column(String(64), nullable=False)
     job_type: Mapped[str] = mapped_column(String(32), nullable=False)  # "read_current" | "read_load_profile"
-    # read_current -> {"obis": "..."}; read_load_profile ->
-    # {"window_hours": N} — каждый запуск запрашивает последние N часов
-    # (скользящее окно от текущего момента, а не от прошлого запуска —
-    # проще и устойчивее к пропущенным/задержанным тикам планировщика).
+    # read_current -> {"obis": "..."} ИЛИ {"poll_profile_id": N}
+    # (2026-09-08 — см. PollProfile: несколько OBIS за один тик,
+    # каждый отдельной Job); read_load_profile -> {"window_hours": N}
+    # — каждый запуск запрашивает последние N часов (скользящее окно от
+    # текущего момента, а не от прошлого запуска — проще и устойчивее к
+    # пропущенным/задержанным тикам планировщика).
     operation_params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     meter_ids: Mapped[list] = mapped_column(JSONB, nullable=False)
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Literal
 
@@ -254,6 +255,44 @@ class ParameterSchemeOut(BaseModel):
 
 class ApplySchemeRequest(BaseModel):
     meter_ids: list[int] = Field(min_length=1)
+
+
+_OBIS_PATTERN = r"^[0-9a-fA-F]{1,2}(\.[0-9a-fA-F]{1,2}){5}$"
+
+
+class PollProfileItem(BaseModel):
+    obis: str = Field(min_length=1, max_length=32)
+    label: str = Field(min_length=1, max_length=255, description="Пояснение — что именно опрашивает этот OBIS")
+    enabled: bool = True
+
+    @field_validator("obis")
+    @classmethod
+    def _validate_obis(cls, value: str) -> str:
+        if not re.match(_OBIS_PATTERN, value):
+            raise ValueError(f"OBIS-код должен быть вида A.B.C.D.E.F (hex-поля), получено: {value!r}")
+        return value
+
+
+class PollProfileCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    description: str | None = None
+    items: list[PollProfileItem] = Field(min_length=1)
+
+
+class PollProfileUpdate(BaseModel):
+    description: str | None = None
+    items: list[PollProfileItem] | None = None
+
+
+class PollProfileOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    description: str | None
+    items: list[dict]
+    created_at: datetime
+    updated_at: datetime | None
 
 
 class JobOut(BaseModel):

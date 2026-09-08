@@ -32,6 +32,7 @@ from .api import (
     meters,
     notifications,
     parameter_schemes,
+    poll_profiles,
     scheduled_jobs,
     users,
 )
@@ -149,6 +150,7 @@ app.include_router(jobs.router)
 app.include_router(users.router)
 app.include_router(audit.router)
 app.include_router(parameter_schemes.router)
+app.include_router(poll_profiles.router)
 app.include_router(scheduled_jobs.router)
 app.include_router(notifications.router)
 app.include_router(billing.router)

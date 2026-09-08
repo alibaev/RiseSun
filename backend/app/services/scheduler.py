@@ -41,7 +41,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..db import SessionLocal
-from ..models import Job, JobStatus, Meter, MeterReading, ScheduledJob, ScheduledJobRun, ScheduledJobRunStatus
+from ..models import (
+    Job,
+    JobStatus,
+    Meter,
+    MeterReading,
+    PollProfile,
+    ScheduledJob,
+    ScheduledJobRun,
+    ScheduledJobRunStatus,
+)
 
 logger = logging.getLogger("mmws_backend.scheduler")
 
@@ -69,7 +78,16 @@ def _is_due(scheduled_job: ScheduledJob, now: datetime) -> bool:
         return False
 
 
-def _build_job_payload(scheduled_job: ScheduledJob) -> dict:
+async def _resolve_payloads(db: AsyncSession, scheduled_job: ScheduledJob) -> list[dict]:
+    """Возвращает список payload для Job этого расписания — как правило
+    один элемент (как было исторически), но для ``read_current`` с
+    привязанным профилем опроса (``operation_params.poll_profile_id`` —
+    2026-09-08, по просьбе пользователя) один на каждый ВКЛЮЧЁННЫЙ пункт
+    профиля: каждый OBIS читается отдельной Job (тот же принцип, что и
+    у ``parameter_schemes.apply_scheme`` — одна пара параметр×счётчик =
+    одна независимо наблюдаемая/переповторяемая задача), а не одним
+    payload на весь тик. Пустой список означает «профиль не найден —
+    пропустить тик» (см. ``_trigger_one``), а не «нет счётчиков»."""
     if scheduled_job.job_type == "read_load_profile":
         window_hours = scheduled_job.operation_params.get("window_hours", _DEFAULT_LOAD_PROFILE_WINDOW_HOURS)
         now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -79,11 +97,21 @@ def _build_job_payload(scheduled_job: ScheduledJob) -> dict:
         }
         if scheduled_job.operation_params.get("obis"):
             payload["obis"] = scheduled_job.operation_params["obis"]
-        return payload
+        return [payload]
     if scheduled_job.job_type == "read_rated_current":
-        return {}  # OBIS фиксирован в job_worker.RATED_CURRENT_OBIS, не параметризуется
+        return [{}]  # OBIS фиксирован в job_worker.RATED_CURRENT_OBIS, не параметризуется
     # read_current
-    return {"obis": scheduled_job.operation_params.get("obis", "1.1.1.8.0.ff")}
+    profile_id = scheduled_job.operation_params.get("poll_profile_id")
+    if profile_id is not None:
+        profile = await db.get(PollProfile, profile_id)
+        if profile is None:
+            logger.warning(
+                "Расписание id=%s (%s) ссылается на удалённый профиль опроса id=%s — пропуск тика",
+                scheduled_job.id, scheduled_job.name, profile_id,
+            )
+            return []
+        return [{"obis": item["obis"]} for item in profile.items if item.get("enabled", True)]
+    return [{"obis": scheduled_job.operation_params.get("obis", "1.1.1.8.0.ff")}]
 
 
 def _bishkek_day_bounds_utc(now: datetime) -> tuple[datetime, datetime]:
@@ -139,25 +167,38 @@ async def _trigger_one(db: AsyncSession, scheduled_job: ScheduledJob) -> None:
     )
     meters = [m for m in meters if m.id not in already_outstanding]
 
-    payload = _build_job_payload(scheduled_job)
+    payloads = await _resolve_payloads(db, scheduled_job)
+    if not payloads:
+        # Профиль опроса удалён — уже залогировано в _resolve_payloads.
+        scheduled_job.last_run_at = now
+        await db.commit()
+        return
+
+    # (meter, payload) — по одной паре на каждый OBIS профиля (обычно
+    # payloads из одного элемента, как было исторически до профилей
+    # опроса, 2026-09-08).
+    pairs: list[tuple[Meter, dict]] = []
     skip_reason = "у всех счётчиков группы уже есть невыполненная задача этого типа"
     if scheduled_job.job_type == "read_current" and scheduled_job.operation_params.get("skip_if_read_today"):
-        already_read = await _already_read_today_meter_ids(
-            db, [m.id for m in meters], payload["obis"], now
-        )
-        meters = [m for m in meters if m.id not in already_read]
-        skip_reason = "все счётчики группы уже опрошены за сегодня (Asia/Bishkek)"
+        for payload in payloads:
+            already_read = await _already_read_today_meter_ids(
+                db, [m.id for m in meters], payload["obis"], now
+            )
+            pairs.extend((m, payload) for m in meters if m.id not in already_read)
+        skip_reason = "все счётчики группы уже опрошены сегодня по всем OBIS профиля (Asia/Bishkek)"
     elif scheduled_job.job_type == "read_rated_current":
         # Токовый класс (rated_current_amps) — статичный паспортный
         # параметр, не меняется у счётчика со временем, поэтому здесь
         # НЕТ суточного окна — счётчик, у которого он уже известен,
         # исключается НАВСЕГДА, а не до конца текущих суток (в отличие
         # от skip_if_read_today выше).
-        meters = [m for m in meters if m.rated_current_amps is None]
+        pairs = [(m, payloads[0]) for m in meters if m.rated_current_amps is None]
         skip_reason = "у всех счётчиков группы токовый класс уже известен"
+    else:
+        pairs = [(m, payload) for m in meters for payload in payloads]
 
     scheduled_job.last_run_at = now
-    if not meters:
+    if not pairs:
         await db.commit()
         logger.info(
             "Расписание id=%s (%s) сработало — %s, пропуск",
@@ -165,15 +206,16 @@ async def _trigger_one(db: AsyncSession, scheduled_job: ScheduledJob) -> None:
         )
         return
 
+    distinct_meter_ids = {meter.id for meter, _ in pairs}
     run = ScheduledJobRun(
         scheduled_job_id=scheduled_job.id,
         status=ScheduledJobRunStatus.RUNNING,
-        meters_total=len(meters),
+        meters_total=len(distinct_meter_ids),
     )
     db.add(run)
     await db.flush()
 
-    for meter in meters:
+    for meter, payload in pairs:
         db.add(
             Job(
                 job_type=scheduled_job.job_type,
@@ -185,8 +227,8 @@ async def _trigger_one(db: AsyncSession, scheduled_job: ScheduledJob) -> None:
 
     await db.commit()
     logger.info(
-        "Расписание id=%s (%s) сработало — run id=%s, счётчиков: %d",
-        scheduled_job.id, scheduled_job.name, run.id, len(meters),
+        "Расписание id=%s (%s) сработало — run id=%s, счётчиков: %d, задач: %d",
+        scheduled_job.id, scheduled_job.name, run.id, len(distinct_meter_ids), len(pairs),
     )
 
 

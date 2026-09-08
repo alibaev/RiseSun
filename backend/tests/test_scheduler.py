@@ -16,13 +16,14 @@ from app.models import (
     JobStatus,
     Meter,
     MeterReading,
+    PollProfile,
     ProtocolProfile,
     ScheduledJob,
     ScheduledJobRun,
     User,
     UserRole,
 )
-from app.services.scheduler import _build_job_payload, _is_due, _run_once, _trigger_one, next_fire_time
+from app.services.scheduler import _is_due, _resolve_payloads, _run_once, _trigger_one, next_fire_time
 
 
 async def _seed_gateway_and_meters(db, n: int = 2) -> list[int]:
@@ -80,28 +81,64 @@ def test_is_due_false_for_invalid_cron_expression():
     assert _is_due(job, datetime.now(timezone.utc)) is False
 
 
-def test_build_job_payload_read_current_default_obis():
+@pytest.mark.asyncio
+async def test_resolve_payloads_read_current_default_obis(db_session):
     job = ScheduledJob(name="x", cron_expression="* * * * *", job_type="read_current", operation_params={}, meter_ids=[])
-    assert _build_job_payload(job) == {"obis": "1.1.1.8.0.ff"}
+    assert await _resolve_payloads(db_session, job) == [{"obis": "1.1.1.8.0.ff"}]
 
 
-def test_build_job_payload_read_load_profile_window():
+@pytest.mark.asyncio
+async def test_resolve_payloads_read_load_profile_window(db_session):
     job = ScheduledJob(
         name="x", cron_expression="* * * * *", job_type="read_load_profile",
         operation_params={"window_hours": 6}, meter_ids=[],
     )
-    payload = _build_job_payload(job)
-    from_dt = datetime.fromisoformat(payload["from_iso"])
-    to_dt = datetime.fromisoformat(payload["to_iso"])
+    payloads = await _resolve_payloads(db_session, job)
+    assert len(payloads) == 1
+    from_dt = datetime.fromisoformat(payloads[0]["from_iso"])
+    to_dt = datetime.fromisoformat(payloads[0]["to_iso"])
     assert (to_dt - from_dt) == timedelta(hours=6)
 
 
-def test_build_job_payload_read_rated_current_is_empty():
+@pytest.mark.asyncio
+async def test_resolve_payloads_read_rated_current_is_empty(db_session):
     job = ScheduledJob(
         name="x", cron_expression="* * * * *", job_type="read_rated_current",
         operation_params={}, meter_ids=[],
     )
-    assert _build_job_payload(job) == {}
+    assert await _resolve_payloads(db_session, job) == [{}]
+
+
+@pytest.mark.asyncio
+async def test_resolve_payloads_poll_profile_returns_enabled_obis_only(db_session):
+    """2026-09-08, по просьбе пользователя — профиль опроса даёт по
+    одному payload на каждый ВКЛЮЧЁННЫЙ пункт, выключенные пропускаются."""
+    profile = PollProfile(
+        name="Профиль1",
+        items=[
+            {"obis": "1.1.1.8.0.ff", "label": "Активная энергия", "enabled": True},
+            {"obis": "1.1.32.7.0.ff", "label": "Напряжение фаза A", "enabled": True},
+            {"obis": "1.1.52.7.0.ff", "label": "Напряжение фаза B", "enabled": False},
+        ],
+    )
+    db_session.add(profile)
+    await db_session.commit()
+
+    job = ScheduledJob(
+        name="x", cron_expression="* * * * *", job_type="read_current",
+        operation_params={"poll_profile_id": profile.id}, meter_ids=[],
+    )
+    payloads = await _resolve_payloads(db_session, job)
+    assert payloads == [{"obis": "1.1.1.8.0.ff"}, {"obis": "1.1.32.7.0.ff"}]
+
+
+@pytest.mark.asyncio
+async def test_resolve_payloads_missing_poll_profile_returns_empty(db_session):
+    job = ScheduledJob(
+        name="x", cron_expression="* * * * *", job_type="read_current",
+        operation_params={"poll_profile_id": 999}, meter_ids=[],
+    )
+    assert await _resolve_payloads(db_session, job) == []
 
 
 @pytest.mark.asyncio
@@ -126,6 +163,47 @@ async def test_trigger_one_creates_run_and_one_job_per_meter(db_session):
     assert all(j.status == JobStatus.QUEUED for j in jobs)
     assert all(j.payload == {"obis": "1.1.1.8.0.ff"} for j in jobs)
     assert scheduled_job.last_run_at is not None
+
+
+@pytest.mark.asyncio
+async def test_trigger_one_poll_profile_creates_one_job_per_meter_per_obis(db_session):
+    """2026-09-08, по просьбе пользователя — расписание с профилем
+    опроса создаёт по отдельной Job на каждую пару счётчик×OBIS
+    (включённый пункт профиля), но meters_total в ScheduledJobRun
+    остаётся числом РАЗНЫХ счётчиков, не числом задач."""
+    meter_ids = await _seed_gateway_and_meters(db_session, n=2)
+    profile = PollProfile(
+        name="Профиль1",
+        items=[
+            {"obis": "1.1.1.8.0.ff", "label": "Активная энергия", "enabled": True},
+            {"obis": "1.1.32.7.0.ff", "label": "Напряжение фаза A", "enabled": True},
+        ],
+    )
+    db_session.add(profile)
+    await db_session.commit()
+
+    scheduled_job = ScheduledJob(
+        name="По профилю", cron_expression="*/5 * * * *", job_type="read_current",
+        operation_params={"poll_profile_id": profile.id}, meter_ids=meter_ids,
+    )
+    db_session.add(scheduled_job)
+    await db_session.commit()
+
+    await _trigger_one(db_session, scheduled_job)
+
+    runs = (await db_session.execute(select(ScheduledJobRun))).scalars().all()
+    assert len(runs) == 1
+    assert runs[0].meters_total == 2  # счётчиков, не задач
+
+    jobs = (await db_session.execute(select(Job).where(Job.scheduled_job_run_id == runs[0].id))).scalars().all()
+    assert len(jobs) == 4  # 2 счётчика × 2 OBIS
+    obis_per_meter = {}
+    for j in jobs:
+        obis_per_meter.setdefault(j.meter_id, set()).add(j.payload["obis"])
+    assert obis_per_meter == {
+        meter_ids[0]: {"1.1.1.8.0.ff", "1.1.32.7.0.ff"},
+        meter_ids[1]: {"1.1.1.8.0.ff", "1.1.32.7.0.ff"},
+    }
 
 
 @pytest.mark.asyncio
