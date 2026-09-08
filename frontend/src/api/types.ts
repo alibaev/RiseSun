@@ -26,6 +26,7 @@ export interface Gateway {
 export interface Meter {
   id: number;
   serial_number: string;
+  physical_address: string | null;
   ip_address: string | null;
   port: number | null;
   protocol_profile: ProtocolProfile | null;

@@ -129,6 +129,7 @@ class MeterOut(BaseModel):
 
     id: int
     serial_number: str
+    physical_address: str | None
     ip_address: str | None
     port: int | None
     is_call_home: bool
