@@ -2,30 +2,37 @@ import { useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "../api/client";
 import { canManageAutomation, useAuth } from "../auth/AuthContext";
 import { ConfirmModal } from "../components/ConfirmModal";
-import type { PollProfile, PollProfileItem } from "../api/types";
+import type { ObisEntry, PollProfile, PollProfileItem } from "../api/types";
 
 const OBIS_PATTERN = /^[0-9a-fA-F]{1,2}(\.[0-9a-fA-F]{1,2}){5}$/;
 
 const EMPTY_ITEM: PollProfileItem = { obis: "", label: "", enabled: true };
 
 function emptyForm(): { name: string; description: string; items: PollProfileItem[] } {
-  return { name: "", description: "", items: [{ ...EMPTY_ITEM }] };
+  return { name: "", description: "", items: [] };
 }
 
 export function PollProfilesPage() {
   const { role } = useAuth();
   const [profiles, setProfiles] = useState<PollProfile[] | null>(null);
+  const [catalog, setCatalog] = useState<ObisEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const [editingId, setEditingId] = useState<number | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState(emptyForm());
   const [pendingDelete, setPendingDelete] = useState<PollProfile | null>(null);
+  const [showCatalogPicker, setShowCatalogPicker] = useState(false);
 
   const loadAll = useCallback(async () => {
     setError(null);
     try {
-      setProfiles(await api.get<PollProfile[]>("/api/poll-profiles"));
+      const [p, c] = await Promise.all([
+        api.get<PollProfile[]>("/api/poll-profiles"),
+        api.get<ObisEntry[]>("/api/obis-catalog"),
+      ]);
+      setProfiles(p);
+      setCatalog(c);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Не удалось загрузить профили опроса");
     }
@@ -39,6 +46,7 @@ export function PollProfilesPage() {
     setEditingId(null);
     setForm(emptyForm());
     setShowForm(true);
+    setShowCatalogPicker(false);
     setError(null);
   }
 
@@ -46,6 +54,7 @@ export function PollProfilesPage() {
     setEditingId(p.id);
     setForm({ name: p.name, description: p.description ?? "", items: p.items.map((i) => ({ ...i })) });
     setShowForm(true);
+    setShowCatalogPicker(false);
     setError(null);
   }
 
@@ -58,6 +67,13 @@ export function PollProfilesPage() {
 
   function addItem() {
     setForm((prev) => ({ ...prev, items: [...prev.items, { ...EMPTY_ITEM }] }));
+  }
+
+  function addFromCatalog(entry: ObisEntry) {
+    setForm((prev) => {
+      if (prev.items.some((it) => it.obis === entry.obis)) return prev; // уже добавлен
+      return { ...prev, items: [...prev.items, { obis: entry.obis, label: entry.label, enabled: true }] };
+    });
   }
 
   function removeItem(index: number) {
@@ -183,10 +199,56 @@ export function PollProfilesPage() {
                   ))}
                 </tbody>
               </table>
+              <button onClick={() => setShowCatalogPicker((v) => !v)}>
+                {showCatalogPicker ? "Закрыть список кодов" : "+ добавить код из карты OBIS"}
+              </button>{" "}
               <button className="secondary" onClick={addItem}>
-                + строка
+                + строка вручную
               </button>{" "}
               <button onClick={handleSave}>Сохранить профиль</button>
+
+              {showCatalogPicker && (
+                <div className="card" style={{ marginTop: 12 }}>
+                  <p className="hint">
+                    Выберите код — посмотрите описание и нажмите «Добавить». Уже добавленные в этот профиль коды
+                    отмечены.
+                  </p>
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        <th>№</th>
+                        <th>OBIS-код</th>
+                        <th>Название</th>
+                        <th>Описание</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {catalog.map((entry) => {
+                        const alreadyAdded = form.items.some((it) => it.obis === entry.obis);
+                        return (
+                          <tr key={entry.number}>
+                            <td>{entry.number}</td>
+                            <td>{entry.obis}</td>
+                            <td>{entry.label}</td>
+                            <td>{entry.description}</td>
+                            <td>
+                              <button disabled={alreadyAdded} onClick={() => addFromCatalog(entry)}>
+                                {alreadyAdded ? "Добавлено" : "Добавить"}
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                  {catalog.length === 0 && (
+                    <p className="hint">
+                      Карта OBIS-кодов пуста — см. раздел «Параметры → Карта OBIS-кодов».
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </section>

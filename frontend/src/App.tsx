@@ -6,6 +6,7 @@ import { LoginPage } from "./pages/LoginPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { MetersListPage } from "./pages/MetersListPage";
 import { MeterDetailPage } from "./pages/MeterDetailPage";
+import { ObisCatalogPage } from "./pages/ObisCatalogPage";
 import { ParameterSchemesPage } from "./pages/ParameterSchemesPage";
 import { PollProfilesPage } from "./pages/PollProfilesPage";
 import { ScheduledJobsPage } from "./pages/ScheduledJobsPage";
@@ -26,6 +27,7 @@ export function App() {
             <Route path="/meters" element={<MetersListPage />} />
             <Route path="/meters/:id" element={<MeterDetailPage />} />
             <Route path="/schemes" element={<ParameterSchemesPage />} />
+            <Route path="/obis-catalog" element={<ObisCatalogPage />} />
             <Route path="/poll-profiles" element={<PollProfilesPage />} />
             <Route path="/scheduled-jobs" element={<ScheduledJobsPage />} />
             <Route path="/audit-log" element={<AuditLogPage />} />

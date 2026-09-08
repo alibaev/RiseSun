@@ -98,6 +98,16 @@ export interface ParameterScheme {
   updated_at: string | null;
 }
 
+// Карта OBIS-кодов (по просьбе пользователя, 2026-09-08) — справочник,
+// только чтение.
+export interface ObisEntry {
+  number: string;
+  obis: string;
+  label: string;
+  description: string;
+  source: string;
+}
+
 // Профили опроса (по просьбе пользователя, 2026-09-08) — именованный
 // набор OBIS-кодов с пояснением, что каждый опрашивает, и признаком
 // включён/выключен; используется в расписаниях вместо одного OBIS.

@@ -44,7 +44,7 @@ export const MENU: MenuCategory[] = [
       { label: "Схемы параметров", to: "/schemes", implemented: true },
       stub("Планы прошивок"),
       stub("Модели связи"),
-      stub("Карта OBIS-кодов"),
+      { label: "Карта OBIS-кодов", to: "/obis-catalog", implemented: true },
       stub("Коды событий"),
     ],
   },
