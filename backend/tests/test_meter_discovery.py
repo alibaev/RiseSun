@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy import select
 
-from app.core.security import hash_password
-from app.models import Gateway, GatewayStatus, Meter, MeterStatus, User, UserRole
+from app.core.security import decrypt_secret, hash_password
+from app.models import Gateway, GatewayStatus, Meter, MeterStatus, ProtocolProfile, ScheduledJob, User, UserRole
 from app.services.gateway_client import SeenSerial
 from app.services.meter_discovery import _run_once
 
@@ -43,6 +43,44 @@ async def test_creates_installed_meter_for_new_serial(db_session):
     assert meters[0].gateway_id == gateway.id
     assert meters[0].protocol_profile is None
     assert meters[0].password_encrypted is None
+
+
+@pytest.mark.asyncio
+async def test_known_test_serial_auto_activated_and_added_to_catchall_schedule(db_session):
+    """2026-09-08 (см. DECISIONS.md) — серийники 6 тестовых счётчиков,
+    удалённых в этот же день, при повторном обнаружении заводятся сразу
+    ACTIVE (пароль/профиль проставлены), а не INSTALLED, и добавляются в
+    расписание с самым большим существующим списком счётчиков (эвристика
+    "группа всех счётчиков", в отличие от узкой smoke-test группы)."""
+    gateway = await _seed_approved_gateway(db_session)
+    catchall = ScheduledJob(
+        name="Ежедневный опрос всех счётчиков", cron_expression="*/30 * * * *",
+        job_type="read_current", operation_params={}, meter_ids=[101, 102, 103],
+    )
+    smoke = ScheduledJob(
+        name="Smoke test", cron_expression="* * * * *",
+        job_type="read_current", operation_params={}, meter_ids=[999],
+    )
+    db_session.add_all([catchall, smoke])
+    await db_session.commit()
+
+    with patch(
+        "app.services.meter_discovery.list_call_home_serials",
+        new=AsyncMock(return_value=[SeenSerial(serial="202006003607", first_seen_unix=1755590400.0)]),
+    ):
+        await _run_once()
+
+    meters = (await db_session.execute(select(Meter))).scalars().all()
+    assert len(meters) == 1
+    meter = meters[0]
+    assert meter.status == MeterStatus.ACTIVE
+    assert meter.protocol_profile == ProtocolProfile.HDLC_DLMS
+    assert decrypt_secret(meter.password_encrypted) == b"12345678"
+
+    await db_session.refresh(catchall)
+    await db_session.refresh(smoke)
+    assert meter.id in catchall.meter_ids
+    assert meter.id not in smoke.meter_ids  # узкая группа не тронута
 
 
 @pytest.mark.asyncio
