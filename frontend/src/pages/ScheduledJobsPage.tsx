@@ -1,8 +1,8 @@
-import { Fragment, useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "../api/client";
 import { canManageAutomation, useAuth } from "../auth/AuthContext";
 import { ConfirmModal } from "../components/ConfirmModal";
-import type { Job, Meter, ScheduledJob, ScheduledJobRun, ScheduledJobType } from "../api/types";
+import type { Job, Meter, PollProfile, ScheduledJob, ScheduledJobRun, ScheduledJobType } from "../api/types";
 
 const JOB_TYPE_LABELS: Record<ScheduledJobType, string> = {
   read_current: "Текущие показания",
@@ -17,23 +17,59 @@ const RUN_STATUS_LABELS: Record<string, string> = {
 };
 
 function formatMeters(meters: Meter[], ids: number[]): string {
+  if (meters.length > 0 && ids.length === meters.length) return `Все (${ids.length})`;
   const bySerial = ids.map((id) => meters.find((m) => m.id === id)?.serial_number ?? `#${id}`);
   return bySerial.join(", ");
+}
+
+function formatOperationParams(job: ScheduledJob, profiles: PollProfile[]): string {
+  if (job.job_type === "read_current") {
+    const profileId = job.operation_params.poll_profile_id;
+    if (typeof profileId === "number") {
+      return `профиль «${profiles.find((p) => p.id === profileId)?.name ?? `#${profileId}`}»`;
+    }
+    return `OBIS ${job.operation_params.obis ?? "—"}`;
+  }
+  if (job.job_type === "read_load_profile") {
+    return `окно ${job.operation_params.window_hours ?? "—"} ч`;
+  }
+  return "—";
 }
 
 export function ScheduledJobsPage() {
   const { role } = useAuth();
   const [jobs, setJobs] = useState<ScheduledJob[] | null>(null);
   const [meters, setMeters] = useState<Meter[]>([]);
+  const [pollProfiles, setPollProfiles] = useState<PollProfile[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const [showCreate, setShowCreate] = useState(false);
   const [name, setName] = useState("");
   const [cron, setCron] = useState("0 * * * *");
   const [jobType, setJobType] = useState<ScheduledJobType>("read_current");
+  const [obisMode, setObisMode] = useState<"manual" | "profile">("manual");
   const [obis, setObis] = useState("1.1.1.8.0.ff");
+  const [selectedProfileId, setSelectedProfileId] = useState<number | null>(null);
   const [windowHours, setWindowHours] = useState("24");
-  const [selectedMeterIds, setSelectedMeterIds] = useState<Set<number>>(new Set());
+
+  // Выбор счётчиков — не полный чекбокс-список (2026-09-08, по просьбе
+  // пользователя: список из ~150 счётчиков неудобен), а режим "все" /
+  // "один по серийному номеру" (поиск клиентской фильтрацией по уже
+  // загруженному списку meters).
+  const [meterMode, setMeterMode] = useState<"all" | "single">("all");
+  const [singleMeterSearch, setSingleMeterSearch] = useState("");
+  const [selectedSingleMeter, setSelectedSingleMeter] = useState<Meter | null>(null);
+
+  const selectedMeterIds = useMemo(() => {
+    if (meterMode === "all") return new Set(meters.map((m) => m.id));
+    return selectedSingleMeter ? new Set([selectedSingleMeter.id]) : new Set<number>();
+  }, [meterMode, meters, selectedSingleMeter]);
+
+  const singleMeterMatches = useMemo(() => {
+    const q = singleMeterSearch.trim().toLowerCase();
+    if (!q) return [];
+    return meters.filter((m) => m.serial_number.toLowerCase().includes(q)).slice(0, 20);
+  }, [meters, singleMeterSearch]);
 
   const [pendingDelete, setPendingDelete] = useState<ScheduledJob | null>(null);
   const [expandedId, setExpandedId] = useState<number | null>(null);
@@ -44,12 +80,14 @@ export function ScheduledJobsPage() {
   const loadAll = useCallback(async () => {
     setError(null);
     try {
-      const [j, m] = await Promise.all([
+      const [j, m, p] = await Promise.all([
         api.get<ScheduledJob[]>("/api/scheduled-jobs"),
         api.get<Meter[]>("/api/meters"),
+        api.get<PollProfile[]>("/api/poll-profiles"),
       ]);
       setJobs(j);
       setMeters(m);
+      setPollProfiles(p);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Не удалось загрузить расписания");
     }
@@ -59,22 +97,21 @@ export function ScheduledJobsPage() {
     loadAll();
   }, [loadAll]);
 
-  function toggleMeter(meterId: number) {
-    setSelectedMeterIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(meterId)) next.delete(meterId);
-      else next.add(meterId);
-      return next;
-    });
-  }
-
   function handleCreate() {
     if (!name.trim() || selectedMeterIds.size === 0) {
-      setError("Укажите имя расписания и хотя бы один счётчик");
+      setError("Укажите имя расписания и хотя бы один счётчик (режим «один по номеру» — счётчик не выбран)");
+      return;
+    }
+    if (jobType === "read_current" && obisMode === "profile" && selectedProfileId === null) {
+      setError("Выберите профиль опроса");
       return;
     }
     const operation_params =
-      jobType === "read_current" ? { obis } : { window_hours: Number(windowHours) || 24 };
+      jobType === "read_current"
+        ? obisMode === "profile"
+          ? { poll_profile_id: selectedProfileId }
+          : { obis }
+        : { window_hours: Number(windowHours) || 24 };
 
     setError(null);
     api
@@ -88,7 +125,9 @@ export function ScheduledJobsPage() {
       .then(() => {
         setShowCreate(false);
         setName("");
-        setSelectedMeterIds(new Set());
+        setMeterMode("all");
+        setSelectedSingleMeter(null);
+        setSingleMeterSearch("");
         return loadAll();
       })
       .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось создать расписание"));
@@ -173,11 +212,45 @@ export function ScheduledJobsPage() {
                 </select>
               </label>
               {jobType === "read_current" ? (
-                <label>
-                  OBIS-код
+                <div>
+                  <label>
+                    <input
+                      type="radio"
+                      checked={obisMode === "manual"}
+                      onChange={() => setObisMode("manual")}
+                    />{" "}
+                    Один OBIS-код вручную
+                  </label>{" "}
+                  <label>
+                    <input
+                      type="radio"
+                      checked={obisMode === "profile"}
+                      onChange={() => setObisMode("profile")}
+                    />{" "}
+                    Профиль опроса (несколько OBIS)
+                  </label>
                   <br />
-                  <input value={obis} onChange={(e) => setObis(e.target.value)} />
-                </label>
+                  {obisMode === "manual" ? (
+                    <input value={obis} onChange={(e) => setObis(e.target.value)} />
+                  ) : (
+                    <select
+                      value={selectedProfileId ?? ""}
+                      onChange={(e) => setSelectedProfileId(e.target.value ? Number(e.target.value) : null)}
+                    >
+                      <option value="">— выберите профиль —</option>
+                      {pollProfiles.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name} ({p.items.filter((i) => i.enabled).length} OBIS)
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  {obisMode === "profile" && pollProfiles.length === 0 && (
+                    <p className="hint">
+                      Профилей опроса пока нет — создайте их на странице «Профили опроса».
+                    </p>
+                  )}
+                </div>
               ) : (
                 <label>
                   Окно, часов (от текущего момента при каждом запуске)
@@ -187,11 +260,46 @@ export function ScheduledJobsPage() {
               )}
               <div>
                 Счётчики:
-                {meters.map((m) => (
-                  <label key={m.id} style={{ display: "block" }}>
-                    <input type="checkbox" checked={selectedMeterIds.has(m.id)} onChange={() => toggleMeter(m.id)} /> {m.serial_number}
-                  </label>
-                ))}
+                <br />
+                <label>
+                  <input type="radio" checked={meterMode === "all"} onChange={() => setMeterMode("all")} /> Все ({meters.length})
+                </label>{" "}
+                <label>
+                  <input type="radio" checked={meterMode === "single"} onChange={() => setMeterMode("single")} /> Один по номеру
+                </label>
+                {meterMode === "single" && (
+                  <div>
+                    <input
+                      value={selectedSingleMeter ? selectedSingleMeter.serial_number : singleMeterSearch}
+                      placeholder="Начните вводить серийный номер..."
+                      onChange={(e) => {
+                        setSelectedSingleMeter(null);
+                        setSingleMeterSearch(e.target.value);
+                      }}
+                    />
+                    {!selectedSingleMeter && singleMeterMatches.length > 0 && (
+                      <ul>
+                        {singleMeterMatches.map((m) => (
+                          <li key={m.id}>
+                            <a
+                              href="#"
+                              onClick={(e) => {
+                                e.preventDefault();
+                                setSelectedSingleMeter(m);
+                                setSingleMeterSearch("");
+                              }}
+                            >
+                              {m.serial_number}
+                            </a>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {!selectedSingleMeter && singleMeterSearch.trim() && singleMeterMatches.length === 0 && (
+                      <p className="hint">Счётчики не найдены</p>
+                    )}
+                  </div>
+                )}
               </div>
               <button onClick={handleCreate}>Сохранить расписание</button>
             </div>
@@ -209,6 +317,7 @@ export function ScheduledJobsPage() {
               <th>Имя</th>
               <th>Cron</th>
               <th>Тип</th>
+              <th>Параметры</th>
               <th>Счётчики</th>
               <th>Статус</th>
               <th>Последний запуск</th>
@@ -227,6 +336,7 @@ export function ScheduledJobsPage() {
                   </td>
                   <td>{j.cron_expression}</td>
                   <td>{JOB_TYPE_LABELS[j.job_type]}</td>
+                  <td>{formatOperationParams(j, pollProfiles)}</td>
                   <td>{formatMeters(meters, j.meter_ids)}</td>
                   <td>{j.is_enabled ? "включено" : "выключено"}</td>
                   <td>{j.last_run_at ? new Date(j.last_run_at).toLocaleString("ru-RU") : "—"}</td>
@@ -244,7 +354,7 @@ export function ScheduledJobsPage() {
                 </tr>
                 {expandedId === j.id && (
                   <tr>
-                    <td colSpan={8}>
+                    <td colSpan={9}>
                       <strong>Журнал запусков</strong>
                       {runs.length === 0 && <p>Запусков ещё не было.</p>}
                       {runs.length > 0 && (

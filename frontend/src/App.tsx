@@ -7,6 +7,7 @@ import { DashboardPage } from "./pages/DashboardPage";
 import { MetersListPage } from "./pages/MetersListPage";
 import { MeterDetailPage } from "./pages/MeterDetailPage";
 import { ParameterSchemesPage } from "./pages/ParameterSchemesPage";
+import { PollProfilesPage } from "./pages/PollProfilesPage";
 import { ScheduledJobsPage } from "./pages/ScheduledJobsPage";
 import { AuditLogPage } from "./pages/AuditLogPage";
 import { UsersPage } from "./pages/UsersPage";
@@ -25,6 +26,7 @@ export function App() {
             <Route path="/meters" element={<MetersListPage />} />
             <Route path="/meters/:id" element={<MeterDetailPage />} />
             <Route path="/schemes" element={<ParameterSchemesPage />} />
+            <Route path="/poll-profiles" element={<PollProfilesPage />} />
             <Route path="/scheduled-jobs" element={<ScheduledJobsPage />} />
             <Route path="/audit-log" element={<AuditLogPage />} />
             <Route path="/users" element={<UsersPage />} />

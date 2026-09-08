@@ -98,6 +98,24 @@ export interface ParameterScheme {
   updated_at: string | null;
 }
 
+// Профили опроса (по просьбе пользователя, 2026-09-08) — именованный
+// набор OBIS-кодов с пояснением, что каждый опрашивает, и признаком
+// включён/выключен; используется в расписаниях вместо одного OBIS.
+export interface PollProfileItem {
+  obis: string;
+  label: string;
+  enabled: boolean;
+}
+
+export interface PollProfile {
+  id: number;
+  name: string;
+  description: string | null;
+  items: PollProfileItem[];
+  created_at: string;
+  updated_at: string | null;
+}
+
 // Этап 4 (ТЗ п.4.2.6) — расписание автоматического опроса.
 export type ScheduledJobType = "read_current" | "read_load_profile";
 

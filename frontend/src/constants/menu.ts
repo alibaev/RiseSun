@@ -55,6 +55,7 @@ export const MENU: MenuCategory[] = [
       stub("Опрос по GPRS"),
       stub("Опрос DCU"),
       stub("Опрос по PLC/RS485"),
+      { label: "Профили опроса", to: "/poll-profiles", implemented: true },
       { label: "Расписания опроса", to: "/scheduled-jobs", implemented: true },
       stub("Задачи параметров (Param Task Setting)"),
       stub("Обновление прошивки"),
