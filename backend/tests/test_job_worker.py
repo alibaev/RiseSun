@@ -28,6 +28,7 @@ from app.models import (
 from app.services.gateway_client import LoadProfileError, LoadProfileRow, ReadResult, WriteResult
 from app.services.job_worker import (
     RATED_CURRENT_OBIS,
+    reap_stale_running_jobs,
     _run_disconnect,
     _run_read_current,
     _run_read_load_profile,
@@ -539,3 +540,37 @@ async def test_reconnect_failure_records_audit_with_billing_source(db_session):
     assert audit_rows[0].source == "billing"
     assert audit_rows[0].result == "failure"
     assert audit_rows[0].details["batch_id"] == "b-test123"
+
+
+@pytest.mark.asyncio
+async def test_reap_stale_running_jobs_fails_orphaned_running_jobs(db_session):
+    """Найденный баг (2026-09-08): job, оставшаяся в RUNNING после
+    убитого перезапуском контейнера воркера, зависала так навсегда —
+    reap_stale_running_jobs (вызывается один раз при старте Backend,
+    см. main.py) обязана закрыть такие записи FAILED, не трогая ни
+    QUEUED, ни уже завершённые."""
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202006003607",
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    stale = Job(job_type="read_current", meter_id=meter.id, payload={}, status=JobStatus.RUNNING)
+    queued = Job(job_type="read_current", meter_id=meter.id, payload={}, status=JobStatus.QUEUED)
+    succeeded = Job(job_type="read_current", meter_id=meter.id, payload={}, status=JobStatus.SUCCEEDED)
+    db_session.add_all([stale, queued, succeeded])
+    await db_session.commit()
+
+    count = await reap_stale_running_jobs(db_session)
+
+    assert count == 1
+    await db_session.refresh(stale)
+    await db_session.refresh(queued)
+    await db_session.refresh(succeeded)
+    assert stale.status == JobStatus.FAILED
+    assert stale.error["code"] == "WORKER_RESTARTED"
+    assert stale.finished_at is not None
+    assert queued.status == JobStatus.QUEUED
+    assert succeeded.status == JobStatus.SUCCEEDED

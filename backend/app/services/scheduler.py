@@ -41,7 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..db import SessionLocal
-from ..models import Job, Meter, MeterReading, ScheduledJob, ScheduledJobRun, ScheduledJobRunStatus
+from ..models import Job, JobStatus, Meter, MeterReading, ScheduledJob, ScheduledJobRun, ScheduledJobRunStatus
 
 logger = logging.getLogger("mmws_backend.scheduler")
 
@@ -107,14 +107,40 @@ async def _already_read_today_meter_ids(
     return set(result.scalars().all())
 
 
+async def _outstanding_job_meter_ids(db: AsyncSession, meter_ids: list[int], job_type: str) -> set[int]:
+    """Счётчики, у которых уже есть НЕЗАВЕРШЁННЫЙ (QUEUED/RUNNING) Job
+    этого же job_type — от предыдущего срабатывания этого же
+    расписания, если воркер ещё не успел до него дойти. Без этой
+    проверки частый cron (`*/30 * * * *`) на медленной call-home
+    очереди (сотни секунд на попытку, низкий процент успеха) плодит
+    дубликаты быстрее, чем воркеры успевают их разбирать — найденный
+    баг, 2026-09-08: у части счётчиков накопилось по 14-15 одинаковых
+    QUEUED job'ов, а другие счётчики из той же группы так ни разу и не
+    были опробованы за ночь (FIFO-очередь тонет в дублях одних и тех
+    же счётчиков)."""
+    result = await db.execute(
+        select(Job.meter_id).where(
+            Job.meter_id.in_(meter_ids),
+            Job.job_type == job_type,
+            Job.status.in_((JobStatus.QUEUED, JobStatus.RUNNING)),
+        )
+    )
+    return set(result.scalars().all())
+
+
 async def _trigger_one(db: AsyncSession, scheduled_job: ScheduledJob) -> None:
     now = datetime.now(timezone.utc)
     meters = (
         await db.execute(select(Meter).where(Meter.id.in_(scheduled_job.meter_ids)))
     ).scalars().all()
 
+    already_outstanding = await _outstanding_job_meter_ids(
+        db, [m.id for m in meters], scheduled_job.job_type
+    )
+    meters = [m for m in meters if m.id not in already_outstanding]
+
     payload = _build_job_payload(scheduled_job)
-    skip_reason = None
+    skip_reason = "у всех счётчиков группы уже есть невыполненная задача этого типа"
     if scheduled_job.job_type == "read_current" and scheduled_job.operation_params.get("skip_if_read_today"):
         already_read = await _already_read_today_meter_ids(
             db, [m.id for m in meters], payload["obis"], now

@@ -36,19 +36,32 @@ from .api import (
     users,
 )
 from .config import settings
+from .db import SessionLocal
 from .services.billing_errors import BillingApiError
 from .services.heartbeat import heartbeat_loop
-from .services.job_worker import worker_loop
+from .services.job_worker import reap_stale_running_jobs, worker_loop
 from .services.meter_discovery import meter_discovery_loop
 from .services.offline_detector import offline_detector_loop
 from .services.scheduler import scheduler_loop
 
 _BILLING_PATH_PREFIX = "/api/v1/billing/"
 
+logger = logging.getLogger("mmws_backend.main")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     stop_event = asyncio.Event()
+    # Любая задача, оставшаяся в RUNNING с прошлого запуска процесса,
+    # гарантированно осиротела (см. job_worker.reap_stale_running_jobs)
+    # — разобрать это ДО запуска воркеров, иначе такие записи навсегда
+    # блокируют повторные попытки для своих счётчиков в планировщике
+    # (2026-09-08, найденный баг).
+    async with SessionLocal() as db:
+        reaped = await reap_stale_running_jobs(db)
+    if reaped:
+        logger.warning("При старте закрыто %d зависших RUNNING-задач с прошлого запуска", reaped)
+
     # settings.job_worker_concurrency параллельных воркеров вместо одного
     # (2026-09-07, по решению пользователя) — очередь job'ов (особенно
     # call-home-чтения, десятки-сотни секунд каждое) иначе обрабатывается

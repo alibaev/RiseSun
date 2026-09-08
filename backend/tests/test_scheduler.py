@@ -129,6 +129,34 @@ async def test_trigger_one_creates_run_and_one_job_per_meter(db_session):
 
 
 @pytest.mark.asyncio
+async def test_trigger_one_does_not_duplicate_outstanding_jobs(db_session):
+    """Найденный баг (2026-09-08): частый cron (`*/30 * * * *`) на
+    медленной call-home очереди раньше плодил дубликаты — счётчик,
+    предыдущий Job которого воркер ещё не успел взять (QUEUED) или
+    сейчас обрабатывает (RUNNING), не должен получить ещё одну Job на
+    следующем срабатывании того же расписания."""
+    meter_ids = await _seed_gateway_and_meters(db_session, n=3)
+    queued_id, running_id, fresh_id = meter_ids
+    db_session.add(Job(job_type="read_current", meter_id=queued_id, payload={}, status=JobStatus.QUEUED))
+    db_session.add(Job(job_type="read_current", meter_id=running_id, payload={}, status=JobStatus.RUNNING))
+    await db_session.commit()
+
+    scheduled_job = ScheduledJob(
+        name="Опрос всех", cron_expression="*/30 * * * *", job_type="read_current",
+        operation_params={"obis": "1.1.1.8.0.ff"}, meter_ids=meter_ids,
+    )
+    db_session.add(scheduled_job)
+    await db_session.commit()
+
+    await _trigger_one(db_session, scheduled_job)
+
+    new_jobs = (
+        await db_session.execute(select(Job).where(Job.scheduled_job_run_id.is_not(None)))
+    ).scalars().all()
+    assert {j.meter_id for j in new_jobs} == {fresh_id}
+
+
+@pytest.mark.asyncio
 async def test_trigger_one_skip_if_read_today_excludes_already_read_meters(db_session):
     """skip_if_read_today (2026-09-07) — счётчик, у которого уже есть
     MeterReading по тому же OBIS за сегодня (Asia/Bishkek), не должен

@@ -593,6 +593,36 @@ async def _maybe_finalize_disconnect_batch_item(db: AsyncSession, job: Job) -> N
     await db.commit()
 
 
+async def reap_stale_running_jobs(db: AsyncSession) -> int:
+    """Вызывается ОДИН раз при старте Backend (main.py, до запуска
+    воркеров). ``RUNNING`` — статус, валидный только пока job реально
+    держит в памяти какой-то воркер текущего процесса; свежий процесс
+    не мог создать ни одной такой записи, значит ЛЮБАЯ строка со
+    статусом RUNNING на момент старта — гарантированно осиротевшая (её
+    воркер убит перезапуском/пересборкой контейнера и никогда не
+    допишет результат). Найденный баг, 2026-09-08: такие job'ы
+    зависали в RUNNING на 9+ часов; сами по себе очередь не блокировали
+    (`_claim_next_job` смотрит только на QUEUED), но вводили в
+    заблуждение при диагностике ("что-то зависло?") и — что важнее —
+    учитывались как "уже есть невыполненная задача" в новой проверке
+    планировщика (``scheduler._outstanding_job_meter_ids``), навсегда
+    блокируя повторную попытку для своего счётчика."""
+    result = await db.execute(select(Job).where(Job.status == JobStatus.RUNNING))
+    stale_jobs = result.scalars().all()
+    now = datetime.now(timezone.utc)
+    for job in stale_jobs:
+        job.status = JobStatus.FAILED
+        job.error = {
+            "code": "WORKER_RESTARTED",
+            "message": "Задача осталась в RUNNING после перезапуска Backend — воркер, державший её, уже не существует",
+            "is_partial": False,
+        }
+        job.finished_at = now
+    if stale_jobs:
+        await db.commit()
+    return len(stale_jobs)
+
+
 async def _process_one(db: AsyncSession) -> bool:
     job = await _claim_next_job(db)
     if job is None:
