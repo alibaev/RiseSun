@@ -472,6 +472,15 @@ def read_via_call_home(
     from .protocols import hdlc_dlms
     from .transport import TcpServerTransport
 
+    # Валидация адреса ДО цикла ожидания — 2026-09-08, найдено на 22
+    # реальных счётчиках (см. errors.AddressingError, DECISIONS.md):
+    # правило «физический адрес = последние 5 цифр серийного» может
+    # давать значение вне 14-битного поля, и это ВСЕГДА одинаково
+    # проваливается для данного serial, сеть тут ни при чём. Без этой
+    # проверки джоб держал бы held-соединение и воркер занятыми весь
+    # max_wait_s (до 150с) на заведомо обречённую попытку.
+    hdlc_dlms.server_hdlc_address(hdlc_dlms.physical_address(serial, hdlc_dlms.HDLC_DLMS))
+
     deadline = time.time() + max_wait_s
     last_error: GatewayError | None = None
     tried_any = False
@@ -579,6 +588,11 @@ def read_load_profile_via_call_home(
     дедуплицирует по (meter_id, obis, timestamp), см. job_worker.py."""
     from .protocols import hdlc_dlms
     from .transport import TcpServerTransport
+
+    # Валидация адреса ДО цикла ожидания — см. тот же комментарий в
+    # read_via_call_home и errors.AddressingError / DECISIONS.md
+    # (2026-09-08, найдено на 22 реальных счётчиках).
+    hdlc_dlms.server_hdlc_address(hdlc_dlms.physical_address(serial, hdlc_dlms.HDLC_DLMS))
 
     deadline = time.time() + max_wait_s
     last_error: GatewayError | None = None

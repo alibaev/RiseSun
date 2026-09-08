@@ -331,6 +331,30 @@ def test_read_via_call_home_raises_if_meter_never_connected():
         pool.stop()
 
 
+def test_read_via_call_home_fails_fast_on_unaddressable_serial():
+    """Регрессия найденного 2026-09-08 бага (см. DECISIONS.md, «22
+    счётчика»): серийники, чьи последние 5 цифр >= 16384 (5 десятичных
+    цифр физически доходят до 99999, а не влезают в 14-битное поле HDLC-
+    адреса), раньше падали необработанным ``ValueError`` где-то в
+    середине цикла ожидания — теперь адрес проверяется ДО входа в цикл,
+    и ``AddressingError`` (см. ``errors.py``) поднимается сразу, не
+    дожидаясь ``max_wait_s``."""
+    from mmws_gateway.errors import AddressingError
+
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10)
+    pool.start()
+    try:
+        start = time.time()
+        with pytest.raises(AddressingError):
+            read_via_call_home(
+                pool, serial="999999999999", password=b"12345678", obis="1.1.1.8.0.ff",
+                retry_interval_s=0.2, max_wait_s=30,
+            )
+        assert time.time() - start < 1.0
+    finally:
+        pool.stop()
+
+
 def _run_fake_meter_load_profile(
     conn: socket.socket, *, addr6: bytes, password: bytes,
     load_profile_obis: bytes, rows: list, capture_period_seconds: int, block_size: int,

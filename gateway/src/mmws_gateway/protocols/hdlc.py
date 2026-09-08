@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..errors import CrcError, GatewayError
+from ..errors import AddressingError, CrcError, GatewayError
 from ..transport import TcpTransport
 
 FLAG = 0x7E
@@ -81,10 +81,17 @@ def server_hdlc_address(physical_address: str, *, logical_device: int = 1) -> in
     (физический адрес счётчика) кодируются как единое 28-битное число
     ``(upper << 14) | lower`` — см. docstring модуля. Подтверждено
     реальным трафиком Risesun (``upper=1`` в обоих проверенных сеансах).
+
+    Найдено на практике 2026-09-08 (см. DECISIONS.md): правило
+    «физический адрес = последние 5 цифр серийного» само по себе может
+    давать значение ≥ 16384 (5 цифр — до 99999), не влезающее в 14-битный
+    ``lower`` — тогда поднимается ``AddressingError`` (а не падение
+    необработанным исключением, как раньше), поскольку правильная схема
+    кодирования для таких серийников не подтверждена реальным трафиком.
     """
     lower = int(physical_address)
     if not 0 <= logical_device < (1 << 14) or not 0 <= lower < (1 << 14):
-        raise ValueError(
+        raise AddressingError(
             f"Компоненты адреса вне диапазона 14 бит: logical_device={logical_device}, "
             f"physical_address={lower}"
         )

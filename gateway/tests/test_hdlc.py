@@ -4,7 +4,7 @@ import socket
 
 import pytest
 
-from mmws_gateway.errors import CrcError, GatewayError
+from mmws_gateway.errors import AddressingError, CrcError, GatewayError
 from mmws_gateway.protocols.hdlc import (
     CONTROL_SNRM,
     DEFAULT_CLIENT_ADDRESS,
@@ -79,9 +79,11 @@ def test_server_hdlc_address_supports_up_to_14_bit_physical_address():
 
 def test_server_hdlc_address_rejects_5_digit_overflow():
     # Известное ограничение (см. DECISIONS.md, 2026-08-18): last-5-digits
-    # серийного может доходить до 99999, что превышает 14-битный lower —
-    # редкий случай, требующий отдельного решения при встрече на практике.
-    with pytest.raises(ValueError):
+    # серийного может доходить до 99999, что превышает 14-битный lower.
+    # Встречено на практике 2026-09-08 на 22 реальных счётчиках —
+    # AddressingError (а не голый ValueError) даёт этим задачам чисто
+    # упасть FAILED, а не рухнуть необработанным исключением.
+    with pytest.raises(AddressingError):
         server_hdlc_address("99999")
 
 
