@@ -4,12 +4,16 @@
 замена реальным полевым испытаниям (см. README.md, Promt_MMWS.md Этап 0, п.4).
 """
 
+import socket
+import threading
+
 import pytest
 
 from mmws_gateway.emulators.common import ConnectionCounter, ErrorInjection, ThreadedEmulatorServer
 from mmws_gateway.emulators.hdlc_dlms_emulator import make_hdlc_dlms_handler
 from mmws_gateway.errors import AuthFailedError, ConnectionLostError, GatewayError, MeterTimeoutError
 from mmws_gateway.protocols import datatypes, dlms, hdlc_dlms
+from mmws_gateway.protocols.hdlc import CONTROL_UA, HdlcFrame, control_information_frame, read_frame_from_transport
 from mmws_gateway.session import run_with_retries
 from mmws_gateway.transport import TcpTransport, TransportConfig
 
@@ -278,3 +282,202 @@ def test_read_survives_serial_whose_frame_contains_embedded_flag_byte():
         with TcpTransport(config) as transport:
             value = hdlc_dlms.read_register(transport, serial=serial, password=PASSWORD, obis=OBIS)
     assert value == 1234567
+
+# --- read_registers_via_established_link (2026-09-09, событийное
+# чтение call-home сразу при подключении — см. DECISIONS.md и план
+# ticklish-popping-bear.md): читает НЕСКОЛЬКО регистров за одну
+# ассоциацию вместо одной на каждый OBIS. Общий emulators/
+# hdlc_dlms_emulator рассчитан на ОДИН регистр за сессию (закрывает её
+# сразу после первого GET), поэтому здесь — свой лёгкий "счётчик",
+# обслуживающий произвольное число регистров подряд на одной
+# ассоциации, с контролем момента обрыва (для теста частичного успеха).
+
+OBIS_2 = "1.1.32.7.0.ff"
+_OBJECT_UNDEFINED = 9  # data-access-result: object-undefined (Green Book), см. hdlc_dlms_emulator.py
+
+
+class _ConnAdapter:
+    """Минимальная обёртка socket -> интерфейс, ожидаемый
+    ``read_frame_from_transport`` (``recv_exact`` + ``reset_frame_seeking``),
+    для серверной стороны в тестах ниже — полноценный (клиентский,
+    с ретраями) ``TcpTransport`` тут не нужен, только чтение кадра по
+    длине на "сыром" сокете."""
+
+    def __init__(self, sock):
+        self._sock = sock
+
+    def recv_exact(self, n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = self._sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("EOF")
+            buf += chunk
+        return buf
+
+    def reset_frame_seeking(self) -> None:
+        pass
+
+
+def _serve_batch_session(conn, *, obis_values: dict, disconnect_after_registers: int | None = None) -> None:
+    """Обслуживает SNRM/UA + AARQ/AARE, затем произвольное число
+    GET-пар (scaler_unit, отвечает scaler=0; value — по ``obis_values``,
+    OBJECT_UNDEFINED если OBIS не найден) подряд на одной ассоциации, в
+    том порядке, в каком их фактически запрашивает клиент. Если
+    ``disconnect_after_registers`` задан — закрывает соединение сразу
+    после этого числа полностью обслуженных регистров, не дожидаясь
+    следующего запроса (имитация обрыва посреди батча)."""
+    adapter = _ConnAdapter(conn)
+    snrm_frame = HdlcFrame.decode(read_frame_from_transport(adapter))
+    ua = HdlcFrame(destination=snrm_frame.source, source=snrm_frame.destination, control=CONTROL_UA)
+    conn.sendall(ua.encode())
+
+    aarq_frame = HdlcFrame.decode(read_frame_from_transport(adapter))
+    parsed_aarq = dlms.parse_aarq(dlms.unwrap_llc(aarq_frame.information))
+    accepted = parsed_aarq.password == PASSWORD
+    aare = dlms.build_aare(accepted=accepted)
+    aare_frame = HdlcFrame(
+        destination=aarq_frame.source, source=aarq_frame.destination,
+        control=control_information_frame(0, 1), information=dlms.wrap_llc_response(aare),
+    )
+    conn.sendall(aare_frame.encode())
+    if not accepted:
+        return
+
+    send_seq, recv_seq = 1, 2
+    served = 0
+    while True:
+        try:
+            frame = HdlcFrame.decode(read_frame_from_transport(adapter))
+        except (ConnectionError, OSError):
+            return
+        get_request = dlms.parse_get_request(dlms.unwrap_llc(frame.information))
+        if get_request.attribute_id == dlms.REGISTER_SCALER_UNIT_ATTRIBUTE:
+            payload = datatypes.encode_structure([datatypes.encode_integer(0), datatypes.encode_unsigned(0)])
+            info = dlms.build_get_response_data(get_request.invoke_id, payload)
+        else:
+            value = obis_values.get(get_request.obis)
+            info = (
+                dlms.build_get_response_data(get_request.invoke_id, datatypes.encode_double_long_unsigned(value))
+                if value is not None
+                else dlms.build_get_response_error(get_request.invoke_id, _OBJECT_UNDEFINED)
+            )
+        response_frame = HdlcFrame(
+            destination=frame.source, source=frame.destination,
+            control=control_information_frame(send_seq, recv_seq), information=dlms.wrap_llc_response(info),
+        )
+        conn.sendall(response_frame.encode())
+        send_seq += 1
+        recv_seq += 1
+
+        if get_request.attribute_id != dlms.REGISTER_SCALER_UNIT_ATTRIBUTE:
+            served += 1
+            if disconnect_after_registers is not None and served >= disconnect_after_registers:
+                return
+
+
+def _run_batch_server(*, obis_values: dict, disconnect_after_registers: int | None = None):
+    """Запускает ``_serve_batch_session`` на localhost в фоновом потоке,
+    возвращает ``(host, port, thread, server_sock)`` — вызывающий
+    отвечает за ``server_sock.close()``/``thread.join()`` по завершении
+    (см. использование ниже, тот же паттерн, что и у
+    ``ThreadedEmulatorServer``, но без его one-register-per-session
+    ограничения)."""
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.bind(("127.0.0.1", 0))
+    server_sock.listen(1)
+    host, port = server_sock.getsockname()
+
+    def _accept_and_serve():
+        conn, _ = server_sock.accept()
+        try:
+            _serve_batch_session(conn, obis_values=obis_values, disconnect_after_registers=disconnect_after_registers)
+        finally:
+            conn.close()
+
+    thread = threading.Thread(target=_accept_and_serve, daemon=True)
+    thread.start()
+    return host, port, thread, server_sock
+
+
+def _read_batch(host: str, port: int, *, password: bytes = PASSWORD, obis_specs, timeout_ms: int = 1000):
+    config = TransportConfig(host=host, port=port, timeout_ms=timeout_ms, max_retries=1)
+    with TcpTransport(config) as transport:
+        hdlc_dlms.establish_link(transport, serial=SERIAL)
+        return hdlc_dlms.read_registers_via_established_link(
+            transport, serial=SERIAL, password=password, obis_specs=obis_specs
+        )
+
+
+def test_read_registers_happy_path_multiple_obis():
+    obis_values = {dlms.parse_obis(OBIS): 1234567, dlms.parse_obis(OBIS_2): 2200000}
+    host, port, thread, server_sock = _run_batch_server(obis_values=obis_values)
+    try:
+        outcomes = _read_batch(
+            host, port, obis_specs=[(OBIS, dlms.REGISTER_CLASS_ID), (OBIS_2, dlms.REGISTER_CLASS_ID)]
+        )
+    finally:
+        thread.join(timeout=3)
+        server_sock.close()
+
+    assert [o.obis for o in outcomes] == [OBIS, OBIS_2]
+    assert all(o.ok for o in outcomes)
+    assert outcomes[0].value == 1234567
+    assert outcomes[1].value == 2200000
+
+
+def test_read_registers_data_access_error_does_not_sink_rest_of_batch():
+    """GatewayError (data-access-error — объект неизвестен "счётчику",
+    не входит в obis_values) на ОДНОМ OBIS не должна прерывать батч —
+    HDLC-нумерация кадров (N(S)/N(R)) должна остаться синхронной,
+    следующий OBIS на той же ассоциации обязан прочитаться штатно."""
+    unknown_obis = "1.1.99.99.0.ff"
+    obis_values = {dlms.parse_obis(OBIS): 1234567}
+    host, port, thread, server_sock = _run_batch_server(obis_values=obis_values)
+    try:
+        outcomes = _read_batch(
+            host, port, obis_specs=[(unknown_obis, dlms.REGISTER_CLASS_ID), (OBIS, dlms.REGISTER_CLASS_ID)]
+        )
+    finally:
+        thread.join(timeout=3)
+        server_sock.close()
+
+    assert outcomes[0].obis == unknown_obis
+    assert outcomes[0].ok is False
+    assert isinstance(outcomes[0].error, GatewayError)
+    assert outcomes[1].obis == OBIS
+    assert outcomes[1].ok is True
+    assert outcomes[1].value == 1234567
+
+
+def test_read_registers_wrong_password_raises_before_any_get():
+    obis_values = {dlms.parse_obis(OBIS): 1234567, dlms.parse_obis(OBIS_2): 2200000}
+    host, port, thread, server_sock = _run_batch_server(obis_values=obis_values)
+    try:
+        with pytest.raises(AuthFailedError):
+            _read_batch(
+                host, port, password=b"WRONGPASS",
+                obis_specs=[(OBIS, dlms.REGISTER_CLASS_ID), (OBIS_2, dlms.REGISTER_CLASS_ID)],
+            )
+    finally:
+        thread.join(timeout=3)
+        server_sock.close()
+
+
+def test_read_registers_connection_drop_mid_batch_returns_partial_results():
+    """Обрыв соединения ПОСЛЕ первого успешно прочитанного регистра, но
+    до второго — не должен терять уже собранный результат первого."""
+    obis_values = {dlms.parse_obis(OBIS): 1234567, dlms.parse_obis(OBIS_2): 2200000}
+    host, port, thread, server_sock = _run_batch_server(obis_values=obis_values, disconnect_after_registers=1)
+    try:
+        outcomes = _read_batch(
+            host, port, obis_specs=[(OBIS, dlms.REGISTER_CLASS_ID), (OBIS_2, dlms.REGISTER_CLASS_ID)]
+        )
+    finally:
+        thread.join(timeout=3)
+        server_sock.close()
+
+    assert len(outcomes) == 1
+    assert outcomes[0].obis == OBIS
+    assert outcomes[0].ok is True
+    assert outcomes[0].value == 1234567

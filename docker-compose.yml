@@ -21,6 +21,14 @@ services:
       context: .
       dockerfile: gateway/Dockerfile
     restart: unless-stopped
+    # Событийное чтение call-home счётчиков сразу при подключении
+    # (2026-09-09, см. DECISIONS.md и план ticklish-popping-bear.md) —
+    # первый раз этому сервису вообще нужны env-переменные: внутренний
+    # HTTP-канал к Backend'у, общий секрет читается из корневого .env
+    # (не в git, см. .gitignore).
+    environment:
+      MMWS_BACKEND_INTERNAL_URL: http://backend:8000
+      MMWS_GATEWAY_INTERNAL_SECRET: ${GATEWAY_INTERNAL_SECRET}
     ports:
       - "127.0.0.1:50051:50051"  # внутренний gRPC — наружу не нужен
       # Call-home порт (счётчик сам инициирует TCP-соединение — см.
@@ -39,6 +47,7 @@ services:
     environment:
       MMWS_DATABASE_URL: postgresql+asyncpg://mmws:mmws@postgres:5432/mmws
       MMWS_GATEWAY_GRPC_TARGET: gateway-risesun:50051
+      MMWS_GATEWAY_INTERNAL_SECRET: ${GATEWAY_INTERNAL_SECRET}
     depends_on:
       postgres:
         condition: service_healthy

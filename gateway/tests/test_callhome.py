@@ -514,3 +514,145 @@ def test_read_load_profile_via_call_home_streams_rows():
     for i, (timestamp, values) in enumerate(decoded):
         assert timestamp == from_dt + timedelta(seconds=capture_period_seconds * i)
         assert values == [5000 + i]
+
+
+# --- Событийное чтение сразу при подключении (2026-09-09, см.
+# DECISIONS.md и план ticklish-popping-bear.md) —
+# CallHomePool._maybe_trigger_immediate_read, вызывается из _identify.
+# backend_client.claim_due_jobs/report_job_results и
+# read_batch_via_fresh_connection замоканы — это тесты на поведение
+# ПУЛА (кто остаётся held, кто закрывается), не на сам DLMS-обмен
+# (тот уже покрыт test_integration_hdlc_dlms.py). ---
+
+
+def test_maybe_trigger_immediate_read_backend_unreachable_leaves_pc_in_pool(monkeypatch):
+    from mmws_gateway import backend_client
+
+    monkeypatch.setattr(backend_client, "claim_due_jobs", lambda serial, **kw: None)
+
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10)
+    pool.start()
+    c1 = None
+    try:
+        addr6 = bytes.fromhex("522300012020")
+        c1 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c1.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.3)
+        # Backend "недоступен" (мок вернул None) — соединение остаётся
+        # в пуле нетронутым для старого пути, как если бы этого
+        # события вовсе не было.
+        assert pool.pending_count() == 1
+    finally:
+        pool.stop()
+        if c1 is not None:
+            try:
+                c1.close()
+            except OSError:
+                pass
+
+
+def test_maybe_trigger_immediate_read_with_jobs_removes_pc_and_reports_results(monkeypatch):
+    from mmws_gateway import backend_client
+    from mmws_gateway.protocols.hdlc_dlms import RegisterReadOutcome
+
+    claimed = backend_client.ClaimDueJobsResult(
+        meter_found=True, meter_id=1, protocol_profile="hdlc_dlms", password="12345678",
+        jobs=[backend_client.DueJob(job_id=7, job_type="read_current", obis="1.1.1.8.0.ff", class_id=0)],
+    )
+    monkeypatch.setattr(backend_client, "claim_due_jobs", lambda serial, **kw: claimed)
+
+    reported: dict = {}
+
+    def fake_report(serial, results, **kw):
+        reported["serial"] = serial
+        reported["results"] = results
+        return True
+
+    monkeypatch.setattr(backend_client, "report_job_results", fake_report)
+    monkeypatch.setattr(
+        "mmws_gateway.callhome.read_batch_via_fresh_connection",
+        lambda pc, **kw: [RegisterReadOutcome(obis="1.1.1.8.0.ff", ok=True, value=999)],
+    )
+
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10)
+    pool.start()
+    c1 = None
+    try:
+        addr6 = bytes.fromhex("522300012020")  # -> 202001002352
+        c1 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c1.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.3)
+
+        # Job'ы найдены — pc забран событийным путём, в пуле его больше нет.
+        assert pool.pending_count() == 0
+        assert reported["serial"] == "202001002352"
+        assert len(reported["results"]) == 1
+        assert reported["results"][0].job_id == 7
+        assert reported["results"][0].ok is True
+        assert reported["results"][0].value == 999
+    finally:
+        pool.stop()
+        if c1 is not None:
+            try:
+                c1.close()
+            except OSError:
+                pass
+
+
+def test_maybe_trigger_immediate_read_closes_sibling_same_serial_connections(monkeypatch):
+    """По просьбе пользователя (2026-09-09): как только одно соединение
+    счётчика стало активным, остальные held-соединения ЭТОГО ЖЕ
+    счётчика должны быть закрыты, а не просто оставлены висеть до
+    истечения окна/лимита."""
+    from mmws_gateway import backend_client
+    from mmws_gateway.protocols.hdlc_dlms import RegisterReadOutcome
+
+    claimed = backend_client.ClaimDueJobsResult(
+        meter_found=True, meter_id=1, protocol_profile="hdlc_dlms", password="12345678",
+        jobs=[backend_client.DueJob(job_id=7, job_type="read_current", obis="1.1.1.8.0.ff", class_id=0)],
+    )
+    call_count = {"n": 0}
+
+    def fake_claim(serial, **kw):
+        call_count["n"] += 1
+        return claimed if call_count["n"] >= 3 else None  # первые 2 подключения — "нечего читать"
+
+    monkeypatch.setattr(backend_client, "claim_due_jobs", fake_claim)
+    monkeypatch.setattr(backend_client, "report_job_results", lambda serial, results, **kw: True)
+    monkeypatch.setattr(
+        "mmws_gateway.callhome.read_batch_via_fresh_connection",
+        lambda pc, **kw: [RegisterReadOutcome(obis="1.1.1.8.0.ff", ok=True, value=1)],
+    )
+
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10, max_per_serial=10)
+    pool.start()
+    c1 = c2 = c3 = None
+    try:
+        addr6 = bytes.fromhex("522300012020")
+        c1 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c1.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.3)
+        c2 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c2.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.3)
+        assert pool.pending_count() == 2  # c1, c2 остались held (нечего было читать)
+
+        c3 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c3.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.3)
+
+        # c3 забран событийным путём; c1/c2 закрыты как "соседи того же
+        # счётчика", а не просто продолжают висеть в пуле.
+        assert pool.pending_count() == 0
+        c1.settimeout(1)
+        assert c1.recv(1) == b""
+        c2.settimeout(1)
+        assert c2.recv(1) == b""
+    finally:
+        pool.stop()
+        for c in (c1, c2, c3):
+            if c is not None:
+                try:
+                    c.close()
+                except OSError:
+                    pass

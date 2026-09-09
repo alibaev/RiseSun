@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -28,7 +29,9 @@ from app.models import (
 from app.services.gateway_client import LoadProfileError, LoadProfileRow, ReadResult, WriteResult
 from app.services.job_worker import (
     RATED_CURRENT_OBIS,
+    claim_due_jobs_for_meter,
     reap_stale_running_jobs,
+    requeue_stale_running_jobs,
     _run_disconnect,
     _run_read_current,
     _run_read_load_profile,
@@ -574,3 +577,102 @@ async def test_reap_stale_running_jobs_fails_orphaned_running_jobs(db_session):
     assert stale.finished_at is not None
     assert queued.status == JobStatus.QUEUED
     assert succeeded.status == JobStatus.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_claim_due_jobs_for_meter_filters_by_meter_and_type(db_session):
+    """claim_due_jobs_for_meter (2026-09-09, событийное чтение
+    call-home — см. DECISIONS.md) — забирает только QUEUED job'ы
+    НУЖНОГО счётчика и НУЖНЫХ типов, переводит их в RUNNING, уважает
+    limit, не трогает чужие job'ы."""
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202006003607",
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    other_meter = Meter(
+        serial_number="202006003608",
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add_all([meter, other_meter])
+    await db_session.flush()
+
+    j1 = Job(job_type="read_current", meter_id=meter.id, payload={"obis": "1.1.1.8.0.ff"})
+    j2 = Job(job_type="read_current", meter_id=meter.id, payload={"obis": "1.1.32.7.0.ff"})
+    j3 = Job(job_type="read_load_profile", meter_id=meter.id, payload={})  # не в job_types
+    j_other = Job(job_type="read_current", meter_id=other_meter.id, payload={"obis": "1.1.1.8.0.ff"})
+    db_session.add_all([j1, j2, j3, j_other])
+    await db_session.commit()
+
+    claimed = await claim_due_jobs_for_meter(
+        db_session, meter_id=meter.id, job_types=["read_current", "read_rated_current"], limit=10
+    )
+
+    assert {j.id for j in claimed} == {j1.id, j2.id}
+    assert all(j.status == JobStatus.RUNNING for j in claimed)
+    assert all(j.started_at is not None for j in claimed)
+    await db_session.refresh(j3)
+    await db_session.refresh(j_other)
+    assert j3.status == JobStatus.QUEUED
+    assert j_other.status == JobStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_claim_due_jobs_for_meter_respects_limit(db_session):
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202006003607",
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    db_session.add_all(
+        [Job(job_type="read_current", meter_id=meter.id, payload={"obis": f"1.1.1.8.{i}.ff"}) for i in range(5)]
+    )
+    await db_session.commit()
+
+    claimed = await claim_due_jobs_for_meter(db_session, meter_id=meter.id, job_types=["read_current"], limit=2)
+    assert len(claimed) == 2
+
+
+@pytest.mark.asyncio
+async def test_requeue_stale_running_jobs_only_touches_old_running(db_session):
+    """requeue_stale_running_jobs (страховка событийного пути, см.
+    DECISIONS.md) — трогает только RUNNING старше порога, возвращает в
+    QUEUED (не FAILED — данные не потеряны, следующая попытка честная),
+    не трогает свежий RUNNING (легитимно выполняется старым путём) и не
+    трогает QUEUED/уже завершённые."""
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202006003607",
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    now = datetime.now(timezone.utc)
+    stale = Job(
+        job_type="read_current", meter_id=meter.id, payload={"obis": "1.1.1.8.0.ff"},
+        status=JobStatus.RUNNING, started_at=now - timedelta(seconds=400),
+    )
+    fresh = Job(
+        job_type="read_current", meter_id=meter.id, payload={"obis": "1.1.32.7.0.ff"},
+        status=JobStatus.RUNNING, started_at=now - timedelta(seconds=10),
+    )
+    queued = Job(job_type="read_current", meter_id=meter.id, payload={"obis": "1.1.20.7.0.ff"}, status=JobStatus.QUEUED)
+    db_session.add_all([stale, fresh, queued])
+    await db_session.commit()
+
+    count = await requeue_stale_running_jobs(db_session, older_than_s=300.0)
+
+    assert count == 1
+    await db_session.refresh(stale)
+    await db_session.refresh(fresh)
+    await db_session.refresh(queued)
+    assert stale.status == JobStatus.QUEUED
+    assert stale.started_at is None
+    assert fresh.status == JobStatus.RUNNING
+    assert queued.status == JobStatus.QUEUED

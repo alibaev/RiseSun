@@ -27,6 +27,7 @@ from .api import (
     billing,
     billing_api_keys,
     dashboard,
+    gateway_internal,
     gateways,
     jobs,
     meters,
@@ -41,7 +42,7 @@ from .config import settings
 from .db import SessionLocal
 from .services.billing_errors import BillingApiError
 from .services.heartbeat import heartbeat_loop
-from .services.job_worker import reap_stale_running_jobs, worker_loop
+from .services.job_worker import reap_stale_running_jobs, stale_job_reaper_loop, worker_loop
 from .services.meter_discovery import meter_discovery_loop
 from .services.offline_detector import offline_detector_loop
 from .services.scheduler import scheduler_loop
@@ -79,6 +80,11 @@ async def lifespan(app: FastAPI):
     scheduler_task = asyncio.create_task(scheduler_loop(stop_event))
     offline_detector_task = asyncio.create_task(offline_detector_loop(stop_event))
     meter_discovery_task = asyncio.create_task(meter_discovery_loop(stop_event))
+    # Страховка событийного пути (см. job_worker.claim_due_jobs_for_meter,
+    # DECISIONS.md и план ticklish-popping-bear.md) — возвращает в
+    # очередь job'ы, которые Gateway забрал (claim-jobs), но так и не
+    # смог отчитать (сбой сети/процесса посреди ассоциации).
+    stale_job_reaper_task = asyncio.create_task(stale_job_reaper_loop(stop_event))
     try:
         yield
     finally:
@@ -88,6 +94,7 @@ async def lifespan(app: FastAPI):
         await scheduler_task
         await offline_detector_task
         await meter_discovery_task
+        await stale_job_reaper_task
 
 
 app = FastAPI(title="MMWS Backend API", version="0.1.0-etap1", lifespan=lifespan)
@@ -158,6 +165,7 @@ app.include_router(notifications.router)
 app.include_router(billing.router)
 app.include_router(billing_api_keys.router)
 app.include_router(dashboard.router)
+app.include_router(gateway_internal.router)
 
 
 @app.get("/health")

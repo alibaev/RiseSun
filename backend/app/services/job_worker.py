@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -78,6 +78,41 @@ async def _claim_next_job(db: AsyncSession) -> Job | None:
     return job
 
 
+async def claim_due_jobs_for_meter(
+    db: AsyncSession, *, meter_id: int, job_types: list[str], limit: int
+) -> list[Job]:
+    """Аналог ``_claim_next_job``, но фильтрован по конкретному счётчику
+    и забирает СРАЗУ НЕСКОЛЬКО job'ов (до ``limit``) — используется
+    событийным путём (``POST /api/internal/gateway/meters/{serial}/
+    claim-jobs``, см. DECISIONS.md и план ticklish-popping-bear.md),
+    когда Gateway спрашивает "что читать" в момент подключения счётчика,
+    а не когда воркер сам доходит до job'ы по FIFO.
+
+    ``FOR UPDATE SKIP LOCKED`` даёт ту же гарантию неповторного захвата,
+    что и у ``_claim_next_job`` — если этот же счётчик одновременно
+    обрабатывается старым путём (маловероятная, но возможная гонка: две
+    почти одновременные call-home попытки того же серийника, см.
+    docstring ``callhome.py`` про частые переподключения), совпадающие
+    job'ы просто не попадут в выборку второго вызова (уже не QUEUED)."""
+    result = await db.execute(
+        select(Job)
+        .where(Job.meter_id == meter_id, Job.job_type.in_(job_types), Job.status == JobStatus.QUEUED)
+        .order_by(Job.created_at)
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    jobs = result.scalars().all()
+    now = datetime.now(timezone.utc)
+    for job in jobs:
+        job.status = JobStatus.RUNNING
+        job.started_at = now
+    if jobs:
+        await db.commit()
+        for job in jobs:
+            await db.refresh(job)
+    return list(jobs)
+
+
 async def _run_read_current(db: AsyncSession, job: Job) -> None:
     meter = await db.get(Meter, job.meter_id)
     if meter is None:
@@ -107,7 +142,16 @@ async def _run_read_current(db: AsyncSession, job: Job) -> None:
         # раньше него самого.
         call_timeout_s=160.0 if meter.is_call_home else 60.0,
     )
+    await finalize_read_current_job(db, job, meter, outcome, obis=obis)
 
+
+async def finalize_read_current_job(db: AsyncSession, job: Job, meter: Meter, outcome, *, obis: str) -> None:
+    """Вынесено из ``_run_read_current`` (2026-09-09, событийное чтение
+    call-home — см. DECISIONS.md и план ticklish-popping-bear.md), чтобы
+    ОДНА и та же логика финализации job'ы использовалась и старым путём
+    (этот воркер, через gRPC), и новым эндпоинтом
+    ``POST /api/internal/gateway/job-results`` — поведение старого пути
+    не меняется, это чистый рефакторинг."""
     now = datetime.now(timezone.utc)
     if outcome.ok:
         job.status = JobStatus.SUCCEEDED
@@ -160,7 +204,12 @@ async def _run_read_rated_current(db: AsyncSession, job: Job) -> None:
         obis=RATED_CURRENT_OBIS,
         call_timeout_s=160.0 if meter.is_call_home else 60.0,
     )
+    await finalize_read_rated_current_job(db, job, meter, outcome)
 
+
+async def finalize_read_rated_current_job(db: AsyncSession, job: Job, meter: Meter, outcome) -> None:
+    """См. docstring ``finalize_read_current_job`` — тот же принцип
+    (используется и старым воркером, и новым эндпоинтом job-results)."""
     now = datetime.now(timezone.utc)
     if outcome.ok and isinstance(outcome.value, (int, float)):
         job.status = JobStatus.SUCCEEDED
@@ -621,6 +670,64 @@ async def reap_stale_running_jobs(db: AsyncSession) -> int:
     if stale_jobs:
         await db.commit()
     return len(stale_jobs)
+
+
+async def requeue_stale_running_jobs(db: AsyncSession, *, older_than_s: float) -> int:
+    """Периодический (не только при старте, в отличие от
+    ``reap_stale_running_jobs`` выше) аналог для страховки событийного
+    пути (см. ``claim_due_jobs_for_meter``, DECISIONS.md, план
+    ticklish-popping-bear.md): если Gateway забрал job'ы через
+    claim-jobs (перевёл их в RUNNING), но так и не смог отчитаться
+    (упал посреди ассоциации, сеть до Backend отвалилась) — эти job'ы
+    иначе провисели бы в RUNNING вечно, невидимые ни ``_claim_next_job``
+    (смотрит только на QUEUED), ни следующему call-home подключению того
+    же счётчика (claim-jobs тоже смотрит только на QUEUED).
+
+    В ОТЛИЧИЕ от ``reap_stale_running_jobs`` — здесь НЕЛЬЗЯ считать
+    каждую встреченную RUNNING-запись осиротевшей: обычный воркер вполне
+    легитимно держит job в RUNNING до `call_timeout_s` (до 220с у
+    чтения профиля нагрузки, самый долгий путь в проекте) — единственный
+    различитель — возраст ``started_at``. Порог обязан быть заметно
+    больше 220с (см. ``settings.stale_running_job_reap_after_s``,
+    дефолт 300с), иначе можно вернуть в очередь job, который старый путь
+    ЕЩЁ реально выполняет — это не сломает данные (job просто выполнится
+    дважды), но приведёт к путанице/лишней нагрузке.
+
+    Возвращает в QUEUED (не в FAILED, как при старте) — job ещё может
+    быть честно дочитан следующей попыткой, данные не потеряны."""
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=older_than_s)
+    result = await db.execute(
+        select(Job).where(Job.status == JobStatus.RUNNING, Job.started_at < cutoff)
+    )
+    stale_jobs = result.scalars().all()
+    for job in stale_jobs:
+        job.status = JobStatus.QUEUED
+        job.started_at = None
+    if stale_jobs:
+        await db.commit()
+    return len(stale_jobs)
+
+
+async def stale_job_reaper_loop(stop_event: asyncio.Event) -> None:
+    logger.info(
+        "Реаниматор зависших RUNNING-задач запущен (порог=%.0fс)",
+        settings.stale_running_job_reap_after_s,
+    )
+    while not stop_event.is_set():
+        async with SessionLocal() as db:
+            try:
+                requeued = await requeue_stale_running_jobs(
+                    db, older_than_s=settings.stale_running_job_reap_after_s
+                )
+                if requeued:
+                    logger.warning("Возвращено в очередь %d зависших RUNNING-задач", requeued)
+            except Exception:
+                logger.exception("Ошибка цикла реанимации зависших задач")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=60.0)
+        except asyncio.TimeoutError:
+            pass
+    logger.info("Реаниматор зависших RUNNING-задач остановлен")
 
 
 async def _process_one(db: AsyncSession) -> bool:

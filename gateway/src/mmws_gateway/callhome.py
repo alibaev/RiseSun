@@ -429,6 +429,15 @@ class CallHomePool:
         except (socket.timeout, OSError):
             return
 
+        # Событийное чтение сразу при подключении (2026-09-09, см.
+        # DECISIONS.md и план ticklish-popping-bear.md) — единственный
+        # момент, когда есть реальный шанс успеть SNRM/AARQ/GET до
+        # истечения "окна жизни" соединения (см. docstring модуля, п.3);
+        # FIFO-очередь старого пути систематически проигрывает эту гонку
+        # при заметном бэклоге. Любая ошибка здесь перехватывается
+        # ВНУТРИ _maybe_trigger_immediate_read и не должна доходить сюда.
+        self._maybe_trigger_immediate_read(pc)
+
     def claim(self, serial: str, *, max_age_s: float | None = None) -> _PooledConnection | None:
         """Забирает из пула САМОЕ СВЕЖЕЕ held-соединение для данного
         серийного номера (если есть) — оно больше не подлежит вытеснению
@@ -456,6 +465,99 @@ class CallHomePool:
             chosen = matches[-1]
             del self._pool[chosen.conn_no]
             return chosen
+
+    def _maybe_trigger_immediate_read(self, pc: _PooledConnection) -> None:
+        """Событийная попытка прочитать ВСЕ due job'ы счётчика сразу
+        после опознания серийника на свежепринятом соединении
+        (2026-09-09, см. DECISIONS.md и план ticklish-popping-bear.md)
+        — выполняется в этом же фоновом потоке ``_identify`` (уже
+        отдельный поток на соединение, не блокирует ``_accept_loop``).
+        Backend недоступен/не отвечает/ничего не должен — трактуется
+        одинаково: "ничего не делаю", ``pc`` ОСТАЁТСЯ в пуле нетронутым
+        для старого пути (``claim()``/job_worker) — сетевой сбой или
+        отсутствие due-задач не должны как-либо мешать существующему
+        поведению. Любое исключение перехватывается широко (эта функция
+        вызывается из середины ``_identify()`` и не должна случайно
+        сорвать её собственную обработку ошибок)."""
+        try:
+            from . import backend_client
+
+            claimed = backend_client.claim_due_jobs(pc.serial)
+            if claimed is None or not claimed.jobs:
+                return
+
+            with self._lock:
+                if self._pool.get(pc.conn_no) is not pc:
+                    # pc уже недоступен (вытеснен по лимиту чуть выше в
+                    # этом же _identify либо claim()-нут старым путём в
+                    # узком окне гонки) — отступаем, job'ы уже RUNNING
+                    # на Backend вернутся в очередь по таймауту (см.
+                    # stale_job_reaper_loop).
+                    logger.info("Immediate-read: соединение #%d уже недоступно, пропуск", pc.conn_no)
+                    return
+                del self._pool[pc.conn_no]
+                # По просьбе пользователя: как только ОДНО соединение
+                # счётчика стало активным, остальные held-соединения
+                # ЭТОГО ЖЕ счётчика больше не нужны — держать несколько
+                # параллельных TCP-сессий к одному счётчику без ответа
+                # ни по одной может само по себе путать модем/прошивку
+                # (см. план ticklish-popping-bear.md).
+                same_serial_others = [p for p in self._pool.values() if p.serial == pc.serial]
+                for p in same_serial_others:
+                    del self._pool[p.conn_no]
+
+            for p in same_serial_others:
+                p.cancelled.set()
+                try:
+                    p.raw_sock.close()
+                except OSError:
+                    pass
+            if same_serial_others:
+                logger.info(
+                    "Immediate-read: закрыто %d других held-соединений счётчика %s "
+                    "(одно из них стало активным)",
+                    len(same_serial_others), pc.serial,
+                )
+
+            obis_specs = [(job.obis, job.class_id) for job in claimed.jobs]
+            try:
+                outcomes = read_batch_via_fresh_connection(
+                    pc, serial=pc.serial, password=claimed.password.encode("ascii"), obis_specs=obis_specs,
+                )
+            except GatewayError as exc:
+                logger.info(
+                    "Immediate-read: соединение #%d — обмен не удался (%s), "
+                    "job'ы вернутся в очередь по таймауту",
+                    pc.conn_no, exc.code,
+                )
+                outcomes = []
+            except (ConnectionError, OSError) as exc:
+                logger.info("Immediate-read: соединение #%d оборвалось (%s)", pc.conn_no, exc)
+                outcomes = []
+            finally:
+                try:
+                    pc.raw_sock.close()
+                except OSError:
+                    pass
+
+            if outcomes:
+                results = [
+                    backend_client.JobResultReport(
+                        job_id=job.job_id, obis=job.obis, ok=outcome.ok, value=outcome.value,
+                        error_code=outcome.error.code if outcome.error else None,
+                        error_message=outcome.error.message if outcome.error else None,
+                        is_partial=False,
+                    )
+                    for job, outcome in zip(claimed.jobs, outcomes)
+                ]
+                if not backend_client.report_job_results(pc.serial, results):
+                    logger.warning(
+                        "Immediate-read: не удалось отправить результаты в Backend для %s — "
+                        "job'ы вернутся в очередь по таймауту",
+                        pc.serial,
+                    )
+        except Exception:
+            logger.exception("Immediate-read: неожиданная ошибка при обработке соединения #%d", pc.conn_no)
 
     def pending_count(self, serial: str | None = None) -> int:
         with self._lock:
@@ -591,6 +693,72 @@ def read_via_call_home(
     if last_error is not None:
         raise last_error
     raise GatewayError(f"Не удалось прочитать регистр со счётчика {serial} за {max_wait_s}с")
+
+
+def read_batch_via_fresh_connection(
+    pc: "_PooledConnection",
+    *,
+    serial: str,
+    password: bytes,
+    obis_specs: list[tuple[str, int]],
+    retry_interval_s: float = DEFAULT_RETRY_INTERVAL_S,
+    per_attempt_timeout_ms: int = DEFAULT_PER_ATTEMPT_TIMEOUT_MS,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS_PER_CONNECTION,
+    association_timeout_ms: int = DEFAULT_ASSOCIATION_TIMEOUT_MS,
+) -> list:
+    """Событийный путь (2026-09-09, см. DECISIONS.md и план
+    ticklish-popping-bear.md; вызывается из ``CallHomePool.
+    _maybe_trigger_immediate_read`` сразу после опознания серийника на
+    СВЕЖЕПРИНЯТОМ соединении) — в отличие от ``read_via_call_home``, НЕ
+    перебирает несколько held-соединений (их тут просто нет, кроме
+    ``pc`` самого): достаточно один раз повторить SNRM (счётчик обычно
+    не отвечает на самый первый) и один раз терпеливо дождаться AARE
+    после AARQ — та же логика ожидания (абсолютный дедлайн, не
+    ``settimeout()``, см. ``DlT645FilteringSocket.set_deadline`` и
+    DECISIONS.md, «эксперимент с ожиданием AARE 150с»), просто без
+    внешнего цикла по held-соединениям, которого здесь нет смысла
+    заводить — соединение только что принято, других кандидатов на
+    этот же серийник специально не остаётся (см. вызывающий код,
+    закрывает соседние held-соединения того же счётчика)."""
+    from .protocols import hdlc_dlms
+    from .transport import TcpServerTransport
+
+    # Валидация адреса ДО сокета — тот же принцип, что и в
+    # read_via_call_home (см. её комментарий про AddressingError).
+    hdlc_dlms.server_hdlc_address(hdlc_dlms.physical_address(serial, hdlc_dlms.HDLC_DLMS))
+
+    filtering_sock = DlT645FilteringSocket(pc.raw_sock)
+    linked = False
+    transport = None
+    last_error: GatewayError | None = None
+    for attempt in range(1, max_attempts + 1):
+        transport = TcpServerTransport.from_accepted_socket(
+            filtering_sock, peer_host=pc.peer[0], peer_port=pc.peer[1], timeout_ms=per_attempt_timeout_ms
+        )
+        try:
+            hdlc_dlms.establish_link(transport, serial=serial)
+            linked = True
+            break
+        except GatewayError as exc:
+            last_error = exc
+            logger.info(
+                "Immediate-read: попытка %d SNRM на соединении #%d — %s, повтор",
+                attempt, pc.conn_no, exc.code,
+            )
+        except (ConnectionError, OSError) as exc:
+            raise GatewayError(f"Обрыв соединения #{pc.conn_no}: {exc}") from exc
+        time.sleep(retry_interval_s)
+
+    if not linked:
+        raise last_error or GatewayError(
+            f"Immediate-read: счётчик {serial} не подтвердил SNRM на свежем соединении "
+            f"за {max_attempts} попыток"
+        )
+
+    filtering_sock.set_deadline(time.time() + association_timeout_ms / 1000)
+    return hdlc_dlms.read_registers_via_established_link(
+        transport, serial=serial, password=password, obis_specs=obis_specs
+    )
 
 
 def read_load_profile_via_call_home(

@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import logging
 
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Iterator
 
 from ..addressing import HDLC_DLMS, physical_address
-from ..errors import GatewayError
+from ..errors import ConnectionLostError, GatewayError, MeterTimeoutError
 from ..transport import TcpTransport
 from . import datatypes, dlms
 from .datatypes import DlmsDataError
@@ -111,6 +112,42 @@ def read_register_via_established_link(
     aare_frame = _recv_i_frame(transport)
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))  # бросает AuthFailedError при отказе
 
+    value, _next_send_seq, error = _read_one_register_via_established_link(
+        transport, server_addr, client_addr, send_seq=1, obis=obis, class_id=class_id,
+    )
+    if error is not None:
+        raise error
+    return value
+
+
+def _read_one_register_via_established_link(
+    transport: TcpTransport,
+    server_addr: int,
+    client_addr: int,
+    *,
+    send_seq: int,
+    obis: str,
+    class_id: int,
+) -> tuple[object | None, int, GatewayError | None]:
+    """Тело GET одного регистра (scaler_unit + value, см. докстринг
+    ``read_register_via_established_link`` про порядок и вендорскую
+    особенность Risesun) — вынесено отдельно (2026-09-09, событийное
+    чтение call-home, см. DECISIONS.md и план ticklish-popping-bear.md),
+    чтобы читать НЕСКОЛЬКО регистров за одну ассоциацию (см.
+    ``read_registers_via_established_link``), продолжая нумерацию
+    HDLC-кадров через все них, а не начиная её заново на каждый GET.
+
+    Возвращает ``(значение, следующий свободный send_seq, ошибка)`` —
+    ошибка на GET самого значения (напр. data-access-error: счётчик
+    ОТВЕТИЛ, просто отказом для этого атрибута) возвращается как
+    значение кортежа, а НЕ бросается исключением: HDLC N(S)/N(R) при
+    этом продвинулись штатно (ответ реально получен), вызывающему
+    (``read_registers_via_established_link``) нужен корректный
+    следующий ``send_seq`` ДАЖЕ при такой ошибке, чтобы не
+    рассинхронизировать нумерацию кадров для следующего OBIS на той же
+    ассоциации. Обрыв соединения (``ConnectionError``/``OSError``) НЕ
+    перехватывается — это уже не восстановимо в рамках текущей
+    ассоциации, распространяется вызывающему как есть."""
     parsed_obis = dlms.parse_obis(obis)
     value_obis = dlms.VALUE_OBIS_OVERRIDES.get(obis, obis)
     parsed_value_obis = dlms.parse_obis(value_obis) if value_obis != obis else parsed_obis
@@ -121,7 +158,7 @@ def read_register_via_established_link(
             parsed_obis, class_id=class_id, attribute_id=dlms.REGISTER_SCALER_UNIT_ATTRIBUTE,
         )
         _send_i_frame(
-            transport, server_addr, client_addr, send_seq=1, recv_seq=1,
+            transport, server_addr, client_addr, send_seq=send_seq, recv_seq=send_seq,
             information=dlms.wrap_llc_command(scaler_request),
         )
         scaler_frame = _recv_i_frame(transport)
@@ -135,17 +172,21 @@ def read_register_via_established_link(
             )
             scaler_unit = None
 
-    value_send_seq = 2 if class_id == dlms.REGISTER_CLASS_ID else 1
+    value_send_seq = send_seq + 1 if class_id == dlms.REGISTER_CLASS_ID else send_seq
     request = dlms.build_get_request(parsed_value_obis, class_id=class_id)
     _send_i_frame(
         transport, server_addr, client_addr, send_seq=value_send_seq, recv_seq=value_send_seq,
         information=dlms.wrap_llc_command(request),
     )
     response_frame = _recv_i_frame(transport)
-    raw_value = dlms.parse_get_response(dlms.unwrap_llc(response_frame.information))
+    next_send_seq = value_send_seq + 1
+    try:
+        raw_value = dlms.parse_get_response(dlms.unwrap_llc(response_frame.information))
+    except GatewayError as exc:
+        return None, next_send_seq, exc
 
     if class_id != dlms.REGISTER_CLASS_ID or not isinstance(raw_value, (int, float)):
-        return raw_value
+        return raw_value, next_send_seq, None
 
     if not (isinstance(scaler_unit, list) and len(scaler_unit) == 2 and isinstance(scaler_unit[0], int)):
         if scaler_unit is not None:
@@ -154,7 +195,7 @@ def read_register_via_established_link(
                 "возвращается сырое значение %r без применения масштаба",
                 obis, value_obis, scaler_unit, raw_value,
             )
-        return raw_value
+        return raw_value, next_send_seq, None
     scaler, unit = scaler_unit[0], scaler_unit[1]
     # unit=30 (Wh, Green Book) — единственная подтверждённая реальным
     # трафиком Risesun DTZY217 единица для этого регистра (см.
@@ -168,13 +209,77 @@ def read_register_via_established_link(
     # применения самого scaler, не только при его отсутствии/сбое.
     effective_scaler = scaler - 3 if unit == dlms.UNIT_WATT_HOUR else scaler
     if effective_scaler == 0:
-        return raw_value
+        return raw_value, next_send_seq, None
     scaled = round(raw_value * (10**effective_scaler), max(0, -effective_scaler))
     logger.info(
         "Register %s (value read at %s): scaler=%d unit=%d (эффективный показатель степени=%d), %r -> %r",
         obis, value_obis, scaler, unit, effective_scaler, raw_value, scaled,
     )
-    return scaled
+    return scaled, next_send_seq, None
+
+
+@dataclass
+class RegisterReadOutcome:
+    obis: str
+    ok: bool
+    value: object | None = None
+    error: GatewayError | None = None
+
+
+def read_registers_via_established_link(
+    transport: TcpTransport,
+    *,
+    serial: str,
+    password: bytes,
+    obis_specs: list[tuple[str, int]],
+) -> list[RegisterReadOutcome]:
+    """AARQ/AARE ОДИН РАЗ, затем последовательно GET на каждый (obis,
+    class_id) из ``obis_specs`` — событийное чтение call-home сразу при
+    подключении (2026-09-09, см. DECISIONS.md и план
+    ticklish-popping-bear.md): вместо отдельной ассоциации на каждый
+    OBIS (как исторически делал ``read_via_call_home``, по одному
+    held-соединению на попытку) читает ВСЕ due-OBIS счётчика за одну
+    ассоциацию, аналог ``GXDLMSReader.ExecuteMeterTasks`` из
+    легаси-референса (один ``InitializeConnection`` + цикл ``Read()``
+    по объектам).
+
+    ``GatewayError``, возвращённая через кортеж из
+    ``_read_one_register_via_established_link`` (data-access-error и
+    т.п. — счётчик ОТВЕТИЛ, просто отказом для этого атрибута), НЕ
+    прерывает цикл — HDLC N(S)/N(R) остались синхронны, безопасно
+    продолжать со следующим OBIS. А вот ``ConnectionLostError``/
+    ``MeterTimeoutError`` (тоже подклассы ``GatewayError``, но
+    БРОШЕННЫЕ, а не возвращённые — доходят из ``_recv_i_frame``/
+    ``_send_i_frame`` транспортного уровня, реального ответа не было
+    вовсе) вместе с обычными ``ConnectionError``/``OSError`` прерывают
+    цикл — соединение более не пригодно для следующего GET. Уже
+    собранные до этого момента результаты возвращаются вызывающему
+    (частичный успех), а не теряются в брошенном исключении."""
+    server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
+    client_addr = DEFAULT_CLIENT_ADDRESS
+
+    aarq = dlms.build_aarq(password)
+    _send_i_frame(
+        transport, server_addr, client_addr, send_seq=0, recv_seq=0,
+        information=dlms.wrap_llc_command(aarq),
+    )
+    aare_frame = _recv_i_frame(transport)
+    dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))  # AuthFailedError и т.п. — весь батч падает, это верно
+
+    results: list[RegisterReadOutcome] = []
+    send_seq = 1
+    for obis, class_id in obis_specs:
+        try:
+            value, send_seq, error = _read_one_register_via_established_link(
+                transport, server_addr, client_addr, send_seq=send_seq, obis=obis, class_id=class_id,
+            )
+        except (ConnectionLostError, MeterTimeoutError, ConnectionError, OSError):
+            break
+        if error is not None:
+            results.append(RegisterReadOutcome(obis=obis, ok=False, error=error))
+        else:
+            results.append(RegisterReadOutcome(obis=obis, ok=True, value=value))
+    return results
 
 
 def write_register(

@@ -324,6 +324,52 @@ class JobOut(BaseModel):
     finished_at: datetime | None
 
 
+# --- Событийное чтение call-home (2026-09-09, см. DECISIONS.md и план
+# /root/.claude/plans/ticklish-popping-bear.md) — внутренний канал
+# Gateway -> Backend, app/api/gateway_internal.py. Не часть публичного
+# API, но схемы описаны так же строго, как остальные. ---
+
+
+class DueJobOut(BaseModel):
+    job_id: int
+    job_type: str
+    obis: str
+    class_id: int = Field(description="0 = класс по умолчанию Gateway (Register, класс 3)")
+
+
+class ClaimDueJobsRequest(BaseModel):
+    job_types: list[str] = ["read_current", "read_rated_current"]
+    max_jobs: int | None = Field(default=None, description="По умолчанию — settings.gateway_internal_claim_batch_max")
+
+
+class ClaimDueJobsResponse(BaseModel):
+    meter_found: bool
+    meter_id: int | None = None
+    protocol_profile: str | None = None
+    password: str | None = Field(default=None, description="Расшифрованный пароль доступа (LLS), ASCII")
+    jobs: list[DueJobOut] = []
+
+
+class JobResultIn(BaseModel):
+    job_id: int
+    obis: str
+    ok: bool
+    value: object | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    is_partial: bool = False
+
+
+class ReportJobResultsRequest(BaseModel):
+    serial: str
+    results: list[JobResultIn]
+
+
+class ReportJobResultsResponse(BaseModel):
+    accepted: int
+    skipped: int = Field(description="Job'ы, которые уже не были RUNNING на момент отчёта (см. анти-задвоение)")
+
+
 ScheduledJobType = Literal["read_current", "read_load_profile", "read_rated_current"]
 
 
