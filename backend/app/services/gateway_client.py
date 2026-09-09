@@ -39,6 +39,7 @@ async def read_register(
     timeout_ms: int = 0,
     retries: int = 0,
     call_timeout_s: float = 60.0,
+    mechanism_id: int = 0,
 ) -> ReadResult:
     """``call_home=True`` — счётчик сам звонит Gateway (подтверждённое
     расхождение с ТЗ Table 1, см. ../DECISIONS.md); ``host``/``port``
@@ -61,6 +62,7 @@ async def read_register(
             timeout_ms=timeout_ms,
             retries=retries,
             call_home=call_home,
+            mechanism_id=mechanism_id,
         )
         response = await stub.ReadRegister(request, timeout=call_timeout_s)
 

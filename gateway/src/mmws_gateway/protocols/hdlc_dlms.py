@@ -70,6 +70,7 @@ def read_register_via_established_link(
     password: bytes,
     obis: str,
     class_id: int = dlms.REGISTER_CLASS_ID,
+    mechanism_id: int = 1,
 ) -> object:
     """AARQ/AARE + GET поверх УЖЕ установленной (SNRM/UA пройден) HDLC-связи.
 
@@ -104,7 +105,7 @@ def read_register_via_established_link(
     server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
     client_addr = DEFAULT_CLIENT_ADDRESS
 
-    aarq = dlms.build_aarq(password)
+    aarq = dlms.build_aarq(password, mechanism_id=mechanism_id)
     _send_i_frame(
         transport, server_addr, client_addr, send_seq=0, recv_seq=0,
         information=dlms.wrap_llc_command(aarq),

@@ -590,6 +590,7 @@ def read_via_call_home(
     max_attempts_per_connection: int = DEFAULT_MAX_ATTEMPTS_PER_CONNECTION,
     max_claim_age_s: float = DEFAULT_MAX_CLAIM_AGE_S,
     association_timeout_ms: int = DEFAULT_ASSOCIATION_TIMEOUT_MS,
+    mechanism_id: int = 1,
 ) -> object:
     """Пытается прочитать регистр через уже установленные (call-home)
     соединения для данного счётчика — перебирает held-соединения от
@@ -665,7 +666,7 @@ def read_via_call_home(
             filtering_sock.set_deadline(time.time() + association_timeout_ms / 1000)
             try:
                 value = hdlc_dlms.read_register_via_established_link(
-                    transport, serial=serial, password=password, obis=obis
+                    transport, serial=serial, password=password, obis=obis, mechanism_id=mechanism_id
                 )
                 logger.info("Call-home: чтение %s удалось на соединении #%d", serial, pc.conn_no)
                 return value

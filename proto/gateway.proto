@@ -80,6 +80,14 @@ message ReadRegisterRequest {
   // «Current Time»/«Current Date», словарь OBIS RW_Tree_параметры) —
   // класс 1 (Data).
   int32 class_id = 10;
+  // Диагностика (2026-09-09) — последний октет OID mechanism-name AARQ
+  // (2.16.756.5.8.2.<mechanism_id>): 1=LLS (по умолчанию, если 0),
+  // 2=HLS, 5=HLS-GMAC и т.д. Проверка гипотезы, что счётчик молчит на
+  // AARQ из-за несовпадения ожидаемого уровня аутентификации — не
+  // завершает полноценную HLS-ассоциацию (calling-authentication-value
+  // всё равно заполняется как для LLS), только меняет заявленный
+  // mechanism-name. См. DECISIONS.md.
+  int32 mechanism_id = 11;
 }
 
 message ReadRegisterResponse {

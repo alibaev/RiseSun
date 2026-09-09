@@ -61,6 +61,11 @@ def _do_read(request: gateway_pb2.ReadRegisterRequest, call_home_pool: CallHomeP
             # собственно AARE-таймаута.
             extra["association_timeout_ms"] = request.timeout_ms
             max_wait_s = max(max_wait_s, request.timeout_ms / 1000 + 20)
+        if request.mechanism_id:
+            # Диагностика (2026-09-09) — см. proto/gateway.proto про
+            # mechanism_id и dlms.build_aarq. 0 (по умолчанию) сохраняет
+            # прежнее поведение (LLS) без изменений.
+            extra["mechanism_id"] = request.mechanism_id
         return read_via_call_home(
             call_home_pool,
             serial=request.serial,

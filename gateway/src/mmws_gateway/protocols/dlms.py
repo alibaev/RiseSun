@@ -169,7 +169,7 @@ def parse_obis(text: str) -> bytes:
     return bytes(values)
 
 
-def build_aarq(password: bytes) -> bytes:
+def build_aarq(password: bytes, *, mechanism_id: int = 1) -> bytes:
     """Строит AARQ с calling-authentication-value = пароль низкого уровня.
 
     Состав полей (application-context, sender-acse-requirements,
@@ -177,10 +177,20 @@ def build_aarq(password: bytes) -> bytes:
     сверен побайтово с реальным трафиком Risesun — без
     sender-acse-requirements/mechanism-name/user-information реальный
     счётчик ассоциацию не примет (см. DECISIONS.md, 2026-08-18).
-    """
+
+    ``mechanism_id`` — последний октет OID mechanism-name
+    (``2.16.756.5.8.2.<mechanism_id>``, Green Book): 1=LLS (дефолт,
+    подтверждён реальным трафиком), 2=HLS, 5=HLS-GMAC и т.д. Параметр
+    исключительно для диагностики (2026-09-09) — гипотеза, что часть
+    счётчиков молчит на AARQ из-за несовпадения уровня аутентификации
+    (см. DECISIONS.md); calling-authentication-value при этом всё равно
+    заполняется как для LLS (сырой пароль), что для настоящего HLS
+    протокольно некорректно (там ожидается вызов-ответ, не пароль) —
+    годится только чтобы проверить, реагирует ли счётчик на смену OID
+    вообще, не для завершения полноценной HLS-ассоциации."""
     context_oid = encode_oid(APPLICATION_CONTEXT_LN_NO_CIPHERING)
     application_context = bytes([0xA1, len(context_oid) + 2, 0x06, len(context_oid)]) + context_oid
-    mechanism_oid = encode_oid(MECHANISM_NAME_LLS)
+    mechanism_oid = encode_oid((2, 16, 756, 5, 8, 2, mechanism_id)) if mechanism_id != 1 else encode_oid(MECHANISM_NAME_LLS)
     mechanism_name = bytes([0x8B, len(mechanism_oid)]) + mechanism_oid
     auth_value = bytes([0x80, len(password)]) + password
     calling_auth = bytes([0xAC, len(auth_value)]) + auth_value
