@@ -45,7 +45,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from .errors import GatewayError
+from .errors import GatewayError, NoConnectionEstablishedError
 
 logger = logging.getLogger("mmws_gateway.callhome")
 
@@ -688,7 +688,7 @@ def read_via_call_home(
             pass
 
     if not tried_any:
-        raise GatewayError(
+        raise NoConnectionEstablishedError(
             f"Счётчик {serial} ещё не установил ни одного call-home соединения с Gateway"
         )
     if last_error is not None:
@@ -860,7 +860,7 @@ def read_load_profile_via_call_home(
             pass
 
     if not tried_any:
-        raise GatewayError(
+        raise NoConnectionEstablishedError(
             f"Счётчик {serial} ещё не установил ни одного call-home соединения с Gateway"
         )
     if last_error is not None:

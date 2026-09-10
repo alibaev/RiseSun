@@ -159,6 +159,16 @@ async def finalize_read_current_job(db: AsyncSession, job: Job, meter: Meter, ou
         db.add(MeterReading(meter_id=meter.id, obis_code=obis, value_json=outcome.value))
         meter.last_seen_at = now
         meter.last_read_at = now
+        job.finished_at = now
+    elif outcome.error_code == "NO_CONNECTION_YET":
+        # Счётчик не звонил вообще, пока этот (старый FIFO) путь ждал —
+        # не значит, что он мёртв, просто ещё не позвонил. Терминально
+        # проваливать job здесь означало бы выбросить реальный шанс,
+        # который вот-вот достанется событийному чтению на следующий
+        # звонок (см. DECISIONS.md, 2026-09-10) — возвращаем в очередь
+        # вместо FAILED, job.finished_at НЕ трогаем (job не завершён).
+        job.status = JobStatus.QUEUED
+        job.started_at = None
     else:
         job.status = JobStatus.FAILED
         job.error = {
@@ -166,7 +176,7 @@ async def finalize_read_current_job(db: AsyncSession, job: Job, meter: Meter, ou
             "message": outcome.error_message,
             "is_partial": outcome.is_partial,
         }
-    job.finished_at = now
+        job.finished_at = now
     await db.commit()
 
 
@@ -223,6 +233,13 @@ async def finalize_read_rated_current_job(db: AsyncSession, job: Job, meter: Met
             "message": f"Ожидалось число, получено {outcome.value!r}",
             "is_partial": False,
         }
+    elif outcome.error_code == "NO_CONNECTION_YET":
+        # См. finalize_read_current_job — тот же принцип, не хороним job,
+        # возвращаем в очередь на следующий звонок счётчика.
+        job.status = JobStatus.QUEUED
+        job.started_at = None
+        await db.commit()
+        return
     else:
         job.status = JobStatus.FAILED
         job.error = {
