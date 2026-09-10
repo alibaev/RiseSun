@@ -656,3 +656,75 @@ def test_maybe_trigger_immediate_read_closes_sibling_same_serial_connections(mon
                     c.close()
                 except OSError:
                     pass
+
+
+def test_maybe_trigger_immediate_read_falls_back_to_next_connection_on_failure(monkeypatch):
+    """2026-09-10 (см. DECISIONS.md): все 154 исторических успешных
+    чтения пришли через старый FIFO-путь, который перебирает НЕСКОЛЬКО
+    held-соединений одного счётчика подряд, пока не истечёт общий
+    бюджет — ни одного успеха не было через "только самое свежее
+    соединение". Событийное чтение должно вести себя так же: если
+    самое свежее (только что опознанное) соединение не ответило,
+    пробуем следующее held-соединение того же счётчика, а не сдаёмся
+    сразу."""
+    from mmws_gateway import backend_client
+    from mmws_gateway.errors import MeterTimeoutError
+    from mmws_gateway.protocols.hdlc_dlms import RegisterReadOutcome
+
+    claimed = backend_client.ClaimDueJobsResult(
+        meter_found=True, meter_id=1, protocol_profile="hdlc_dlms", password="12345678",
+        jobs=[backend_client.DueJob(job_id=7, job_type="read_current", obis="1.1.1.8.0.ff", class_id=0)],
+    )
+    call_count = {"n": 0}
+
+    def fake_claim(serial, **kw):
+        call_count["n"] += 1
+        return claimed if call_count["n"] >= 2 else None  # первое подключение — "нечего читать"
+
+    monkeypatch.setattr(backend_client, "claim_due_jobs", fake_claim)
+
+    reported: dict = {}
+    monkeypatch.setattr(
+        backend_client, "report_job_results",
+        lambda serial, results, **kw: reported.update(results=results) or True,
+    )
+
+    attempts: list = []
+
+    def fake_read_batch(pc, **kw):
+        attempts.append(pc.conn_no)
+        if len(attempts) == 1:
+            raise MeterTimeoutError("AARE не пришло")
+        return [RegisterReadOutcome(obis="1.1.1.8.0.ff", ok=True, value=42)]
+
+    monkeypatch.setattr("mmws_gateway.callhome.read_batch_via_fresh_connection", fake_read_batch)
+
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10, max_per_serial=10)
+    pool.start()
+    c1 = c2 = None
+    try:
+        addr6 = bytes.fromhex("522300012020")
+        c1 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c1.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.3)
+        assert pool.pending_count() == 1  # c1 held, "нечего читать" пока
+
+        c2 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c2.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.3)
+
+        # Первая (свежая, c2) попытка провалилась, вторая (запасная, c1)
+        # — успешна. Обе held-соединения выбраны из пула, результат
+        # взят со второй попытки.
+        assert len(attempts) == 2
+        assert pool.pending_count() == 0
+        assert reported["results"][0].ok is True
+        assert reported["results"][0].value == 42
+    finally:
+        pool.stop()
+        for c in (c1, c2):
+            if c is not None:
+                try:
+                    c.close()
+                except OSError:
+                    pass

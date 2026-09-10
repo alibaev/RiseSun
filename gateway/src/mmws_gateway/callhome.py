@@ -113,6 +113,15 @@ DEFAULT_MAX_CLAIM_AGE_S = 30.0
 # счётчик и так уже принял и обработал AARQ) — лучше просто терпеливо
 # подождать ответ дольше именно на этом шаге, не начиная сессию заново.
 DEFAULT_ASSOCIATION_TIMEOUT_MS = 45000
+# Общий бюджет на ВСЕ held-соединения одного счётчика в событийном чтении
+# (см. _maybe_trigger_immediate_read) — то же значение, что и старый FIFO-
+# путь (max_wait_s в grpc_server.py). Найдено на практике 2026-09-10: все
+# 154 исторических успешных чтения пришли через старый путь, который
+# перебирает НЕСКОЛЬКО разных held-соединений одного счётчика подряд,
+# пока не истечёт этот бюджет — а не через единственную попытку на самом
+# свежем соединении. Событийное чтение до этого закрывало все соседние
+# соединения счётчика сразу, оставляя себе только один "бросок кубика".
+DEFAULT_IMMEDIATE_READ_MAX_WAIT_S = 150.0
 
 _DLT645_START = 0x68
 
@@ -496,49 +505,77 @@ class CallHomePool:
                     logger.info("Immediate-read: соединение #%d уже недоступно, пропуск", pc.conn_no)
                     return
                 del self._pool[pc.conn_no]
-                # По просьбе пользователя: как только ОДНО соединение
-                # счётчика стало активным, остальные held-соединения
-                # ЭТОГО ЖЕ счётчика больше не нужны — держать несколько
-                # параллельных TCP-сессий к одному счётчику без ответа
-                # ни по одной может само по себе путать модем/прошивку
-                # (см. план ticklish-popping-bear.md).
+                # Остальные held-соединения ЭТОГО ЖЕ счётчика больше не
+                # нужны пулу (не оставлять их висеть до истечения окна/
+                # лимита) — но, в отличие от прежней версии, НЕ выбрасываем
+                # их сразу: пробуем как запасные попытки, если pc не
+                # ответит (см. DEFAULT_IMMEDIATE_READ_MAX_WAIT_S выше).
                 same_serial_others = [p for p in self._pool.values() if p.serial == pc.serial]
                 for p in same_serial_others:
                     del self._pool[p.conn_no]
 
-            for p in same_serial_others:
-                p.cancelled.set()
-                try:
-                    p.raw_sock.close()
-                except OSError:
-                    pass
+            # Кандидаты пробуются по очереди: сначала pc (только что
+            # доказал живость свежим DL/T645-анонсом), затем остальные
+            # held-соединения того же счётчика от свежего к старому —
+            # тот же принцип предпочтения, что и в claim(). Несколько
+            # разных физических дозвонов вместо одного (см. комментарий
+            # у DEFAULT_IMMEDIATE_READ_MAX_WAIT_S).
+            candidates = [pc] + sorted(same_serial_others, key=lambda p: p.accepted_at, reverse=True)
             if same_serial_others:
                 logger.info(
-                    "Immediate-read: закрыто %d других held-соединений счётчика %s "
-                    "(одно из них стало активным)",
-                    len(same_serial_others), pc.serial,
+                    "Immediate-read: у счётчика %s ещё %d held-соединений в резерве "
+                    "как запасные попытки (счётчику стало активным #%d)",
+                    pc.serial, len(same_serial_others), pc.conn_no,
                 )
 
             obis_specs = [(job.obis, job.class_id) for job in claimed.jobs]
-            try:
-                outcomes = read_batch_via_fresh_connection(
-                    pc, serial=pc.serial, password=claimed.password.encode("ascii"), obis_specs=obis_specs,
-                )
-            except GatewayError as exc:
-                logger.info(
-                    "Immediate-read: соединение #%d — обмен не удался (%s), "
-                    "job'ы вернутся в очередь по таймауту",
-                    pc.conn_no, exc.code,
-                )
-                outcomes = []
-            except (ConnectionError, OSError) as exc:
-                logger.info("Immediate-read: соединение #%d оборвалось (%s)", pc.conn_no, exc)
-                outcomes = []
-            finally:
+            password_bytes = claimed.password.encode("ascii")
+            deadline = time.time() + DEFAULT_IMMEDIATE_READ_MAX_WAIT_S
+            outcomes: list = []
+            remaining = list(candidates)
+            while remaining:
+                if time.time() >= deadline:
+                    logger.info(
+                        "Immediate-read: общий бюджет ожидания (%.0fс) для счётчика %s исчерпан, "
+                        "%d соединений не пробовали",
+                        DEFAULT_IMMEDIATE_READ_MAX_WAIT_S, pc.serial, len(remaining),
+                    )
+                    break
+                candidate = remaining.pop(0)
                 try:
-                    pc.raw_sock.close()
+                    outcomes = read_batch_via_fresh_connection(
+                        candidate, serial=pc.serial, password=password_bytes, obis_specs=obis_specs,
+                    )
+                    break
+                except GatewayError as exc:
+                    logger.info(
+                        "Immediate-read: соединение #%d — обмен не удался (%s)%s",
+                        candidate.conn_no, exc.code,
+                        f", пробуем следующее из {len(remaining)} оставшихся" if remaining else "",
+                    )
+                    outcomes = []
+                except (ConnectionError, OSError) as exc:
+                    logger.info("Immediate-read: соединение #%d оборвалось (%s)", candidate.conn_no, exc)
+                    outcomes = []
+                finally:
+                    candidate.cancelled.set()
+                    try:
+                        candidate.raw_sock.close()
+                    except OSError:
+                        pass
+            for candidate in remaining:
+                candidate.cancelled.set()
+                try:
+                    candidate.raw_sock.close()
                 except OSError:
                     pass
+
+            if not outcomes:
+                logger.info(
+                    "Immediate-read: не удалось прочитать счётчик %s ни на одном из %d "
+                    "испробованных соединений — job'ы вернутся в очередь по таймауту",
+                    pc.serial, len(candidates) - len(remaining),
+                )
 
             if outcomes:
                 results = [
