@@ -266,6 +266,36 @@ class LoadProfileData(Base):
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class ObisReferenceEntry(Base):
+    """Полный справочник объектов (Association View) по каждой из 3
+    моделей DTZY217 — импорт из XML-экспорта заводской сервисной
+    программы (``C:\\NEW_DLMS\\Suzak\\*.xml`` на референсной боевой
+    системе, формат ``ArrayOfGXDLMSObject``, 2026-09-10). В отличие от
+    ``app/obis_catalog.py`` (намеренно маленький, только коды с
+    подтверждённым в ЭТОМ проекте назначением) — это ПОЛНЫЙ каталог
+    объектов от производителя (2941 объект × 3 модели), источник для
+    поиска/сверки, а не курируемый список. Несколько записей уже
+    сверены с ``obis_catalog.py`` и совпали (1.1.1.8.0.255, 1.1.0.6.3.255,
+    1.1.99.1.0.255) — при этом ``1.1.60.50.0.ff`` (используется в
+    ``dlms.VALUE_OBIS_OVERRIDES``) НЕ найден ни в одной из 3 моделей,
+    см. DECISIONS.md."""
+
+    __tablename__ = "obis_reference_entries"
+    __table_args__ = (UniqueConstraint("meter_model", "logical_name", name="uq_obis_reference_entry"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # "100V 5A" | "380V 100A" | "380V 5A" — суффикс, совпадающий с
+    # Meter.model (напр. "DTZY217 (380V 100A)").
+    meter_model: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    class_name: Mapped[str] = mapped_column(String(64), nullable=False)  # напр. "GXDLMSRegister"
+    class_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    logical_name: Mapped[str] = mapped_column(String(32), nullable=False, index=True)  # "1.1.1.8.0.255"
+    description: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    scaler: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
 class EventLog(Base):
     """Журнал событий счётчика (ТЗ п. 4.2.3, Приложение Г.4)."""
 
