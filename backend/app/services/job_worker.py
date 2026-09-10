@@ -124,6 +124,13 @@ async def _run_read_current(db: AsyncSession, job: Job) -> None:
 
     gateway = meter.gateway
     obis = job.payload["obis"]
+    # class_id — необязательное поле payload (0 = дефолт Gateway, класс
+    # Register), добавлено 2026-09-10 для точечных диагностических
+    # чтений произвольных объектов (напр. Association View, класс 15) —
+    # тот же параметр, что gateway_client.read_register уже поддерживал
+    # для write/read-load-profile путей, просто раньше не пробрасывался
+    # из payload обычного read_current.
+    class_id = job.payload.get("class_id", 0)
     password = decrypt_secret(meter.password_encrypted).decode("ascii")
 
     outcome = await read_register(
@@ -135,6 +142,7 @@ async def _run_read_current(db: AsyncSession, job: Job) -> None:
         serial=meter.serial_number,
         password=password,
         obis=obis,
+        class_id=class_id,
         # call-home ждёт, пока звонящий счётчик установит и подтвердит
         # соединение (см. callhome.read_via_call_home, max_wait_s=150с —
         # gateway/src/mmws_gateway/grpc_server.py) — даём Backend'у чуть
