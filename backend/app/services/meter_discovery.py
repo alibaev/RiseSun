@@ -1,11 +1,16 @@
 """Обнаружение новых счётчиков по call-home (Этап 6) — фоновый цикл
 (тот же паттерн, что и ``heartbeat.py``), опрашивающий
 ``Gateway.ListCallHomeSerials`` на каждом APPROVED экземпляре Gateway и
-заводящий в справочник ранее неизвестные серийные номера со статусом
-``MeterStatus.INSTALLED`` — раньше добавление счётчика требовало заранее
-знать его серийный номер откуда-то ещё; теперь звонящий домой счётчик
-сам появляется в справочнике, администратору остаётся только
-активировать его (указать пароль/протокол, см. app/api/meters.py).
+заводящий в справочник ранее неизвестные серийные номера.
+
+Раньше добавление счётчика требовало заранее знать его серийный номер
+откуда-то ещё; теперь звонящий домой счётчик сам появляется в
+справочнике. С 2026-09-10 (по просьбе пользователя, ожидающего
+подключение ~300 новых счётчиков) ЛЮБОЙ новый call-home серийник
+автоактивируется сразу — пароль/профиль единые для всего парка
+(подтверждено реальным трафиком, см. DECISIONS.md, «Массовая
+активация 141 счётчика»), ручная активация через app/api/meters.py
+больше не нужна как обязательный шаг.
 """
 
 from __future__ import annotations
@@ -24,23 +29,20 @@ logger = logging.getLogger("mmws_backend.meter_discovery")
 
 _CHECK_INTERVAL_S = 30.0
 
-# Серийники 6 тестовых счётчиков, удалённых 2026-09-08 (см. DECISIONS.md,
-# «Чистка БД: 6 тестовых счётчиков и битый gateway_id=1») — среди них
-# были счётчики, реально использовавшиеся для первых тестов, не только
-# синтетические заглушки. По просьбе пользователя: если ОДИН ИЗ ЭТИХ
-# серийников когда-либо позвонит домой снова, заводить его сразу
-# ГОТОВЫМ к работе (пароль/профиль/ACTIVE), а не оставлять как обычное
-# автообнаружение в INSTALLED — для всех остальных, ранее неизвестных
-# серийников поведение не меняется.
-_KNOWN_TEST_SERIALS = frozenset(
-    {"202006003607", "999000111222", "202099009999", "900000000001", "900000000002", "999888777666"}
-)
 # Пароль/профиль подтверждены реальным трафиком для звонящих домой
 # счётчиков Risesun (см. DECISIONS.md, «Массовая активация 141
-# счётчика»), тот же дефолт используется для остальных call-home
-# счётчиков парка.
+# счётчика») — единый дефолт для ВСЕХ call-home счётчиков парка,
+# включая новые (см. докстринг модуля, 2026-09-10).
 _AUTO_ACTIVATE_PASSWORD = b"12345678"
 _AUTO_ACTIVATE_PROFILE = ProtocolProfile.HDLC_DLMS
+# По словам пользователя (2026-09-10): вся новая партия (~300 счётчиков,
+# ожидаемая этим заходом) — токовый класс 100А, в отличие от старого
+# парка (5-7.5А, смешанно, устанавливается фактическим чтением
+# read_rated_current — см. finalize_read_rated_current_job). Ставим
+# сразу при автообнаружении вместо ожидания первого удачного чтения;
+# реальное чтение (если случится) всё равно перезапишет этим же
+# значением или уточнит его.
+_NEW_BATCH_RATED_CURRENT_AMPS = 100.0
 
 
 async def _add_to_catchall_schedules(db, meter_id: int) -> None:
@@ -87,30 +89,20 @@ async def _run_once() -> None:
             new_serials = [s.serial for s in seen if s.serial not in existing_serials]
             auto_activated = []
             for serial in new_serials:
-                if serial in _KNOWN_TEST_SERIALS:
-                    meter = Meter(
-                        serial_number=serial, is_call_home=True, gateway_id=gateway.id,
-                        status=MeterStatus.ACTIVE, protocol_profile=_AUTO_ACTIVATE_PROFILE,
-                        password_encrypted=encrypt_secret(_AUTO_ACTIVATE_PASSWORD),
-                    )
-                    auto_activated.append(meter)
-                else:
-                    meter = Meter(
-                        serial_number=serial, is_call_home=True,
-                        status=MeterStatus.INSTALLED, gateway_id=gateway.id,
-                    )
+                meter = Meter(
+                    serial_number=serial, is_call_home=True, gateway_id=gateway.id,
+                    status=MeterStatus.ACTIVE, protocol_profile=_AUTO_ACTIVATE_PROFILE,
+                    password_encrypted=encrypt_secret(_AUTO_ACTIVATE_PASSWORD),
+                    rated_current_amps=_NEW_BATCH_RATED_CURRENT_AMPS,
+                )
+                auto_activated.append(meter)
                 db.add(meter)
             if new_serials:
                 logger.info(
-                    "Обнаружено %d новых счётчиков через call-home на gateway_id=%s: %s",
+                    "Обнаружено и автоактивировано %d новых счётчиков через call-home "
+                    "на gateway_id=%s: %s",
                     len(new_serials), gateway.id, new_serials,
                 )
-                if auto_activated:
-                    logger.info(
-                        "Из них %d — известные ранее удалённые тестовые счётчики, "
-                        "автоактивированы: %s",
-                        len(auto_activated), [m.serial_number for m in auto_activated],
-                    )
                 await db.flush()  # нужны meter.id для добавления в расписания
                 for meter in auto_activated:
                     await _add_to_catchall_schedules(db, meter.id)

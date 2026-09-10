@@ -26,32 +26,14 @@ async def _seed_approved_gateway(db, grpc_target: str = "localhost:50051") -> Ga
 
 
 @pytest.mark.asyncio
-async def test_creates_installed_meter_for_new_serial(db_session):
-    gateway = await _seed_approved_gateway(db_session)
-
-    with patch(
-        "app.services.meter_discovery.list_call_home_serials",
-        new=AsyncMock(return_value=[SeenSerial(serial="900000000123", first_seen_unix=1755590400.0)]),
-    ):
-        await _run_once()
-
-    meters = (await db_session.execute(select(Meter))).scalars().all()
-    assert len(meters) == 1
-    assert meters[0].serial_number == "900000000123"
-    assert meters[0].status == MeterStatus.INSTALLED
-    assert meters[0].is_call_home is True
-    assert meters[0].gateway_id == gateway.id
-    assert meters[0].protocol_profile is None
-    assert meters[0].password_encrypted is None
-
-
-@pytest.mark.asyncio
-async def test_known_test_serial_auto_activated_and_added_to_catchall_schedule(db_session):
-    """2026-09-08 (см. DECISIONS.md) — серийники 6 тестовых счётчиков,
-    удалённых в этот же день, при повторном обнаружении заводятся сразу
-    ACTIVE (пароль/профиль проставлены), а не INSTALLED, и добавляются в
-    расписание с самым большим существующим списком счётчиков (эвристика
-    "группа всех счётчиков", в отличие от узкой smoke-test группы)."""
+async def test_new_serial_auto_activated_and_added_to_catchall_schedule(db_session):
+    """2026-09-10 (см. DECISIONS.md) — по просьбе пользователя (ожидание
+    ~300 новых счётчиков) ЛЮБОЙ новый call-home серийник заводится сразу
+    ACTIVE (пароль/профиль — единый дефолт парка), а не INSTALLED, и
+    добавляется в расписание с самым большим существующим списком
+    счётчиков (эвристика "группа всех счётчиков", в отличие от узкой
+    smoke-test группы). Раньше это применялось только к 6 конкретным
+    ранее удалённым тестовым серийникам — теперь ко всем."""
     gateway = await _seed_approved_gateway(db_session)
     catchall = ScheduledJob(
         name="Ежедневный опрос всех счётчиков", cron_expression="*/30 * * * *",
@@ -66,16 +48,20 @@ async def test_known_test_serial_auto_activated_and_added_to_catchall_schedule(d
 
     with patch(
         "app.services.meter_discovery.list_call_home_serials",
-        new=AsyncMock(return_value=[SeenSerial(serial="202006003607", first_seen_unix=1755590400.0)]),
+        new=AsyncMock(return_value=[SeenSerial(serial="900000000123", first_seen_unix=1755590400.0)]),
     ):
         await _run_once()
 
     meters = (await db_session.execute(select(Meter))).scalars().all()
     assert len(meters) == 1
     meter = meters[0]
+    assert meter.serial_number == "900000000123"
+    assert meter.is_call_home is True
+    assert meter.gateway_id == gateway.id
     assert meter.status == MeterStatus.ACTIVE
     assert meter.protocol_profile == ProtocolProfile.HDLC_DLMS
     assert decrypt_secret(meter.password_encrypted) == b"12345678"
+    assert meter.rated_current_amps == 100.0
 
     await db_session.refresh(catchall)
     await db_session.refresh(smoke)
