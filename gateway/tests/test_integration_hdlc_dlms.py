@@ -13,7 +13,13 @@ from mmws_gateway.emulators.common import ConnectionCounter, ErrorInjection, Thr
 from mmws_gateway.emulators.hdlc_dlms_emulator import make_hdlc_dlms_handler
 from mmws_gateway.errors import AuthFailedError, ConnectionLostError, GatewayError, MeterTimeoutError
 from mmws_gateway.protocols import datatypes, dlms, hdlc_dlms
-from mmws_gateway.protocols.hdlc import CONTROL_UA, HdlcFrame, control_information_frame, read_frame_from_transport
+from mmws_gateway.protocols.hdlc import (
+    CONTROL_DISC,
+    CONTROL_UA,
+    HdlcFrame,
+    control_information_frame,
+    read_frame_from_transport,
+)
 from mmws_gateway.session import run_with_retries
 from mmws_gateway.transport import TcpTransport, TransportConfig
 
@@ -509,6 +515,11 @@ def test_aarq_is_resent_when_aare_delayed():
             # Первый AARQ — молча игнорируем (имитация помехи модема).
             HdlcFrame.decode(read_frame_from_transport(adapter))
             aarq_count["n"] += 1
+
+            # Перед переотправкой клиент шлёт DISC (см. DECISIONS.md,
+            # 2026-09-10) — считываем и отбрасываем, это не AARQ.
+            disc_frame = HdlcFrame.decode(read_frame_from_transport(adapter))
+            assert disc_frame.control == CONTROL_DISC
 
             # Второй AARQ — это и есть переотправка клиентом, отвечаем как обычно.
             aarq_frame = HdlcFrame.decode(read_frame_from_transport(adapter))

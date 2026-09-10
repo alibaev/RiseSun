@@ -27,6 +27,7 @@ from ..transport import TcpTransport
 from . import datatypes, dlms
 from .datatypes import DlmsDataError
 from .hdlc import (
+    CONTROL_DISC,
     CONTROL_SNRM,
     CONTROL_UA,
     DEFAULT_CLIENT_ADDRESS,
@@ -472,6 +473,19 @@ def _send_aarq_and_await_aare(
     last_error: MeterTimeoutError | None = None
     try:
         for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                # Рекомендация производителя (2026-09-10, см. DECISIONS.md):
+                # "Сначала отправьте кадр разрыва соединения, затем
+                # отправьте AARQ" — перед ПОВТОРНОЙ отправкой AARQ (не
+                # перед первой — на ней ещё нет "застрявшего" состояния,
+                # которое нужно было бы сбрасывать) шлём DISC
+                # (control=0x53). Ответ не ждём и не разбираем — если
+                # придёт, это S/U-кадр, безопасно проглотится как
+                # супервизорный в _recv_i_frame ниже.
+                disc_frame = HdlcFrame(
+                    destination=server_addr, source=client_addr, control=CONTROL_DISC,
+                )
+                transport.send(disc_frame.encode())
             _send_i_frame(
                 transport, server_addr, client_addr, send_seq=0, recv_seq=0,
                 information=aarq_information,
