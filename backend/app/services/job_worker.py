@@ -514,6 +514,20 @@ async def _run_read_load_profile(db: AsyncSession, job: Job) -> None:
         error_info = {"code": exc.code, "message": exc.message, "is_partial": exc.is_partial or rows_written > 0}
 
     now = datetime.now(timezone.utc)
+    if error_info is not None and error_info["code"] == "NO_CONNECTION_YET":
+        # См. finalize_read_current_job — тот же принцип (2026-09-10, не
+        # распространили сразу и сюда): счётчик не звонил, пока этот
+        # путь ждал, не значит, что он мёртв — возвращаем в очередь на
+        # следующий звонок вместо терминального FAILED. Уже записанные
+        # строки (если были) не теряются — вставка идемпотентна
+        # (ON CONFLICT DO NOTHING по meter_id+obis_code+timestamp),
+        # повторный проход с тем же диапазоном дат безопасен.
+        job.status = JobStatus.QUEUED
+        job.started_at = None
+        job.result = {"obis": obis, "rows_written": rows_written}
+        await db.commit()
+        return
+
     job.result = {"obis": obis, "rows_written": rows_written}
     if error_info is None:
         job.status = JobStatus.SUCCEEDED
