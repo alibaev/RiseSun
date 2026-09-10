@@ -481,3 +481,81 @@ def test_read_registers_connection_drop_mid_batch_returns_partial_results():
     assert outcomes[0].obis == OBIS
     assert outcomes[0].ok is True
     assert outcomes[0].value == 1234567
+
+
+def test_aarq_is_resent_when_aare_delayed():
+    """2026-09-10 (см. DECISIONS.md — ответ производителя на разбор
+    AARE-тишины): AARE может не прийти на первый AARQ (помехи от
+    heartbeat-кадров 3G/4G-модема); штатная рекомендация производителя —
+    переотправить AARQ и снова ждать, а не просто ждать дольше на той же
+    попытке. Сервер здесь намеренно молчит на первый AARQ и отвечает
+    AARE только на второй (повторно присланный клиентом) — проверяем,
+    что клиент это делает сам, без явного участия вызывающего кода."""
+    obis_values = {dlms.parse_obis(OBIS): 1234567}
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.bind(("127.0.0.1", 0))
+    server_sock.listen(1)
+    host, port = server_sock.getsockname()
+    aarq_count = {"n": 0}
+
+    def _serve():
+        conn, _ = server_sock.accept()
+        try:
+            adapter = _ConnAdapter(conn)
+            snrm_frame = HdlcFrame.decode(read_frame_from_transport(adapter))
+            ua = HdlcFrame(destination=snrm_frame.source, source=snrm_frame.destination, control=CONTROL_UA)
+            conn.sendall(ua.encode())
+
+            # Первый AARQ — молча игнорируем (имитация помехи модема).
+            HdlcFrame.decode(read_frame_from_transport(adapter))
+            aarq_count["n"] += 1
+
+            # Второй AARQ — это и есть переотправка клиентом, отвечаем как обычно.
+            aarq_frame = HdlcFrame.decode(read_frame_from_transport(adapter))
+            aarq_count["n"] += 1
+            parsed_aarq = dlms.parse_aarq(dlms.unwrap_llc(aarq_frame.information))
+            aare = dlms.build_aare(accepted=parsed_aarq.password == PASSWORD)
+            aare_frame = HdlcFrame(
+                destination=aarq_frame.source, source=aarq_frame.destination,
+                control=control_information_frame(0, 1), information=dlms.wrap_llc_response(aare),
+            )
+            conn.sendall(aare_frame.encode())
+
+            frame = HdlcFrame.decode(read_frame_from_transport(adapter))
+            get_request = dlms.parse_get_request(dlms.unwrap_llc(frame.information))
+            payload = datatypes.encode_structure([datatypes.encode_integer(0), datatypes.encode_unsigned(0)])
+            info = dlms.build_get_response_data(get_request.invoke_id, payload)
+            response_frame = HdlcFrame(
+                destination=frame.source, source=frame.destination,
+                control=control_information_frame(1, 2), information=dlms.wrap_llc_response(info),
+            )
+            conn.sendall(response_frame.encode())
+
+            frame = HdlcFrame.decode(read_frame_from_transport(adapter))
+            get_request = dlms.parse_get_request(dlms.unwrap_llc(frame.information))
+            value = obis_values[get_request.obis]
+            info = dlms.build_get_response_data(get_request.invoke_id, datatypes.encode_double_long_unsigned(value))
+            response_frame = HdlcFrame(
+                destination=frame.source, source=frame.destination,
+                control=control_information_frame(2, 3), information=dlms.wrap_llc_response(info),
+            )
+            conn.sendall(response_frame.encode())
+        finally:
+            conn.close()
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    try:
+        # Короткий таймаут на попытку — сервер сознательно молчит после
+        # первого AARQ, клиент должен переотправить, а не просто зависнуть
+        # до общего дедлайна.
+        outcomes = _read_batch(
+            host, port, obis_specs=[(OBIS, dlms.REGISTER_CLASS_ID)], timeout_ms=300,
+        )
+    finally:
+        thread.join(timeout=3)
+        server_sock.close()
+
+    assert aarq_count["n"] == 2
+    assert outcomes[0].ok is True
+    assert outcomes[0].value == 1234567

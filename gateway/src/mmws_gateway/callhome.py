@@ -216,6 +216,13 @@ class DlT645FilteringSocket:
         дедлайн главнее и не должен незаметно продлеваться извне."""
         self._deadline = deadline
 
+    def get_deadline(self) -> float | None:
+        """Текущий абсолютный дедлайн — используется вызывающим кодом,
+        чтобы временно сузить его на время попыток AARQ с повтором
+        (см. ``hdlc_dlms._send_aarq_and_await_aare``, 2026-09-10) и затем
+        восстановить исходное значение для последующих GET."""
+        return self._deadline
+
     def settimeout(self, timeout_s: float) -> None:
         if self._deadline is not None:
             return

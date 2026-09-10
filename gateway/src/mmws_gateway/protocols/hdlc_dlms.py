@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from dataclasses import dataclass
 from datetime import timedelta
@@ -106,11 +107,9 @@ def read_register_via_established_link(
     client_addr = DEFAULT_CLIENT_ADDRESS
 
     aarq = dlms.build_aarq(password, mechanism_id=mechanism_id)
-    _send_i_frame(
-        transport, server_addr, client_addr, send_seq=0, recv_seq=0,
-        information=dlms.wrap_llc_command(aarq),
+    aare_frame = _send_aarq_and_await_aare(
+        transport, server_addr, client_addr, dlms.wrap_llc_command(aarq),
     )
-    aare_frame = _recv_i_frame(transport)
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))  # бросает AuthFailedError при отказе
 
     value, _next_send_seq, error = _read_one_register_via_established_link(
@@ -260,11 +259,9 @@ def read_registers_via_established_link(
     client_addr = DEFAULT_CLIENT_ADDRESS
 
     aarq = dlms.build_aarq(password)
-    _send_i_frame(
-        transport, server_addr, client_addr, send_seq=0, recv_seq=0,
-        information=dlms.wrap_llc_command(aarq),
+    aare_frame = _send_aarq_and_await_aare(
+        transport, server_addr, client_addr, dlms.wrap_llc_command(aarq),
     )
-    aare_frame = _recv_i_frame(transport)
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))  # AuthFailedError и т.п. — весь батч падает, это верно
 
     results: list[RegisterReadOutcome] = []
@@ -317,11 +314,9 @@ def write_register_via_established_link(
     client_addr = DEFAULT_CLIENT_ADDRESS
 
     aarq = dlms.build_aarq(password)
-    _send_i_frame(
-        transport, server_addr, client_addr, send_seq=0, recv_seq=0,
-        information=dlms.wrap_llc_command(aarq),
+    aare_frame = _send_aarq_and_await_aare(
+        transport, server_addr, client_addr, dlms.wrap_llc_command(aarq),
     )
-    aare_frame = _recv_i_frame(transport)
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))
 
     request = dlms.build_set_request(dlms.parse_obis(obis), encoded_value, class_id=class_id)
@@ -365,11 +360,9 @@ def execute_action_via_established_link(
     client_addr = DEFAULT_CLIENT_ADDRESS
 
     aarq = dlms.build_aarq(password)
-    _send_i_frame(
-        transport, server_addr, client_addr, send_seq=0, recv_seq=0,
-        information=dlms.wrap_llc_command(aarq),
+    aare_frame = _send_aarq_and_await_aare(
+        transport, server_addr, client_addr, dlms.wrap_llc_command(aarq),
     )
-    aare_frame = _recv_i_frame(transport)
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))
 
     request = dlms.build_action_request(dlms.parse_obis(obis), method_id, class_id=class_id)
@@ -441,6 +434,72 @@ def _recv_i_frame(transport: TcpTransport) -> HdlcFrame:
     )
 
 
+# Ответ производителя (Eric, 2026-09-10, см. DECISIONS.md) на разбор
+# AARE-тишины: "00 00 00" после AARQ — это heartbeat 3G/4G-модема,
+# случайно совпавший по времени, штатная процедура на этот случай —
+# "Resend the AARQ and wait for the meter's AARE response frame". До
+# этого AARQ отправлялся РОВНО ОДИН раз, дальше — пассивное ожидание
+# на весь бюджет (45-150с); теперь ждём короткими окнами и повторяем
+# отправку AARQ между ними, вместо одной длинной пассивной паузы.
+DEFAULT_AARQ_PER_ATTEMPT_TIMEOUT_S = 10.0
+DEFAULT_AARQ_MAX_ATTEMPTS = 20
+
+
+def _send_aarq_and_await_aare(
+    transport: TcpTransport,
+    server_addr: int,
+    client_addr: int,
+    aarq_information: bytes,
+    *,
+    per_attempt_timeout_s: float = DEFAULT_AARQ_PER_ATTEMPT_TIMEOUT_S,
+    max_attempts: int = DEFAULT_AARQ_MAX_ATTEMPTS,
+) -> HdlcFrame:
+    """Отправляет AARQ (I(0,0)) и ждёт AARE, повторно отправляя AARQ
+    короткими окнами вместо одного долгого пассивного ожидания (см.
+    комментарий выше). Для call-home-транспорта (``DlT645FilteringSocket``,
+    единый абсолютный дедлайн на всю операцию, включая последующие GET)
+    временно сужает дедлайн под каждую попытку и восстанавливает исходный
+    перед возвратом — иначе GET после AARE получили бы урезанный бюджет.
+    Для обычного ``TcpTransport`` (прямое IP-подключение) — сокет и так
+    использует фиксированный таймаут на каждый ``recv()``, поэтому
+    ``get_deadline``/``set_deadline`` там просто отсутствуют (duck typing),
+    и повтор AARQ происходит на этом же, уже существующем таймауте."""
+    sock = getattr(transport, "_sock", None)
+    get_deadline = getattr(sock, "get_deadline", None)
+    set_deadline = getattr(sock, "set_deadline", None)
+    original_deadline = get_deadline() if get_deadline is not None else None
+
+    last_error: MeterTimeoutError | None = None
+    try:
+        for attempt in range(1, max_attempts + 1):
+            _send_i_frame(
+                transport, server_addr, client_addr, send_seq=0, recv_seq=0,
+                information=aarq_information,
+            )
+            if set_deadline is not None:
+                narrowed = time.time() + per_attempt_timeout_s
+                if original_deadline is not None:
+                    narrowed = min(narrowed, original_deadline)
+                set_deadline(narrowed)
+            try:
+                return _recv_i_frame(transport)
+            except MeterTimeoutError as exc:
+                last_error = exc
+                logger.info(
+                    "AARE не пришло за %.0fс после AARQ (попытка %d/%d) — повторно "
+                    "отправляем AARQ (рекомендация производителя, см. DECISIONS.md 2026-09-10)",
+                    per_attempt_timeout_s, attempt, max_attempts,
+                )
+                if original_deadline is not None and time.time() >= original_deadline:
+                    break
+        raise last_error or MeterTimeoutError(
+            f"AARE не пришло после {max_attempts} попыток AARQ"
+        )
+    finally:
+        if set_deadline is not None:
+            set_deadline(original_deadline)
+
+
 def read_load_profile(
     transport: TcpTransport,
     *,
@@ -502,11 +561,9 @@ def read_load_profile_via_established_link(
     client_addr = DEFAULT_CLIENT_ADDRESS
 
     aarq = dlms.build_aarq(password)
-    _send_i_frame(
-        transport, server_addr, client_addr, send_seq=0, recv_seq=0,
-        information=dlms.wrap_llc_command(aarq),
+    aare_frame = _send_aarq_and_await_aare(
+        transport, server_addr, client_addr, dlms.wrap_llc_command(aarq),
     )
-    aare_frame = _recv_i_frame(transport)
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))
 
     parsed_obis = dlms.parse_obis(obis)
