@@ -196,10 +196,22 @@ class DlT645FilteringSocket:
     выставляет ``settimeout()`` заново ПЕРЕД каждым отдельным вызовом,
     так что накопленное время не может незаметно продлеваться шумом."""
 
+    # Сколько последних сырых байт держать в буфере диагностики (2026-09-10,
+    # см. DECISIONS.md — по просьбе пользователя, вдохновлено находкой в
+    # референсной C#-программе: для части моделей счётчиков штатный
+    # DLMS-парсер получает байты, не укладывающиеся в строгий формат
+    # ("Invalid data type."), и референс для таких моделей это терпит, а
+    # не считает провалом). Наша фильтрация "в поиске кадра" отбрасывает
+    # нераспознанные байты ДО попытки разбора — так что при отказе чтения
+    # не было видно, было ли на самом деле что-то на проводе, что не
+    # сложилось в валидный кадр, или действительно полная тишина.
+    _MAX_CAPTURED_BYTES = 4096
+
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
         self._seeking = True
         self._deadline: float | None = None
+        self._captured = bytearray()
 
     def reset_seeking(self) -> None:
         """Включает фильтрацию заново перед следующим кадром — вызывается
@@ -240,7 +252,22 @@ class DlT645FilteringSocket:
             if remaining <= 0:
                 raise socket.timeout("Дедлайн ожидания ответа счётчика истёк")
             self._sock.settimeout(remaining)
-        return self._sock.recv(n)
+        chunk = self._sock.recv(n)
+        if chunk:
+            self._captured += chunk
+            overflow = len(self._captured) - self._MAX_CAPTURED_BYTES
+            if overflow > 0:
+                del self._captured[:overflow]
+        return chunk
+
+    def captured_hex(self) -> str:
+        """Все сырые байты, реально пришедшие по сокету (до фильтрации,
+        независимо от того, сложились ли они в валидный кадр) — для
+        диагностики отказов чтения, см. докстринг ``_MAX_CAPTURED_BYTES``."""
+        return self._captured.hex()
+
+    def clear_captured(self) -> None:
+        self._captured.clear()
 
     def _raw_recv_exact(self, n: int) -> bytes:
         buf = bytearray()
@@ -740,6 +767,29 @@ def read_via_call_home(
     raise GatewayError(f"Не удалось прочитать регистр со счётчика {serial} за {max_wait_s}с")
 
 
+def _log_captured_on_failure(filtering_sock: "DlT645FilteringSocket", conn_no: int, stage: str) -> None:
+    """Диагностика (2026-09-10, см. DECISIONS.md — находка в референсной
+    C#-программе: штатный DLMS-парсер для части моделей счётчиков может
+    получить байты, не укладывающиеся в строгий формат ("Invalid data
+    type."), и референс для таких моделей это терпит, а не считает
+    провалом). Наша фильтрация "в поиске кадра" отбрасывает нераспознанные
+    байты ДО попытки разбора — логируем всё, что реально пришло по
+    сокету на этом этапе, чтобы увидеть, было ли на проводе что-то, что
+    не сложилось в валидный кадр, или действительно полная тишина."""
+    raw_hex = filtering_sock.captured_hex()
+    if raw_hex:
+        logger.info(
+            "Immediate-read: соединение #%d — на этапе %s получено %d сырых байт, "
+            "не сложившихся в успешный обмен: %s",
+            conn_no, stage, len(raw_hex) // 2, raw_hex,
+        )
+    else:
+        logger.info(
+            "Immediate-read: соединение #%d — на этапе %s не пришло ВООБЩЕ НИ БАЙТА",
+            conn_no, stage,
+        )
+
+
 def read_batch_via_fresh_connection(
     pc: "_PooledConnection",
     *,
@@ -795,15 +845,21 @@ def read_batch_via_fresh_connection(
         time.sleep(retry_interval_s)
 
     if not linked:
+        _log_captured_on_failure(filtering_sock, pc.conn_no, "SNRM")
         raise last_error or GatewayError(
             f"Immediate-read: счётчик {serial} не подтвердил SNRM на свежем соединении "
             f"за {max_attempts} попыток"
         )
 
     filtering_sock.set_deadline(time.time() + association_timeout_ms / 1000)
-    return hdlc_dlms.read_registers_via_established_link(
-        transport, serial=serial, password=password, obis_specs=obis_specs
-    )
+    filtering_sock.clear_captured()  # SNRM/UA уже прошли — интересны только байты ПОСЛЕ этого
+    try:
+        return hdlc_dlms.read_registers_via_established_link(
+            transport, serial=serial, password=password, obis_specs=obis_specs
+        )
+    except Exception:
+        _log_captured_on_failure(filtering_sock, pc.conn_no, "AARQ/AARE/GET")
+        raise
 
 
 def read_load_profile_via_call_home(
