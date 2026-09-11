@@ -34,15 +34,21 @@ from ..schemas import (
     ClaimDueJobsRequest,
     ClaimDueJobsResponse,
     DueJobOut,
+    DueLoadProfileJobOut,
     ReportJobResultsRequest,
     ReportJobResultsResponse,
+    ReportLoadProfileResultRequest,
+    ReportLoadProfileResultResponse,
 )
 from ..services.gateway_client import ReadResult
+from ..services.load_profile import DEFAULT_LOAD_PROFILE_OBIS
 from ..services.job_worker import (
     RATED_CURRENT_OBIS,
+    _insert_load_profile_row,
     _maybe_finalize_scheduled_job_run,
     claim_due_jobs_for_meter,
     finalize_read_current_job,
+    finalize_read_load_profile_job,
     finalize_read_rated_current_job,
 )
 from ..services.res_mapping import res_name_for_port
@@ -120,6 +126,7 @@ async def claim_due_jobs(
     claimed = await claim_due_jobs_for_meter(db, meter_id=meter.id, job_types=body.job_types, limit=limit)
 
     jobs: list[DueJobOut] = []
+    load_profile_jobs: list[DueLoadProfileJobOut] = []
     for job in claimed:
         if job.job_type == "read_current":
             # class_id — из payload (по умолчанию 0 = Register), а не
@@ -137,6 +144,17 @@ async def claim_due_jobs(
             )
         elif job.job_type == "read_rated_current":
             jobs.append(DueJobOut(job_id=job.id, job_type=job.job_type, obis=RATED_CURRENT_OBIS, class_id=0))
+        elif job.job_type == "read_load_profile":
+            # 2026-09-11 — перенос на событийный путь (см. DECISIONS.md).
+            load_profile_jobs.append(
+                DueLoadProfileJobOut(
+                    job_id=job.id,
+                    obis=job.payload.get("obis") or DEFAULT_LOAD_PROFILE_OBIS,
+                    class_id=job.payload.get("class_id", 0),
+                    from_iso=job.payload["from_iso"],
+                    to_iso=job.payload["to_iso"],
+                )
+            )
 
     password = decrypt_secret(meter.password_encrypted).decode("ascii")
     return ClaimDueJobsResponse(
@@ -145,6 +163,7 @@ async def claim_due_jobs(
         protocol_profile=meter.protocol_profile.value,
         password=password,
         jobs=jobs,
+        load_profile_jobs=load_profile_jobs,
     )
 
 
@@ -191,3 +210,48 @@ async def report_job_results(
         accepted += 1
 
     return ReportJobResultsResponse(accepted=accepted, skipped=skipped)
+
+
+@router.post("/load-profile-results", response_model=ReportLoadProfileResultResponse)
+async def report_load_profile_results(
+    body: ReportLoadProfileResultRequest,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_gateway_internal_secret),
+) -> ReportLoadProfileResultResponse:
+    """2026-09-11 — перенос read_load_profile на событийный путь (см.
+    DECISIONS.md). Gateway собирает все строки буфера в памяти (генератор
+    ``read_load_profile_via_established_link``, как и раньше) и
+    отчитывается ОДНИМ запросом — обрыв связи посреди передачи не теряет
+    уже собранные строки (``ok=False, is_partial=True, rows`` непустой)."""
+    result = await db.execute(select(Meter).where(Meter.serial_number == body.serial))
+    meter = result.scalar_one_or_none()
+    if meter is None:
+        return ReportLoadProfileResultResponse(accepted=False, rows_written=0)
+
+    job = await db.get(Job, body.job_id)
+    # job уже не RUNNING — старый путь (после реанимации stale_job_
+    # reaper_loop) успел обработать её первым — тот же принцип
+    # анти-задвоения, что и в report_job_results.
+    if job is None or job.meter_id != meter.id or job.status != JobStatus.RUNNING:
+        return ReportLoadProfileResultResponse(accepted=False, rows_written=0)
+
+    rows_written = 0
+    for row in body.rows:
+        await _insert_load_profile_row(
+            db, meter_id=meter.id, obis=body.obis, job_id=job.id,
+            timestamp_iso=row.timestamp_iso, values=row.values,
+        )
+        rows_written += 1
+
+    error_info = None
+    if not body.ok:
+        error_info = {
+            "code": body.error_code, "message": body.error_message,
+            "is_partial": body.is_partial or rows_written > 0,
+        }
+    await finalize_read_load_profile_job(db, job, meter, obis=body.obis, rows_written=rows_written, error_info=error_info)
+
+    if job.scheduled_job_run_id is not None:
+        await _maybe_finalize_scheduled_job_run(db, job.scheduled_job_run_id)
+
+    return ReportLoadProfileResultResponse(accepted=True, rows_written=rows_written)

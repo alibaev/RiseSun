@@ -183,3 +183,67 @@ def test_report_job_results_returns_false_on_unreachable_backend(monkeypatch):
         "202306004113", [backend_client.JobResultReport(job_id=1, obis="1.1.1.8.0.ff", ok=False)], timeout_s=1.0
     )
     assert ok is False
+
+
+def test_claim_due_jobs_returns_load_profile_jobs_even_without_register_jobs():
+    """2026-09-11 — перенос read_load_profile на событийный путь (см.
+    DECISIONS.md). Раньше отсутствие обычных jobs трактовалось как
+    "нечего делать" безусловно — из-за этого чисто профильный ответ
+    (jobs=[], load_profile_jobs непустой) молча отбрасывался целиком."""
+    _StubHandler.response_body = {
+        "meter_found": True, "meter_id": 42, "protocol_profile": "hdlc_dlms", "password": "12345678",
+        "jobs": [],
+        "load_profile_jobs": [
+            {
+                "job_id": 9, "obis": "1.1.63.1.0.ff", "class_id": 7,
+                "from_iso": "2026-09-11T00:00:00", "to_iso": "2026-09-11T01:00:00",
+            }
+        ],
+    }
+    result = backend_client.claim_due_jobs("202306004113")
+    assert result is not None
+    assert result.jobs == []
+    assert len(result.load_profile_jobs) == 1
+    lp = result.load_profile_jobs[0]
+    assert lp.job_id == 9
+    assert lp.from_iso == "2026-09-11T00:00:00"
+    assert lp.to_iso == "2026-09-11T01:00:00"
+
+
+def test_claim_due_jobs_returns_none_when_both_job_lists_empty():
+    _StubHandler.response_body = {
+        "meter_found": True, "meter_id": 42, "protocol_profile": "hdlc_dlms", "password": "12345678",
+        "jobs": [], "load_profile_jobs": [],
+    }
+    assert backend_client.claim_due_jobs("202306004113") is None
+
+
+def test_report_load_profile_results_sends_rows_and_flags():
+    _StubHandler.response_body = {"accepted": True, "rows_written": 2}
+    ok = backend_client.report_load_profile_results(
+        "202306004113",
+        job_id=9,
+        obis="1.1.63.1.0.ff",
+        rows=[
+            backend_client.LoadProfileRowReport(timestamp_iso="2026-09-11T00:15:00", values=[100]),
+            backend_client.LoadProfileRowReport(timestamp_iso="2026-09-11T00:30:00", values=[105]),
+        ],
+        ok=True,
+    )
+    assert ok is True
+    assert _StubHandler.last_request["serial"] == "202306004113"
+    assert _StubHandler.last_request["job_id"] == 9
+    assert _StubHandler.last_request["rows"] == [
+        {"timestamp_iso": "2026-09-11T00:15:00", "values": [100]},
+        {"timestamp_iso": "2026-09-11T00:30:00", "values": [105]},
+    ]
+    assert _StubHandler.last_request["ok"] is True
+
+
+def test_report_load_profile_results_returns_false_on_unreachable_backend(monkeypatch):
+    monkeypatch.setattr(backend_client, "DEFAULT_BACKEND_INTERNAL_URL", "http://127.0.0.1:1")
+    ok = backend_client.report_load_profile_results(
+        "202306004113", job_id=9, obis="1.1.63.1.0.ff", rows=[], ok=False,
+        error_code="TIMEOUT", timeout_s=1.0,
+    )
+    assert ok is False

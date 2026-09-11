@@ -698,6 +698,20 @@ def read_load_profile_via_established_link(
     )
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))
 
+    # 2026-09-11 — тот же баг, что был найден и исправлен для регистров
+    # (см. read_registers_via_established_link и DECISIONS.md,
+    # "class_id=0 никогда не нормализовался на событийном пути"): job'ы
+    # read_load_profile, создаваемые через API/планировщик, обычно не
+    # указывают class_id в payload вовсе (см. api/meters.py) — Backend
+    # тогда отдаёт 0 по умолчанию (gateway_internal.py:
+    # ``job.payload.get("class_id", 0)``). Старый gRPC-путь нормализовал
+    # 0 в PROFILE_GENERIC_CLASS_ID снаружи, в grpc_server.py, ДО вызова
+    # этой функции — новый (событийный) путь вызывает её напрямую и того
+    # шага не делал. Нормализация здесь, внутри established_link-функции
+    # (а не у каждого вызывающего кода по отдельности), защищает сразу
+    # все три точки входа (call-home, call-home batch, обычный TCP).
+    class_id = class_id or dlms.PROFILE_GENERIC_CLASS_ID
+
     parsed_obis = dlms.parse_obis(obis)
 
     period_request = dlms.build_get_request(

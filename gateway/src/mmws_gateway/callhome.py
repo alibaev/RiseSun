@@ -44,6 +44,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from .errors import GatewayError, NoConnectionEstablishedError
 
@@ -644,7 +645,7 @@ class CallHomePool:
             from . import backend_client
 
             claimed = backend_client.claim_due_jobs(pc.serial, peer_ip=pc.peer[0], local_port=pc.local_port)
-            if claimed is None or not claimed.jobs:
+            if claimed is None or not (claimed.jobs or claimed.load_profile_jobs):
                 return
 
             with self._lock:
@@ -680,130 +681,224 @@ class CallHomePool:
                     pc.serial, len(same_serial_others), pc.conn_no,
                 )
 
-            obis_specs = [(job.obis, job.class_id) for job in claimed.jobs]
             password_bytes = claimed.password.encode("ascii")
-            deadline = time.time() + DEFAULT_IMMEDIATE_READ_MAX_WAIT_S
-            outcomes: list = []
-            remaining = list(candidates)
-            while True:
-                if time.time() >= deadline:
-                    logger.info(
-                        "Immediate-read: общий бюджет ожидания (%.0fс) для счётчика %s исчерпан%s",
-                        DEFAULT_IMMEDIATE_READ_MAX_WAIT_S, pc.serial,
-                        f", {len(remaining)} соединений не пробовали" if remaining else "",
-                    )
-                    break
-                if not remaining:
-                    # 2026-09-11 (по просьбе пользователя) — все уже
-                    # случайно оказавшиеся в пуле held-соединения этого
-                    # счётчика исчерпаны (либо провалом, либо "залипшей"
-                    # ассоциацией, см. ниже), а бюджет ожидания ещё не
-                    # истёк: ждём СЛЕДУЮЩИЙ дозвон этого же счётчика,
-                    # вместо немедленной сдачи — раньше цикл реагировал
-                    # только на то, что уже лежало в пуле на момент
-                    # опознания, следующего дозвона не ждал вовсе.
-                    next_pc = self._wait_for_sibling_connection(pc.serial, deadline)
-                    if next_pc is None:
-                        break
-                    logger.info(
-                        "Immediate-read: дождались следующего дозвона счётчика %s — соединение #%d",
-                        pc.serial, next_pc.conn_no,
-                    )
-                    remaining.append(next_pc)
-                    continue
-                candidate = remaining.pop(0)
-                try:
-                    if pc.serial in VER2_EMULATION_TEST_SERIALS:
-                        from .protocols import dlms as dlms_module
 
+            if claimed.jobs:
+                obis_specs = [(job.obis, job.class_id) for job in claimed.jobs]
+                deadline = time.time() + DEFAULT_IMMEDIATE_READ_MAX_WAIT_S
+                outcomes: list = []
+                remaining = list(candidates)
+                while True:
+                    if time.time() >= deadline:
                         logger.info(
-                            "Immediate-read: соединение #%d — эксперимент 'эмуляция ver2.zip' "
-                            "для счётчика %s", candidate.conn_no, pc.serial,
+                            "Immediate-read: общий бюджет ожидания (%.0fс) для счётчика %s исчерпан%s",
+                            DEFAULT_IMMEDIATE_READ_MAX_WAIT_S, pc.serial,
+                            f", {len(remaining)} соединений не пробовали" if remaining else "",
                         )
-                        outcomes = read_batch_via_fresh_connection(
-                            candidate, serial=pc.serial, password=password_bytes, obis_specs=obis_specs,
-                            aarq_user_information=dlms_module.USER_INFORMATION_INITIATE_VER2_VARIANT,
-                            aare_per_attempt_timeout_s=20.0,
-                            aare_max_attempts=3,
-                            send_disc_before_retry=False,
-                        )
-                    else:
-                        outcomes = read_batch_via_fresh_connection(
-                            candidate, serial=pc.serial, password=password_bytes, obis_specs=obis_specs,
-                        )
-                    if outcomes and not any(o.ok for o in outcomes):
-                        # 2026-09-11, см. DECISIONS.md ("покопайся в
-                        # истории логов сервера") — эксперимент показал:
-                        # ассоциация может успешно установиться (AARE
-                        # получен), но ВСЕ последующие чтения (проверено
-                        # на 8 разных OBIS = 16 GET в одной ассоциации)
-                        # стабильно возвращают один и тот же мусорный
-                        # ответ — "залипшая" ассоциация, не помогает ни
-                        # разнообразие OBIS, ни отдельные invoke_id. Раньше
-                        # такой результат принимался как окончательный
-                        # (единственный успешный обмен без исключения —
-                        # цикл сразу прерывался). Теперь пробуем СВЕЖУЮ
-                        # ассоциацию вместо того, чтобы сдаваться на
-                        # заведомо плохой — либо уже готовую запасную из
-                        # пула, либо (см. ветку "not remaining" выше)
-                        # дождавшись следующего дозвона.
+                        break
+                    if not remaining:
+                        # 2026-09-11 (по просьбе пользователя) — все уже
+                        # случайно оказавшиеся в пуле held-соединения этого
+                        # счётчика исчерпаны (либо провалом, либо "залипшей"
+                        # ассоциацией, см. ниже), а бюджет ожидания ещё не
+                        # истёк: ждём СЛЕДУЮЩИЙ дозвон этого же счётчика,
+                        # вместо немедленной сдачи — раньше цикл реагировал
+                        # только на то, что уже лежало в пуле на момент
+                        # опознания, следующего дозвона не ждал вовсе.
+                        next_pc = self._wait_for_sibling_connection(pc.serial, deadline)
+                        if next_pc is None:
+                            break
                         logger.info(
-                            "Immediate-read: соединение #%d — ассоциация установилась, но все %d "
-                            "чтений вернулись с ошибкой (похоже на «залипшую» ассоциацию) — "
-                            "пробуем следующую",
-                            candidate.conn_no, len(outcomes),
+                            "Immediate-read: дождались следующего дозвона счётчика %s — соединение #%d",
+                            pc.serial, next_pc.conn_no,
                         )
+                        remaining.append(next_pc)
                         continue
-                    break
-                except GatewayError as exc:
-                    logger.info(
-                        "Immediate-read: соединение #%d — обмен не удался (%s)%s",
-                        candidate.conn_no, exc.code,
-                        f", пробуем следующее из {len(remaining)} оставшихся" if remaining else "",
-                    )
-                    outcomes = []
-                except (ConnectionError, OSError) as exc:
-                    logger.info("Immediate-read: соединение #%d оборвалось (%s)", candidate.conn_no, exc)
-                    outcomes = []
-                finally:
+                    candidate = remaining.pop(0)
+                    try:
+                        if pc.serial in VER2_EMULATION_TEST_SERIALS:
+                            from .protocols import dlms as dlms_module
+
+                            logger.info(
+                                "Immediate-read: соединение #%d — эксперимент 'эмуляция ver2.zip' "
+                                "для счётчика %s", candidate.conn_no, pc.serial,
+                            )
+                            outcomes = read_batch_via_fresh_connection(
+                                candidate, serial=pc.serial, password=password_bytes, obis_specs=obis_specs,
+                                aarq_user_information=dlms_module.USER_INFORMATION_INITIATE_VER2_VARIANT,
+                                aare_per_attempt_timeout_s=20.0,
+                                aare_max_attempts=3,
+                                send_disc_before_retry=False,
+                            )
+                        else:
+                            outcomes = read_batch_via_fresh_connection(
+                                candidate, serial=pc.serial, password=password_bytes, obis_specs=obis_specs,
+                            )
+                        if outcomes and not any(o.ok for o in outcomes):
+                            # 2026-09-11, см. DECISIONS.md ("покопайся в
+                            # истории логов сервера") — эксперимент показал:
+                            # ассоциация может успешно установиться (AARE
+                            # получен), но ВСЕ последующие чтения (проверено
+                            # на 8 разных OBIS = 16 GET в одной ассоциации)
+                            # стабильно возвращают один и тот же мусорный
+                            # ответ — "залипшая" ассоциация, не помогает ни
+                            # разнообразие OBIS, ни отдельные invoke_id. Раньше
+                            # такой результат принимался как окончательный
+                            # (единственный успешный обмен без исключения —
+                            # цикл сразу прерывался). Теперь пробуем СВЕЖУЮ
+                            # ассоциацию вместо того, чтобы сдаваться на
+                            # заведомо плохой — либо уже готовую запасную из
+                            # пула, либо (см. ветку "not remaining" выше)
+                            # дождавшись следующего дозвона.
+                            logger.info(
+                                "Immediate-read: соединение #%d — ассоциация установилась, но все %d "
+                                "чтений вернулись с ошибкой (похоже на «залипшую» ассоциацию) — "
+                                "пробуем следующую",
+                                candidate.conn_no, len(outcomes),
+                            )
+                            continue
+                        break
+                    except GatewayError as exc:
+                        logger.info(
+                            "Immediate-read: соединение #%d — обмен не удался (%s)%s",
+                            candidate.conn_no, exc.code,
+                            f", пробуем следующее из {len(remaining)} оставшихся" if remaining else "",
+                        )
+                        outcomes = []
+                    except (ConnectionError, OSError) as exc:
+                        logger.info("Immediate-read: соединение #%d оборвалось (%s)", candidate.conn_no, exc)
+                        outcomes = []
+                    finally:
+                        candidate.cancelled.set()
+                        try:
+                            candidate.raw_sock.close()
+                        except OSError:
+                            pass
+                for candidate in remaining:
                     candidate.cancelled.set()
                     try:
                         candidate.raw_sock.close()
                     except OSError:
                         pass
-            for candidate in remaining:
+
+                if not outcomes:
+                    logger.info(
+                        "Immediate-read: не удалось прочитать счётчик %s ни на одном из %d "
+                        "испробованных соединений — job'ы вернутся в очередь по таймауту",
+                        pc.serial, len(candidates) - len(remaining),
+                    )
+
+                if outcomes:
+                    results = [
+                        backend_client.JobResultReport(
+                            job_id=job.job_id, obis=job.obis, ok=outcome.ok,
+                            value=_json_safe_value(outcome.value),
+                            error_code=outcome.error.code if outcome.error else None,
+                            error_message=outcome.error.message if outcome.error else None,
+                            is_partial=False,
+                        )
+                        for job, outcome in zip(claimed.jobs, outcomes)
+                    ]
+                    if not backend_client.report_job_results(pc.serial, results):
+                        logger.warning(
+                            "Immediate-read: не удалось отправить результаты в Backend для %s — "
+                            "job'ы вернутся в очередь по таймауту",
+                            pc.serial,
+                        )
+            else:
+                # Нет обычных read_current/read_rated_current job'ов —
+                # свежепринятые held-соединения того же дозвона (если
+                # были) никому не понадобились, закрываем сразу же, не
+                # оставляя висеть до истечения окна/лимита (тот же
+                # принцип, что и в ветке с register-job'ами выше).
+                for candidate in candidates:
+                    candidate.cancelled.set()
+                    try:
+                        candidate.raw_sock.close()
+                    except OSError:
+                        pass
+
+            if claimed.load_profile_jobs:
+                self._run_load_profile_jobs(pc, claimed, password_bytes)
+        except Exception:
+            logger.exception("Immediate-read: неожиданная ошибка при обработке соединения #%d", pc.conn_no)
+
+    def _run_load_profile_jobs(
+        self,
+        pc: "_PooledConnection",
+        claimed: "backend_client.ClaimDueJobsResult",
+        password_bytes: bytes,
+    ) -> None:
+        """2026-09-11 — перенос ``read_load_profile`` на событийный путь
+        (см. DECISIONS.md, план ticklish-popping-bear.md). Вызывается из
+        ``_maybe_trigger_immediate_read`` ПОСЛЕ обработки обычных
+        read_current/read_rated_current job'ов того же дозвона (если
+        были) — к этому моменту все ранее опробованные held-соединения
+        уже закрыты (см. ``finally``/`candidate.raw_sock.close()` выше и
+        ветку "нет register-job'ов"), поэтому почти всегда приходится
+        ждать СЛЕДУЮЩИЙ дозвон этого же счётчика (``_wait_for_sibling_
+        connection``) — так же, как ветка "not remaining" в основном
+        цикле. Каждый load-profile job обрабатывается на ОТДЕЛЬНОМ
+        свежем соединении — несколько job'ов подряд не пытаемся уместить
+        в одну ассоциацию (в отличие от read_current-батча): чтение
+        профиля — заметно более длительный обмен (датаблоки), и делить
+        общий бюджет ожидания между несколькими такими попытками
+        означало бы почти гарантированный провал всех."""
+        from . import backend_client
+
+        for job in claimed.load_profile_jobs:
+            deadline = time.time() + DEFAULT_IMMEDIATE_READ_MAX_WAIT_S
+            candidate = self._wait_for_sibling_connection(pc.serial, deadline)
+            if candidate is None:
+                logger.info(
+                    "Immediate-read (профиль): не дождались нового соединения счётчика %s "
+                    "для job #%d за %.0fс — job вернётся в очередь по таймауту",
+                    pc.serial, job.job_id, DEFAULT_IMMEDIATE_READ_MAX_WAIT_S,
+                )
+                continue
+
+            error: GatewayError | None
+            try:
+                from_dt = datetime.fromisoformat(job.from_iso)
+                to_dt = datetime.fromisoformat(job.to_iso)
+                rows, error = read_load_profile_via_fresh_connection(
+                    candidate, serial=pc.serial, password=password_bytes,
+                    obis=job.obis, class_id=job.class_id, from_dt=from_dt, to_dt=to_dt,
+                )
+            except GatewayError as exc:
+                logger.info(
+                    "Immediate-read (профиль): соединение #%d — обмен не удался (%s)",
+                    candidate.conn_no, exc.code,
+                )
+                rows, error = [], exc
+            except (ConnectionError, OSError) as exc:
+                logger.info("Immediate-read (профиль): соединение #%d оборвалось (%s)", candidate.conn_no, exc)
+                rows, error = [], GatewayError(f"Обрыв соединения #{candidate.conn_no}: {exc}")
+            finally:
                 candidate.cancelled.set()
                 try:
                     candidate.raw_sock.close()
                 except OSError:
                     pass
 
-            if not outcomes:
-                logger.info(
-                    "Immediate-read: не удалось прочитать счётчик %s ни на одном из %d "
-                    "испробованных соединений — job'ы вернутся в очередь по таймауту",
-                    pc.serial, len(candidates) - len(remaining),
+            report_rows = [
+                backend_client.LoadProfileRowReport(
+                    timestamp_iso=timestamp.isoformat(), values=_json_safe_value(values),
                 )
-
-            if outcomes:
-                results = [
-                    backend_client.JobResultReport(
-                        job_id=job.job_id, obis=job.obis, ok=outcome.ok,
-                        value=_json_safe_value(outcome.value),
-                        error_code=outcome.error.code if outcome.error else None,
-                        error_message=outcome.error.message if outcome.error else None,
-                        is_partial=False,
-                    )
-                    for job, outcome in zip(claimed.jobs, outcomes)
-                ]
-                if not backend_client.report_job_results(pc.serial, results):
-                    logger.warning(
-                        "Immediate-read: не удалось отправить результаты в Backend для %s — "
-                        "job'ы вернутся в очередь по таймауту",
-                        pc.serial,
-                    )
-        except Exception:
-            logger.exception("Immediate-read: неожиданная ошибка при обработке соединения #%d", pc.conn_no)
+                for timestamp, values in rows
+            ]
+            ok = error is None
+            if not backend_client.report_load_profile_results(
+                pc.serial, job_id=job.job_id, obis=job.obis, rows=report_rows, ok=ok,
+                error_code=error.code if error else None,
+                error_message=error.message if error else None,
+                is_partial=(error is not None and len(report_rows) > 0),
+            ):
+                logger.warning(
+                    "Immediate-read (профиль): не удалось отправить результаты в Backend для %s "
+                    "(job #%d) — job вернётся в очередь по таймауту",
+                    pc.serial, job.job_id,
+                )
 
     def pending_count(self, serial: str | None = None) -> int:
         with self._lock:
@@ -1071,6 +1166,99 @@ def read_batch_via_fresh_connection(
     except Exception:
         _log_captured_on_failure(filtering_sock, pc.conn_no, "AARQ/AARE/GET")
         raise
+
+
+def read_load_profile_via_fresh_connection(
+    pc: "_PooledConnection",
+    *,
+    serial: str,
+    password: bytes,
+    obis: str,
+    class_id: int,
+    from_dt,
+    to_dt,
+    retry_interval_s: float = DEFAULT_RETRY_INTERVAL_S,
+    per_attempt_timeout_ms: int = DEFAULT_PER_ATTEMPT_TIMEOUT_MS,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS_PER_CONNECTION,
+    association_timeout_ms: int = DEFAULT_ASSOCIATION_TIMEOUT_MS,
+) -> tuple[list[tuple[object, object]], "GatewayError | None"]:
+    """Профиль нагрузки через событийный путь (2026-09-11, см.
+    DECISIONS.md — перенос read_load_profile на immediate-read; живой
+    эксперимент подтвердил, что ассоциация на свежем соединении держится
+    и после AARE, не только до него). Аналог ``read_batch_via_fresh_
+    connection`` (тот же SNRM-повтор + терпеливое ожидание AARE через
+    единый дедлайн), но вызывает ``hdlc_dlms.read_load_profile_via_
+    established_link`` вместо чтения регистров — генератор датаблоков,
+    поэтому результат собирается в список, а не возвращается как есть:
+    обрыв связи посреди передачи НЕ должен терять уже собранные строки
+    (см. вызывающий код и ``backend_client.report_load_profile_results``
+    — отчёт с частичным результатом, а не пустая рука).
+
+    Возвращает ``(строки, ошибка)`` — ``ошибка is None`` при чистом
+    завершении (в т.ч. если сам диапазон дат пуст — строк тогда нет, но
+    это не отказ); при обрыве/отказе строки, собранные ДО этого момента,
+    всё равно возвращаются вместе с ошибкой."""
+    from .protocols import hdlc_dlms
+    from .transport import TcpServerTransport
+
+    hdlc_dlms.server_hdlc_address(hdlc_dlms.physical_address(serial, hdlc_dlms.HDLC_DLMS))
+
+    filtering_sock = DlT645FilteringSocket(pc.raw_sock)
+    linked = False
+    transport = None
+    last_error: GatewayError | None = None
+    for attempt in range(1, max_attempts + 1):
+        transport = TcpServerTransport.from_accepted_socket(
+            filtering_sock, peer_host=pc.peer[0], peer_port=pc.peer[1], timeout_ms=per_attempt_timeout_ms
+        )
+        try:
+            hdlc_dlms.establish_link(transport, serial=serial)
+            linked = True
+            break
+        except GatewayError as exc:
+            last_error = exc
+            logger.info(
+                "Immediate-read (профиль): попытка %d SNRM на соединении #%d — %s, повтор",
+                attempt, pc.conn_no, exc.code,
+            )
+        except (ConnectionError, OSError) as exc:
+            raise GatewayError(f"Обрыв соединения #{pc.conn_no}: {exc}") from exc
+        time.sleep(retry_interval_s)
+
+    if not linked:
+        _log_captured_on_failure(filtering_sock, pc.conn_no, "SNRM (профиль)")
+        raise last_error or GatewayError(
+            f"Immediate-read (профиль): счётчик {serial} не подтвердил SNRM на свежем соединении "
+            f"за {max_attempts} попыток"
+        )
+
+    from .protocols.datatypes import DlmsDataError
+
+    filtering_sock.set_deadline(time.time() + association_timeout_ms / 1000)
+    filtering_sock.clear_captured()
+    rows: list[tuple[object, object]] = []
+    try:
+        for row in hdlc_dlms.read_load_profile_via_established_link(
+            transport, serial=serial, password=password, obis=obis, class_id=class_id,
+            from_dt=from_dt, to_dt=to_dt,
+        ):
+            rows.append(row)
+    except GatewayError as exc:
+        if exc.code == "AUTH_FAILED":
+            raise
+        _log_captured_on_failure(filtering_sock, pc.conn_no, "AARQ/AARE/GET (профиль)")
+        return rows, exc
+    except DlmsDataError as exc:
+        # 2026-09-10 нашли этот же класс бага для обычных регистров (см.
+        # DECISIONS.md) — DlmsDataError НЕ подкласс GatewayError, поэтому
+        # не ловится строкой выше; счётчик ответил, просто некорректными
+        # данными (напр. на GET capture_period) — это отказ ЭТОЙ попытки,
+        # а не необработанное исключение, роняющее весь поток identify().
+        _log_captured_on_failure(filtering_sock, pc.conn_no, "AARQ/AARE/GET (профиль)")
+        return rows, GatewayError(f"Некорректные данные в ответе счётчика: {exc}")
+    except (ConnectionError, OSError) as exc:
+        return rows, GatewayError(f"Обрыв соединения #{pc.conn_no}: {exc}")
+    return rows, None
 
 
 def read_load_profile_via_call_home(

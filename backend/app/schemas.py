@@ -378,7 +378,10 @@ class DueJobOut(BaseModel):
 
 
 class ClaimDueJobsRequest(BaseModel):
-    job_types: list[str] = ["read_current", "read_rated_current"]
+    # read_load_profile добавлен 2026-09-11 (см. DECISIONS.md — перенос
+    # профиля нагрузки на событийный путь); Gateway это поле вообще не
+    # передаёт, всегда используется этот дефолт.
+    job_types: list[str] = ["read_current", "read_rated_current", "read_load_profile"]
     max_jobs: int | None = Field(default=None, description="По умолчанию — settings.gateway_internal_claim_batch_max")
     peer_ip: str | None = Field(
         default=None,
@@ -401,12 +404,24 @@ class ClaimDueJobsRequest(BaseModel):
     )
 
 
+class DueLoadProfileJobOut(BaseModel):
+    # 2026-09-11 — перенос read_load_profile на событийный путь (см.
+    # DECISIONS.md). Отдельная форма от DueJobOut — задача на профиль
+    # несёт диапазон дат, а не только obis/class_id.
+    job_id: int
+    obis: str
+    class_id: int = Field(description="0 = класс по умолчанию Gateway (Profile Generic, класс 7)")
+    from_iso: str
+    to_iso: str
+
+
 class ClaimDueJobsResponse(BaseModel):
     meter_found: bool
     meter_id: int | None = None
     protocol_profile: str | None = None
     password: str | None = Field(default=None, description="Расшифрованный пароль доступа (LLS), ASCII")
     jobs: list[DueJobOut] = []
+    load_profile_jobs: list[DueLoadProfileJobOut] = []
 
 
 class JobResultIn(BaseModel):
@@ -427,6 +442,32 @@ class ReportJobResultsRequest(BaseModel):
 class ReportJobResultsResponse(BaseModel):
     accepted: int
     skipped: int = Field(description="Job'ы, которые уже не были RUNNING на момент отчёта (см. анти-задвоение)")
+
+
+class LoadProfileRowIn(BaseModel):
+    timestamp_iso: str
+    values: list[object]
+
+
+class ReportLoadProfileResultRequest(BaseModel):
+    # 2026-09-11 — Gateway собирает ВСЕ строки в памяти по мере прихода
+    # датаблоков (как и раньше, generator в hdlc_dlms.read_load_profile_
+    # via_established_link) и отчитывается ОДНИМ запросом в конце — как
+    # частичным успехом (обрыв связи посреди передачи — уже собранные
+    # строки не теряются), так и полным.
+    serial: str
+    job_id: int
+    obis: str
+    rows: list[LoadProfileRowIn] = []
+    ok: bool
+    error_code: str | None = None
+    error_message: str | None = None
+    is_partial: bool = False
+
+
+class ReportLoadProfileResultResponse(BaseModel):
+    accepted: bool
+    rows_written: int = 0
 
 
 ScheduledJobType = Literal["read_current", "read_load_profile", "read_rated_current"]

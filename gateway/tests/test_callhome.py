@@ -547,6 +547,7 @@ def test_read_via_call_home_fails_fast_on_unaddressable_serial():
 def _run_fake_meter_load_profile(
     conn: socket.socket, *, addr6: bytes, password: bytes,
     load_profile_obis: bytes, rows: list, capture_period_seconds: int, block_size: int,
+    class_ids_seen: list | None = None,
 ) -> None:
     """Тот же приём, что и ``_run_fake_meter``/``_serve_rest_of_session``
     (2026-08-19) — воспроизводит SNRM->UA->AARQ->AARE, затем GET
@@ -576,6 +577,8 @@ def _run_fake_meter_load_profile(
     period_frame = HdlcFrame.decode(_read_frame(conn))
     period_request = dlms.parse_get_request(dlms.unwrap_llc(period_frame.information))
     assert period_request.obis == load_profile_obis
+    if class_ids_seen is not None:
+        class_ids_seen.append(period_request.class_id)
     info = dlms.build_get_response_data(
         period_request.invoke_id, datatypes.encode_double_long_unsigned(capture_period_seconds)
     )
@@ -638,6 +641,60 @@ def test_read_load_profile_via_call_home_streams_rows():
     for i, (timestamp, values) in enumerate(decoded):
         assert timestamp == from_dt + timedelta(seconds=capture_period_seconds * i)
         assert values == [5000 + i]
+
+
+def test_read_load_profile_normalizes_class_id_zero_to_profile_generic():
+    """2026-09-11 — тот же баг, что и у регистров (см.
+    test_integration_hdlc_dlms.py::test_read_registers_normalizes_class_id_zero_to_register
+    и DECISIONS.md): job'ы read_load_profile, созданные через API/
+    планировщик, не указывают class_id в payload — Backend
+    (gateway_internal.py) отдаёт 0 по умолчанию, событийный путь
+    (в отличие от старого gRPC, где class_id нормализовался в
+    grpc_server.py ДО вызова established_link-функции) вызывает
+    ``read_load_profile_via_established_link`` напрямую с этим нулём.
+    Без нормализации внутри неё сам GET улетел бы с class_id=0 —
+    подтверждаем байтово, что счётчик реально получает
+    PROFILE_GENERIC_CLASS_ID (7), даже когда вызывающий код передал 0."""
+    serial = "202001002352"
+    addr6 = bytes.fromhex("522300012020")
+    password = b"12345678"
+    obis = "1.1.63.1.0.ff"
+    capture_period_seconds = 900
+    from_dt = datetime(2026, 8, 1)
+    to_dt = datetime(2026, 8, 19)
+    rows = [[datatypes.encode_double_long_unsigned(5000 + i)] for i in range(2)]
+    class_ids_seen: list = []
+
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10)
+    pool.start()
+    try:
+        client_conn = socket.create_connection(("127.0.0.1", pool.bind_port))
+        meter_thread = threading.Thread(
+            target=_run_fake_meter_load_profile,
+            kwargs=dict(
+                conn=client_conn, addr6=addr6, password=password,
+                load_profile_obis=dlms.parse_obis(obis), rows=rows,
+                capture_period_seconds=capture_period_seconds, block_size=6,
+                class_ids_seen=class_ids_seen,
+            ),
+            daemon=True,
+        )
+        meter_thread.start()
+
+        decoded = list(
+            read_load_profile_via_call_home(
+                pool, serial=serial, password=password, obis=obis, class_id=0,
+                from_dt=from_dt, to_dt=to_dt,
+                retry_interval_s=0.5, max_wait_s=15, per_attempt_timeout_ms=1500,
+                max_attempts_per_connection=5,
+            )
+        )
+        meter_thread.join(timeout=3)
+    finally:
+        pool.stop()
+
+    assert len(decoded) == 2
+    assert class_ids_seen == [dlms.PROFILE_GENERIC_CLASS_ID]
 
 
 # --- Событийное чтение сразу при подключении (2026-09-09, см.
@@ -1004,6 +1061,190 @@ def test_maybe_trigger_immediate_read_falls_back_to_next_connection_on_failure(m
         assert pool.pending_count() == 0
         assert reported["results"][0].ok is True
         assert reported["results"][0].value == 42
+    finally:
+        pool.stop()
+        for c in (c1, c2):
+            if c is not None:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+
+
+def test_maybe_trigger_immediate_read_with_only_load_profile_job_waits_for_fresh_connection(monkeypatch):
+    """2026-09-11 — перенос read_load_profile на событийный путь (см.
+    DECISIONS.md). Счётчик, у которого из due job'ов есть ТОЛЬКО
+    load-profile (никаких read_current/read_rated_current) — c1 не
+    находит для себя обычных register-job'ов, но не остаётся висеть в
+    пуле (закрывается сразу, см. ветку "нет register-job'ов"), а
+    load-profile job дожидается СЛЕДУЮЩЕГО дозвона (c2), т.к. чтение
+    профиля всегда идёт на отдельном свежем соединении."""
+    from mmws_gateway import backend_client
+
+    claimed = backend_client.ClaimDueJobsResult(
+        meter_found=True, meter_id=1, protocol_profile="hdlc_dlms", password="12345678",
+        jobs=[],
+        load_profile_jobs=[
+            backend_client.DueLoadProfileJob(
+                job_id=9, obis="1.0.99.1.0.ff", class_id=7,
+                from_iso="2026-09-10T00:00:00", to_iso="2026-09-10T03:00:00",
+            )
+        ],
+    )
+    call_count = {"n": 0}
+
+    def fake_claim(serial, **kw):
+        # Первая claim() — от c1 — реально что-то отдаёт; вторая — от
+        # собственного _identify() потока c2, который claim() дёргает
+        # независимо — на реальном Backend'е job уже RUNNING после
+        # первого claim'а, повторный claim того же счётчика вернул бы
+        # "нечего делать", тот же принцип моделируем здесь.
+        call_count["n"] += 1
+        return claimed if call_count["n"] == 1 else None
+
+    monkeypatch.setattr(backend_client, "claim_due_jobs", fake_claim)
+
+    reported: dict = {}
+
+    def fake_report(serial, **kw):
+        reported["serial"] = serial
+        reported.update(kw)
+        return True
+
+    monkeypatch.setattr(backend_client, "report_load_profile_results", fake_report)
+
+    attempts: list = []
+
+    def fake_read_load_profile(pc, **kw):
+        attempts.append(pc.conn_no)
+        return [(datetime(2026, 9, 10, 0, 0, 0), [1, 2, 3])], None
+
+    monkeypatch.setattr("mmws_gateway.callhome.read_load_profile_via_fresh_connection", fake_read_load_profile)
+    # Опрос пула раз в 0.05с вместо боевой 1с — тест не должен ждать реальную секунду.
+    monkeypatch.setattr(CallHomePool, "_SIBLING_POLL_INTERVAL_S", 0.05)
+
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10, max_per_serial=10)
+    pool.start()
+    c1 = c2 = None
+    try:
+        addr6 = bytes.fromhex("522300012020")
+        c1 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c1.sendall(_build_dummy_dlt645_frame(addr6))
+
+        # c2 появляется чуть позже — имитирует следующий дозвон,
+        # которого дожидается _run_load_profile_jobs.
+        def _connect_c2_later():
+            time.sleep(0.3)
+            sock = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+            sock.sendall(_build_dummy_dlt645_frame(addr6))
+            return sock
+
+        holder: dict = {}
+        thread = threading.Thread(target=lambda: holder.update(c2=_connect_c2_later()))
+        thread.start()
+        thread.join(timeout=3)
+        c2 = holder.get("c2")
+
+        deadline = time.time() + 3
+        while time.time() < deadline and "serial" not in reported:
+            time.sleep(0.05)
+
+        # c1 не остался висеть в пуле (закрыт сразу — нет register-job'ов
+        # для него), load-profile job обработан на c2.
+        assert len(attempts) == 1
+        assert reported["serial"] == "202001002352"
+        assert reported["job_id"] == 9
+        assert reported["obis"] == "1.0.99.1.0.ff"
+        assert reported["ok"] is True
+        assert len(reported["rows"]) == 1
+        assert reported["rows"][0].timestamp_iso == "2026-09-10T00:00:00"
+        assert reported["rows"][0].values == [1, 2, 3]
+    finally:
+        pool.stop()
+        for c in (c1, c2):
+            if c is not None:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+
+
+def test_maybe_trigger_immediate_read_reports_load_profile_job_after_register_jobs(monkeypatch):
+    """Счётчик с ОБОИМИ типами due job'ов (обычный read_current и
+    load-profile) — сначала обрабатывается register-батч на c1 (тот
+    же принцип, что и раньше), затем load-profile job дожидается
+    отдельного свежего соединения (c1 к этому моменту уже закрыт
+    read_batch_via_fresh_connection'ом)."""
+    from mmws_gateway import backend_client
+    from mmws_gateway.protocols.hdlc_dlms import RegisterReadOutcome
+
+    claimed = backend_client.ClaimDueJobsResult(
+        meter_found=True, meter_id=1, protocol_profile="hdlc_dlms", password="12345678",
+        jobs=[backend_client.DueJob(job_id=7, job_type="read_current", obis="1.1.1.8.0.ff", class_id=0)],
+        load_profile_jobs=[
+            backend_client.DueLoadProfileJob(
+                job_id=9, obis="1.0.99.1.0.ff", class_id=7,
+                from_iso="2026-09-10T00:00:00", to_iso="2026-09-10T03:00:00",
+            )
+        ],
+    )
+    call_count = {"n": 0}
+
+    def fake_claim(serial, **kw):
+        # См. комментарий в предыдущем тесте — вторая claim() (от
+        # собственного _identify() потока c2) на реальном Backend'е уже
+        # ничего не вернула бы (job'ы уже RUNNING после первого claim'а).
+        call_count["n"] += 1
+        return claimed if call_count["n"] == 1 else None
+
+    monkeypatch.setattr(backend_client, "claim_due_jobs", fake_claim)
+    monkeypatch.setattr(backend_client, "report_job_results", lambda serial, results, **kw: True)
+    monkeypatch.setattr(
+        "mmws_gateway.callhome.read_batch_via_fresh_connection",
+        lambda pc, **kw: [RegisterReadOutcome(obis="1.1.1.8.0.ff", ok=True, value=999)],
+    )
+
+    profile_reported: dict = {}
+
+    def fake_profile_report(serial, **kw):
+        profile_reported["serial"] = serial
+        profile_reported.update(kw)
+        return True
+
+    monkeypatch.setattr(backend_client, "report_load_profile_results", fake_profile_report)
+    monkeypatch.setattr(
+        "mmws_gateway.callhome.read_load_profile_via_fresh_connection",
+        lambda pc, **kw: ([(datetime(2026, 9, 10, 0, 0, 0), [1])], None),
+    )
+    monkeypatch.setattr(CallHomePool, "_SIBLING_POLL_INTERVAL_S", 0.05)
+
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10, max_per_serial=10)
+    pool.start()
+    c1 = c2 = None
+    try:
+        addr6 = bytes.fromhex("522300012020")
+        c1 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c1.sendall(_build_dummy_dlt645_frame(addr6))
+
+        def _connect_c2_later():
+            time.sleep(0.3)
+            sock = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+            sock.sendall(_build_dummy_dlt645_frame(addr6))
+            return sock
+
+        holder: dict = {}
+        thread = threading.Thread(target=lambda: holder.update(c2=_connect_c2_later()))
+        thread.start()
+        thread.join(timeout=3)
+        c2 = holder.get("c2")
+
+        deadline = time.time() + 3
+        while time.time() < deadline and "serial" not in profile_reported:
+            time.sleep(0.05)
+
+        assert profile_reported["serial"] == "202001002352"
+        assert profile_reported["job_id"] == 9
+        assert profile_reported["ok"] is True
     finally:
         pool.stop()
         for c in (c1, c2):

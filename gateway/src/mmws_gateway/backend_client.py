@@ -45,12 +45,24 @@ class DueJob:
 
 
 @dataclass
+class DueLoadProfileJob:
+    # 2026-09-11 — перенос read_load_profile на событийный путь (см.
+    # DECISIONS.md).
+    job_id: int
+    obis: str
+    class_id: int
+    from_iso: str
+    to_iso: str
+
+
+@dataclass
 class ClaimDueJobsResult:
     meter_found: bool
     meter_id: int | None = None
     protocol_profile: str | None = None
     password: str | None = None
     jobs: list[DueJob] = field(default_factory=list)
+    load_profile_jobs: list[DueLoadProfileJob] = field(default_factory=list)
 
 
 @dataclass
@@ -116,11 +128,18 @@ def claim_due_jobs(
     body = _post_json(f"/api/internal/gateway/meters/{serial}/claim-jobs", payload, timeout_s=timeout_s)
     if body is None:
         return None
-    if not body.get("meter_found") or not body.get("jobs"):
+    if not body.get("meter_found") or not (body.get("jobs") or body.get("load_profile_jobs")):
         return None
     jobs = [
         DueJob(job_id=j["job_id"], job_type=j["job_type"], obis=j["obis"], class_id=j["class_id"])
         for j in body["jobs"]
+    ]
+    load_profile_jobs = [
+        DueLoadProfileJob(
+            job_id=j["job_id"], obis=j["obis"], class_id=j["class_id"],
+            from_iso=j["from_iso"], to_iso=j["to_iso"],
+        )
+        for j in body.get("load_profile_jobs") or []
     ]
     return ClaimDueJobsResult(
         meter_found=True,
@@ -128,6 +147,7 @@ def claim_due_jobs(
         protocol_profile=body.get("protocol_profile"),
         password=body.get("password"),
         jobs=jobs,
+        load_profile_jobs=load_profile_jobs,
     )
 
 
@@ -149,4 +169,43 @@ def report_job_results(
         ],
     }
     body = _post_json("/api/internal/gateway/job-results", payload, timeout_s=timeout_s)
+    return body is not None
+
+
+@dataclass
+class LoadProfileRowReport:
+    timestamp_iso: str
+    values: object
+
+
+def report_load_profile_results(
+    serial: str,
+    *,
+    job_id: int,
+    obis: str,
+    rows: list[LoadProfileRowReport],
+    ok: bool,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    is_partial: bool = False,
+    timeout_s: float = DEFAULT_REPORT_TIMEOUT_S,
+) -> bool:
+    """2026-09-11 — перенос read_load_profile на событийный путь (см.
+    DECISIONS.md). ``rows`` — ВСЕ строки, собранные Gateway'ем к моменту
+    отчёта (даже при ``ok=False``/``is_partial=True`` — обрыв связи
+    посреди передачи датаблоков не должен терять уже полученные строки).
+    ``False`` — отчёт не доставлен, job останется RUNNING на стороне
+    Backend и будет возвращён в очередь периодическим
+    ``stale_job_reaper_loop``, после чего его подхватит старый путь."""
+    payload = {
+        "serial": serial,
+        "job_id": job_id,
+        "obis": obis,
+        "ok": ok,
+        "error_code": error_code,
+        "error_message": error_message,
+        "is_partial": is_partial,
+        "rows": [{"timestamp_iso": r.timestamp_iso, "values": r.values} for r in rows],
+    }
+    body = _post_json("/api/internal/gateway/load-profile-results", payload, timeout_s=timeout_s)
     return body is not None

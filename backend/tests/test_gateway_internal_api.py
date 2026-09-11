@@ -9,7 +9,19 @@ from sqlalchemy import select
 
 from app.config import settings
 from app.core.security import encrypt_secret, hash_password
-from app.models import Gateway, GatewayStatus, Job, JobStatus, Meter, MeterReading, MeterStatus, ProtocolProfile, User, UserRole
+from app.models import (
+    Gateway,
+    GatewayStatus,
+    Job,
+    JobStatus,
+    LoadProfileData,
+    Meter,
+    MeterReading,
+    MeterStatus,
+    ProtocolProfile,
+    User,
+    UserRole,
+)
 
 _HEADERS = {"X-Internal-Secret": settings.gateway_internal_secret}
 
@@ -73,7 +85,10 @@ async def test_claim_jobs_disabled_globally_returns_not_found(client, db_session
         f"/api/internal/gateway/meters/{meter.serial_number}/claim-jobs", json={}, headers=_HEADERS
     )
     assert resp.status_code == 200
-    assert resp.json() == {"meter_found": False, "meter_id": None, "protocol_profile": None, "password": None, "jobs": []}
+    assert resp.json() == {
+        "meter_found": False, "meter_id": None, "protocol_profile": None, "password": None,
+        "jobs": [], "load_profile_jobs": [],
+    }
 
 
 @pytest.mark.asyncio
@@ -326,3 +341,114 @@ async def test_job_results_failure_marks_job_failed(client, db_session):
     await db_session.refresh(job)
     assert job.status == JobStatus.FAILED
     assert job.error["code"] == "TIMEOUT"
+
+
+@pytest.mark.asyncio
+async def test_claim_jobs_returns_load_profile_jobs(client, db_session):
+    """2026-09-11 — перенос read_load_profile на событийный путь (см.
+    DECISIONS.md)."""
+    meter = await _seed_meter(db_session)
+    db_session.add(
+        Job(
+            job_type="read_load_profile", meter_id=meter.id,
+            payload={"from_iso": "2026-09-11T00:00:00", "to_iso": "2026-09-11T01:00:00"},
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/internal/gateway/meters/{meter.serial_number}/claim-jobs", json={}, headers=_HEADERS
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["jobs"] == []
+    assert len(body["load_profile_jobs"]) == 1
+    lp_job = body["load_profile_jobs"][0]
+    assert lp_job["obis"] == "1.1.63.1.0.ff"  # DEFAULT_LOAD_PROFILE_OBIS, payload его не задавал
+    assert lp_job["from_iso"] == "2026-09-11T00:00:00"
+    assert lp_job["to_iso"] == "2026-09-11T01:00:00"
+
+    result = await db_session.execute(select(Job).where(Job.meter_id == meter.id))
+    job = result.scalars().one()
+    assert job.status == JobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_load_profile_results_inserts_rows_and_succeeds(client, db_session):
+    meter = await _seed_meter(db_session)
+    job = Job(job_type="read_load_profile", meter_id=meter.id, status=JobStatus.RUNNING, payload={})
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.post(
+        "/api/internal/gateway/load-profile-results",
+        json={
+            "serial": meter.serial_number,
+            "job_id": job.id,
+            "obis": "1.1.63.1.0.ff",
+            "ok": True,
+            "rows": [
+                {"timestamp_iso": "2026-09-11T00:15:00", "values": [100]},
+                {"timestamp_iso": "2026-09-11T00:30:00", "values": [105]},
+            ],
+        },
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"accepted": True, "rows_written": 2}
+
+    await db_session.refresh(job)
+    assert job.status == JobStatus.SUCCEEDED
+    rows = (await db_session.execute(select(LoadProfileData).where(LoadProfileData.meter_id == meter.id))).scalars().all()
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_load_profile_results_partial_failure_keeps_collected_rows(client, db_session):
+    """Обрыв связи посреди передачи датаблоков — уже собранные Gateway'ем
+    строки не должны теряться, даже когда итоговый исход job'а FAILED."""
+    meter = await _seed_meter(db_session)
+    job = Job(job_type="read_load_profile", meter_id=meter.id, status=JobStatus.RUNNING, payload={})
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.post(
+        "/api/internal/gateway/load-profile-results",
+        json={
+            "serial": meter.serial_number,
+            "job_id": job.id,
+            "obis": "1.1.63.1.0.ff",
+            "ok": False,
+            "error_code": "CONNECTION_LOST",
+            "error_message": "обрыв соединения",
+            "is_partial": True,
+            "rows": [{"timestamp_iso": "2026-09-11T00:15:00", "values": [100]}],
+        },
+        headers=_HEADERS,
+    )
+    assert resp.json() == {"accepted": True, "rows_written": 1}
+
+    await db_session.refresh(job)
+    assert job.status == JobStatus.FAILED
+    assert job.error["code"] == "CONNECTION_LOST"
+    assert job.error["is_partial"] is True
+    rows = (await db_session.execute(select(LoadProfileData).where(LoadProfileData.meter_id == meter.id))).scalars().all()
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_load_profile_results_skips_job_not_running(client, db_session):
+    meter = await _seed_meter(db_session)
+    job = Job(job_type="read_load_profile", meter_id=meter.id, status=JobStatus.SUCCEEDED, payload={})
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.post(
+        "/api/internal/gateway/load-profile-results",
+        json={"serial": meter.serial_number, "job_id": job.id, "obis": "1.1.63.1.0.ff", "ok": True, "rows": []},
+        headers=_HEADERS,
+    )
+    assert resp.json() == {"accepted": False, "rows_written": 0}

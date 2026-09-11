@@ -474,6 +474,53 @@ async def _run_write_parameter(db: AsyncSession, job: Job) -> None:
 _LOAD_PROFILE_COMMIT_BATCH = 20
 
 
+async def _insert_load_profile_row(db: AsyncSession, *, meter_id: int, obis: str, job_id: int, timestamp_iso: str, values: object) -> None:
+    stmt = (
+        pg_insert(LoadProfileData)
+        .values(
+            meter_id=meter_id, obis_code=obis, timestamp=datetime.fromisoformat(timestamp_iso),
+            values_json=values, job_id=job_id,
+        )
+        .on_conflict_do_nothing(constraint="uq_load_profile_row")
+    )
+    await db.execute(stmt)
+
+
+async def finalize_read_load_profile_job(
+    db: AsyncSession, job: Job, meter: Meter, *, obis: str, rows_written: int, error_info: dict | None,
+) -> None:
+    """Общая финализация read_load_profile — используется и старым путём
+    (см. ``_run_read_load_profile`` ниже), и событийным (2026-09-11, см.
+    DECISIONS.md — перенос профиля нагрузки на immediate-read,
+    ``api/gateway_internal.py::report_load_profile_results``). Вставка
+    строк — ответственность вызывающего кода (см. ``_insert_load_profile_row``
+    выше); здесь только простановка статуса job'а, тот же принцип, что и
+    у ``finalize_read_current_job``."""
+    now = datetime.now(timezone.utc)
+    if error_info is not None and error_info.get("code") == "NO_CONNECTION_YET":
+        # См. finalize_read_current_job — тот же принцип: счётчик не
+        # звонил, пока путь ждал, не значит, что он мёртв — возвращаем в
+        # очередь на следующий звонок вместо терминального FAILED. Уже
+        # записанные строки (если были) не теряются — вставка идемпотентна
+        # (ON CONFLICT DO NOTHING по meter_id+obis_code+timestamp),
+        # повторный проход с тем же диапазоном дат безопасен.
+        job.status = JobStatus.QUEUED
+        job.started_at = None
+        job.result = {"obis": obis, "rows_written": rows_written}
+        await db.commit()
+        return
+
+    job.result = {"obis": obis, "rows_written": rows_written}
+    if error_info is None:
+        job.status = JobStatus.SUCCEEDED
+        meter.last_seen_at = now
+    else:
+        job.status = JobStatus.FAILED
+        job.error = error_info
+    job.finished_at = now
+    await db.commit()
+
+
 async def _run_read_load_profile(db: AsyncSession, job: Job) -> None:
     """Читает профиль нагрузки (Этап 3, ТЗ п.4.2.3) и сохраняет строки по
     мере поступления (не дожидаясь конца передачи — генератор
@@ -527,18 +574,10 @@ async def _run_read_load_profile(db: AsyncSession, job: Job) -> None:
             # собственную, понятную ошибку.
             call_timeout_s=220.0 if meter.is_call_home else 180.0,
         ):
-            stmt = (
-                pg_insert(LoadProfileData)
-                .values(
-                    meter_id=meter.id,
-                    obis_code=obis,
-                    timestamp=datetime.fromisoformat(row.timestamp_iso),
-                    values_json=row.values,
-                    job_id=job.id,
-                )
-                .on_conflict_do_nothing(constraint="uq_load_profile_row")
+            await _insert_load_profile_row(
+                db, meter_id=meter.id, obis=obis, job_id=job.id,
+                timestamp_iso=row.timestamp_iso, values=row.values,
             )
-            await db.execute(stmt)
             rows_written += 1
             if rows_written % _LOAD_PROFILE_COMMIT_BATCH == 0:
                 job.result = {"obis": obis, "rows_written": rows_written}
@@ -546,30 +585,7 @@ async def _run_read_load_profile(db: AsyncSession, job: Job) -> None:
     except LoadProfileError as exc:
         error_info = {"code": exc.code, "message": exc.message, "is_partial": exc.is_partial or rows_written > 0}
 
-    now = datetime.now(timezone.utc)
-    if error_info is not None and error_info["code"] == "NO_CONNECTION_YET":
-        # См. finalize_read_current_job — тот же принцип (2026-09-10, не
-        # распространили сразу и сюда): счётчик не звонил, пока этот
-        # путь ждал, не значит, что он мёртв — возвращаем в очередь на
-        # следующий звонок вместо терминального FAILED. Уже записанные
-        # строки (если были) не теряются — вставка идемпотентна
-        # (ON CONFLICT DO NOTHING по meter_id+obis_code+timestamp),
-        # повторный проход с тем же диапазоном дат безопасен.
-        job.status = JobStatus.QUEUED
-        job.started_at = None
-        job.result = {"obis": obis, "rows_written": rows_written}
-        await db.commit()
-        return
-
-    job.result = {"obis": obis, "rows_written": rows_written}
-    if error_info is None:
-        job.status = JobStatus.SUCCEEDED
-        meter.last_seen_at = now
-    else:
-        job.status = JobStatus.FAILED
-        job.error = error_info
-    job.finished_at = now
-    await db.commit()
+    await finalize_read_load_profile_job(db, job, meter, obis=obis, rows_written=rows_written, error_info=error_info)
 
 
 async def _run_disconnect_operation(db: AsyncSession, job: Job, *, operation: str) -> None:
