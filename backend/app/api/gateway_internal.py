@@ -17,15 +17,19 @@ worker_loop``) систематически проигрывает эту гон
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+import logging
+
+from fastapi import APIRouter, BackgroundTasks, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth.gateway_internal_deps import require_gateway_internal_secret
 from ..config import settings
 from ..core.security import decrypt_secret
-from ..db import get_db
+from ..db import SessionLocal, get_db
 from ..models import Job, JobStatus, Meter, MeterStatus
+
+logger = logging.getLogger("mmws_backend.gateway_internal")
 from ..schemas import (
     ClaimDueJobsRequest,
     ClaimDueJobsResponse,
@@ -41,17 +45,57 @@ from ..services.job_worker import (
     finalize_read_current_job,
     finalize_read_rated_current_job,
 )
+from ..services.res_mapping import res_name_for_port
 
 router = APIRouter(prefix="/api/internal/gateway", tags=["gateway-internal"])
+
+
+async def _record_connection_metadata(serial: str, peer_ip: str | None, local_port: int | None) -> None:
+    """Фоновая задача (2026-09-11, по просьбе пользователя — "не должна
+    мешать чтению, пусть работает отдельным потоком"): выполняется ПОСЛЕ
+    того, как ответ claim-jobs уже отправлен Gateway'ю (FastAPI
+    BackgroundTasks), в собственной сессии БД — не может задержать или
+    заблокировать основной путь чтения ни на миллисекунду, независимо от
+    того, сколько займёт эта запись. call-home-счётчики сами инициируют
+    соединение, их ip_address иначе никогда и нигде не сохраняется —
+    пишем при КАЖДОМ опознании (не только когда есть due job'ы), т.к. IP
+    модема может плавать между сеансами связи. res_name — из
+    local_port (см. services/res_mapping.py); пользователь физически
+    разводит дозвон РЭС по портам, поэтому тоже обновляется при каждом
+    опознании, а не только один раз."""
+    try:
+        async with SessionLocal() as db:
+            result = await db.execute(select(Meter).where(Meter.serial_number == serial))
+            meter = result.scalar_one_or_none()
+            if meter is None:
+                return
+            changed = False
+            if peer_ip and meter.ip_address != peer_ip:
+                meter.ip_address = peer_ip
+                changed = True
+            res_name = res_name_for_port(local_port)
+            if res_name is not None and meter.res_name != res_name:
+                meter.res_name = res_name
+                changed = True
+            if changed:
+                await db.commit()
+    except Exception:  # noqa: BLE001 — сугубо вспомогательная запись, не должна ронять фон
+        logger.exception(
+            "Не удалось сохранить peer_ip=%s/local_port=%s для счётчика %s", peer_ip, local_port, serial
+        )
 
 
 @router.post("/meters/{serial}/claim-jobs", response_model=ClaimDueJobsResponse)
 async def claim_due_jobs(
     serial: str,
     body: ClaimDueJobsRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     _: None = Depends(require_gateway_internal_secret),
 ) -> ClaimDueJobsResponse:
+    if body.peer_ip or body.local_port is not None:
+        background_tasks.add_task(_record_connection_metadata, serial, body.peer_ip, body.local_port)
+
     # Глобальный выключатель / поэтапный allowlist (см. config.py) —
     # "ничего не найдено", НЕ ошибка: Gateway трактует это точно так же,
     # как сетевой сбой — оставляет соединение в пуле для старого пути.
@@ -78,7 +122,19 @@ async def claim_due_jobs(
     jobs: list[DueJobOut] = []
     for job in claimed:
         if job.job_type == "read_current":
-            jobs.append(DueJobOut(job_id=job.id, job_type=job.job_type, obis=job.payload["obis"], class_id=0))
+            # class_id — из payload (по умолчанию 0 = Register), а не
+            # хардкод: диагностические чтения произвольных объектов
+            # (напр. Data class_id=1 для OBIS ключа AES 0.0.60.32.77.ff,
+            # см. DECISIONS.md 2026-09-10) иначе всегда читались бы как
+            # Register и падали на несовпадении класса.
+            jobs.append(
+                DueJobOut(
+                    job_id=job.id,
+                    job_type=job.job_type,
+                    obis=job.payload["obis"],
+                    class_id=job.payload.get("class_id", 0),
+                )
+            )
         elif job.job_type == "read_rated_current":
             jobs.append(DueJobOut(job_id=job.id, job_type=job.job_type, obis=RATED_CURRENT_OBIS, class_id=0))
 

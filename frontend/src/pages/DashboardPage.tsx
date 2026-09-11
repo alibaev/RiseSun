@@ -3,6 +3,8 @@ import { api, ApiError } from "../api/client";
 
 interface DashboardData {
   meters_total: number;
+  read_percentage_today: number;
+  read_percentage_3d: number;
   meters_online: number;
   meters_offline: number;
   jobs_active: number;
@@ -68,6 +70,14 @@ export function DashboardPage() {
                 <span className="status-dot offline" /> {data.meters_offline}
               </div>
               <div className="stat-label">Offline</div>
+            </div>
+            <div className="card stat-card">
+              <div className="stat-value">{data.read_percentage_today}%</div>
+              <div className="stat-label">Прочитано за сегодня</div>
+            </div>
+            <div className="card stat-card">
+              <div className="stat-value">{data.read_percentage_3d}%</div>
+              <div className="stat-label">Прочитано за 3 суток</div>
             </div>
             <div className="card stat-card">
               <div className="stat-value">{data.jobs_active}</div>

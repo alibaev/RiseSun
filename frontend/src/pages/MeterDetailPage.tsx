@@ -4,15 +4,14 @@ import { api, ApiError } from "../api/client";
 import { tokenStorage } from "../auth/tokenStorage";
 import { useAuth, canTriggerRead, canWriteParameter } from "../auth/AuthContext";
 import { ConfirmModal } from "../components/ConfirmModal";
-import { WRITABLE_PARAMS } from "../constants/writableParameters";
 import { formatValue } from "../lib/format";
-import type { Job, LoadProfileRow, LogEntry, Meter, MeterReading } from "../api/types";
+import type { Job, LogEntry, Meter, MeterReading } from "../api/types";
 
 const DEFAULT_OBIS = "1.1.1.8.0.ff"; // активная энергия, приём, всего (ТЗ Приложение Г.3)
 
 // <input type="datetime-local"> ждёт "YYYY-MM-DDTHH:mm" в локальном
 // времени пользователя, без секунд/зоны — обрезаем toISOString() (UTC)
-// до минут, этого достаточно для выбора диапазона профиля нагрузки.
+// до минут, этого достаточно для выбора периода показаний.
 function toDatetimeLocal(date: Date): string {
   const offsetMs = date.getTimezoneOffset() * 60000;
   return new Date(date.getTime() - offsetMs).toISOString().slice(0, 16);
@@ -39,51 +38,55 @@ export function MeterDetailPage() {
   const [disconnectJob, setDisconnectJob] = useState<Job | null>(null);
   const disconnectWsRef = useRef<WebSocket | null>(null);
 
-  const [paramInputs, setParamInputs] = useState<Record<string, string>>({});
-  const [pendingWrite, setPendingWrite] = useState<{ parameter: string; label: string; value: number } | null>(null);
-  const [settlementJob, setSettlementJob] = useState<Job | null>(null);
-  const settlementWsRef = useRef<WebSocket | null>(null);
+  // Вкладка "Показания" (2026-09-11, было "Текущие показания") — период
+  // по умолчанию: последние сутки, правится вручную и применяется
+  // кнопкой "Показать" (перезапрашивает с сервера — см. GET .../readings
+  // ?from_iso=&to_iso=).
+  const [readingsFrom, setReadingsFrom] = useState(() => toDatetimeLocal(new Date(Date.now() - 86400000)));
+  const [readingsTo, setReadingsTo] = useState(() => toDatetimeLocal(new Date()));
 
-  // Этап 3 (ТЗ п.4.2.3): профиль нагрузки — асинхронная задача с
-  // потенциально долгой передачей (блочная передача на стороне
-  // Gateway, см. gateway/src/mmws_gateway/protocols/hdlc_dlms.py). По
-  // умолчанию выбираются последние сутки — типичный диапазон для
-  // проверки, диапазон правится вручную перед запуском.
-  const [loadProfileRows, setLoadProfileRows] = useState<LoadProfileRow[]>([]);
-  const [loadProfileFrom, setLoadProfileFrom] = useState(() => toDatetimeLocal(new Date(Date.now() - 86400000)));
-  const [loadProfileTo, setLoadProfileTo] = useState(() => toDatetimeLocal(new Date()));
-  const [loadProfileJob, setLoadProfileJob] = useState<Job | null>(null);
-  const loadProfileWsRef = useRef<WebSocket | null>(null);
+  const loadReadings = useCallback(async () => {
+    if (!id) return;
+    try {
+      const params = new URLSearchParams({
+        from_iso: `${readingsFrom}:00`,
+        to_iso: `${readingsTo}:00`,
+      });
+      setReadings(await api.get<MeterReading[]>(`/api/meters/${id}/readings?${params}`));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Не удалось загрузить показания");
+    }
+  }, [id, readingsFrom, readingsTo]);
 
   const loadAll = useCallback(async () => {
     if (!id) return;
     setError(null);
     try {
-      const [m, r, e, t, lp] = await Promise.all([
+      const [m, e, t] = await Promise.all([
         api.get<Meter>(`/api/meters/${id}`),
-        api.get<MeterReading[]>(`/api/meters/${id}/readings`),
         api.get<LogEntry[]>(`/api/meters/${id}/event-log`),
         api.get<LogEntry[]>(`/api/meters/${id}/tamper-log`),
-        api.get<LoadProfileRow[]>(`/api/meters/${id}/load-profile`),
       ]);
       setMeter(m);
-      setReadings(r);
       setEventLog(e);
       setTamperLog(t);
-      setLoadProfileRows(lp);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Не удалось загрузить данные счётчика");
     }
   }, [id]);
 
+  // Загрузка при открытии страницы — только по смене id, НЕ по смене
+  // periodа (иначе каждое нажатие в date-picker'е перезапрашивало бы
+  // всё заново); применение нового периода — отдельно, кнопкой
+  // "Показать" (см. ниже), вызывающей loadReadings() напрямую.
   useEffect(() => {
     loadAll();
-  }, [loadAll]);
+    loadReadings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
 
   useEffect(() => () => wsRef.current?.close(), []);
   useEffect(() => () => datetimeWsRef.current?.close(), []);
-  useEffect(() => () => settlementWsRef.current?.close(), []);
-  useEffect(() => () => loadProfileWsRef.current?.close(), []);
   useEffect(() => () => disconnectWsRef.current?.close(), []);
 
   function watchJob(job: Job, wsRef: { current: WebSocket | null }, onUpdate: (job: Job) => void) {
@@ -114,29 +117,6 @@ export function MeterDetailPage() {
       .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось запустить установку времени"));
   }
 
-  function handleConfirmWriteParameter() {
-    if (!id || !pendingWrite) return;
-    const { parameter, value } = pendingWrite;
-    setPendingWrite(null);
-    setError(null);
-    api
-      .post<Job>(`/api/meters/${id}/write-parameter/${parameter}`, { value })
-      .then((job) => {
-        setSettlementJob(job);
-        watchJob(job, settlementWsRef, setSettlementJob);
-      })
-      .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось запустить запись параметра"));
-  }
-
-  function requestWriteParameter(key: string, label: string) {
-    const value = Number(paramInputs[key]);
-    if (!Number.isInteger(value) || value < 0 || value > 255) {
-      setError(`${label}: значение должно быть целым числом от 0 до 255`);
-      return;
-    }
-    setPendingWrite({ parameter: key, label, value });
-  }
-
   function handleConfirmDisconnectOp() {
     if (!id || !pendingDisconnectOp) return;
     const op = pendingDisconnectOp;
@@ -151,21 +131,6 @@ export function MeterDetailPage() {
       .catch((err) =>
         setError(err instanceof ApiError ? err.message : `Не удалось запустить операцию "${op}"`)
       );
-  }
-
-  function handleReadLoadProfile() {
-    if (!id) return;
-    setError(null);
-    api
-      .post<Job>(`/api/meters/${id}/read-load-profile`, {
-        from_iso: `${loadProfileFrom}:00`,
-        to_iso: `${loadProfileTo}:00`,
-      })
-      .then((job) => {
-        setLoadProfileJob(job);
-        watchJob(job, loadProfileWsRef, setLoadProfileJob);
-      })
-      .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось запустить чтение профиля нагрузки"));
   }
 
   function handleRefreshReadings() {
@@ -184,7 +149,7 @@ export function MeterDetailPage() {
           setActiveJob(updated);
           if (updated.status === "succeeded" || updated.status === "failed") {
             ws.close();
-            loadAll();
+            loadReadings();
           }
         };
       })
@@ -297,54 +262,9 @@ export function MeterDetailPage() {
         />
       )}
 
-      {canWriteParameter(role) && (
-        <section className="card">
-          <h2>Параметры (расчётный период, профиль нагрузки, отображение, тариф)</h2>
-          <div className="filters">
-            {WRITABLE_PARAMS.map(({ key, label }) => (
-              <label key={key}>
-                {label} (0-255)
-                <br />
-                <input
-                  type="number"
-                  min={0}
-                  max={255}
-                  value={paramInputs[key] ?? ""}
-                  onChange={(e) => setParamInputs((prev) => ({ ...prev, [key]: e.target.value }))}
-                  style={{ width: 100 }}
-                />{" "}
-                <button
-                  onClick={() => requestWriteParameter(key, label)}
-                  disabled={settlementJob?.status === "queued" || settlementJob?.status === "running"}
-                >
-                  Записать
-                </button>
-              </label>
-            ))}
-          </div>
-          {(settlementJob?.status === "queued" || settlementJob?.status === "running") && <p>Записываю...</p>}
-          {settlementJob?.status === "succeeded" && <p className="hint">Параметр записан.</p>}
-          {settlementJob?.status === "failed" && (
-            <div className="error-message">
-              Ошибка записи: {settlementJob.error?.code} — {settlementJob.error?.message}
-            </div>
-          )}
-        </section>
-      )}
-
-      {pendingWrite && (
-        <ConfirmModal
-          title={pendingWrite.label}
-          message={`Будет записано значение "${pendingWrite.value}" на счётчик. Подтвердите операцию.`}
-          confirmLabel="Записать"
-          onConfirm={handleConfirmWriteParameter}
-          onCancel={() => setPendingWrite(null)}
-        />
-      )}
-
       <section className="card">
         <div className="card-header">
-          <h2>Текущие показания</h2>
+          <h2>Показания</h2>
           {canTriggerRead(role) && (
             <button onClick={handleRefreshReadings} disabled={activeJob?.status === "queued" || activeJob?.status === "running"}>
               {activeJob?.status === "queued" || activeJob?.status === "running"
@@ -353,6 +273,19 @@ export function MeterDetailPage() {
             </button>
           )}
         </div>
+        <div className="filters">
+          <label>
+            С
+            <br />
+            <input type="datetime-local" value={readingsFrom} onChange={(e) => setReadingsFrom(e.target.value)} />
+          </label>
+          <label>
+            По
+            <br />
+            <input type="datetime-local" value={readingsTo} onChange={(e) => setReadingsTo(e.target.value)} />
+          </label>
+          <button onClick={() => loadReadings()}>Показать</button>
+        </div>
         {activeJob?.status === "failed" && (
           <div className="error-message">
             Ошибка чтения: {activeJob.error?.code} — {activeJob.error?.message}
@@ -360,95 +293,31 @@ export function MeterDetailPage() {
         )}
         {error && <div className="error-message">{error}</div>}
         {readings.length === 0 ? (
-          <p>Показаний пока нет.</p>
+          <p>Показаний за выбранный период нет.</p>
         ) : (
           <table className="data-table">
             <thead>
               <tr>
                 <th>OBIS-код</th>
-                <th>Значение</th>
+                <th>Показание</th>
                 <th>Единица</th>
-                <th>Время чтения</th>
-              </tr>
-            </thead>
-            <tbody>
-              {readings.map((r) => (
-                <tr key={r.id}>
-                  <td>{r.obis_code}</td>
-                  <td>{formatValue(r.value_json)}</td>
-                  <td>{r.unit ?? "—"}</td>
-                  <td>{new Date(r.read_at).toLocaleString("ru-RU")}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </section>
-
-      <section className="card">
-        <div className="card-header">
-          <h2>Профиль нагрузки</h2>
-        </div>
-        {canTriggerRead(role) && (
-          <div className="filters">
-            <label>
-              С
-              <br />
-              <input
-                type="datetime-local"
-                value={loadProfileFrom}
-                onChange={(e) => setLoadProfileFrom(e.target.value)}
-              />
-            </label>
-            <label>
-              По
-              <br />
-              <input type="datetime-local" value={loadProfileTo} onChange={(e) => setLoadProfileTo(e.target.value)} />
-            </label>
-            <button
-              onClick={handleReadLoadProfile}
-              disabled={loadProfileJob?.status === "queued" || loadProfileJob?.status === "running"}
-            >
-              {loadProfileJob?.status === "queued" || loadProfileJob?.status === "running" ? "Читаю..." : "Прочитать"}
-            </button>
-          </div>
-        )}
-        {(loadProfileJob?.status === "queued" || loadProfileJob?.status === "running") && (
-          <p className="hint">
-            Читаю профиль нагрузки
-            {typeof loadProfileJob.result?.rows_written === "number"
-              ? ` — принято строк: ${loadProfileJob.result.rows_written}`
-              : "..."}
-          </p>
-        )}
-        {loadProfileJob?.status === "succeeded" && (
-          <p className="hint">
-            Готово, строк принято: {String(loadProfileJob.result?.rows_written ?? loadProfileRows.length)}.
-          </p>
-        )}
-        {loadProfileJob?.status === "failed" && (
-          <div className="error-message">
-            Ошибка чтения профиля нагрузки: {loadProfileJob.error?.code} — {loadProfileJob.error?.message}
-            {loadProfileJob.error?.is_partial && " (часть данных успела сохраниться — можно повторить для докачки)"}
-          </div>
-        )}
-        {loadProfileRows.length === 0 ? (
-          <p>Данных профиля нагрузки пока нет.</p>
-        ) : (
-          <table className="data-table">
-            <thead>
-              <tr>
+                <th>Дата</th>
                 <th>Время</th>
-                <th>Значения</th>
               </tr>
             </thead>
             <tbody>
-              {loadProfileRows.map((r) => (
-                <tr key={r.id}>
-                  <td>{new Date(r.timestamp).toLocaleString("ru-RU")}</td>
-                  <td>{formatValue(r.values_json)}</td>
-                </tr>
-              ))}
+              {readings.map((r) => {
+                const readAt = new Date(r.read_at);
+                return (
+                  <tr key={r.id}>
+                    <td>{r.obis_code}</td>
+                    <td>{formatValue(r.value_json)}</td>
+                    <td>{r.unit ?? "—"}</td>
+                    <td>{readAt.toLocaleDateString("ru-RU")}</td>
+                    <td>{readAt.toLocaleTimeString("ru-RU")}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

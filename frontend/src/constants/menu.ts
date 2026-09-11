@@ -30,8 +30,8 @@ export const MENU: MenuCategory[] = [
       stub("Абоненты"),
       stub("SIM-карты"),
       { label: "Счётчики", to: "/meters", implemented: true },
+      { label: "РЭСы и Объекты", to: "/res", implemented: true },
       stub("Точки учёта (POC)"),
-      stub("Концентраторы (DCU)"),
     ],
   },
   {
@@ -39,7 +39,6 @@ export const MENU: MenuCategory[] = [
     items: [
       stub("Поставщики"),
       stub("Типы счётчиков"),
-      stub("Типы DCU"),
       stub("Планы опроса"),
       { label: "Схемы параметров", to: "/schemes", implemented: true },
       stub("Планы прошивок"),
@@ -53,31 +52,18 @@ export const MENU: MenuCategory[] = [
     items: [
       stub("Работа со счётчиком (общая)"),
       stub("Опрос по GPRS"),
-      stub("Опрос DCU"),
-      stub("Опрос по PLC/RS485"),
       { label: "Профили опроса", to: "/poll-profiles", implemented: true },
       { label: "Расписания опроса", to: "/scheduled-jobs", implemented: true },
       stub("Задачи параметров (Param Task Setting)"),
-      stub("Обновление прошивки"),
       stub("Анализ сети счётчиков"),
-      stub("Результат настройки тарифа"),
     ],
   },
   {
     label: "Анализ",
     items: [
-      stub("События счётчиков"),
-      stub("События DCU"),
       stub("Суточный биллинг"),
-      stub("Месячный биллинг"),
       stub("Профиль нагрузки 1"),
       stub("Профиль нагрузки 2"),
-      stub("Потребление"),
-      stub("Процент сбора данных (Acquisition Rate)"),
-      stub("Потери в сети (Lineloss Rate)"),
-      stub("Процент онлайн (Online Rate)"),
-      stub("Анализ напряжения"),
-      stub("Анализ тока"),
     ],
   },
   {
@@ -91,10 +77,6 @@ export const MENU: MenuCategory[] = [
       stub("Журнал операций (Operating Log)"),
       stub("Журнал входов (Login Log)"),
     ],
-  },
-  {
-    label: "Монтаж",
-    items: [stub("Инструмент установки (подменю на скриншотах не раскрыто)")],
   },
   {
     label: "Система",

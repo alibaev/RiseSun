@@ -6,6 +6,7 @@ DL/T645-шума, скользящее окно с вытеснением, чт�
 
 from __future__ import annotations
 
+import json
 import socket
 import threading
 import time
@@ -17,6 +18,7 @@ from datetime import datetime, timedelta
 from mmws_gateway.callhome import (
     CallHomePool,
     DlT645FilteringSocket,
+    _json_safe_value,
     read_load_profile_via_call_home,
     read_via_call_home,
     serial_from_dlt645_address,
@@ -61,6 +63,86 @@ def test_filtering_socket_skips_dlt645_frame_and_zero_bytes():
         assert bytes(collected) == b"\x7eHELLO\x7e"
     finally:
         client_sock.close()
+
+
+def test_filtering_socket_echoes_heartbeat_on_three_zero_bytes():
+    """2026-09-10 (см. DECISIONS.md, аудит ver2.zip): реально работавшая
+    заводская программа отвечает 3 нулевыми байтами на ровно 3 нулевых
+    байта, полученных по TCP (GPRS-heartbeat, независимый от HDLC/DLMS).
+    Мы раньше эти байты молча съедали — проверяем, что теперь отвечаем."""
+    server_sock, client_sock = socket.socketpair()
+    try:
+        server_sock.sendall(b"\x00\x00\x00" + b"\x7eHELLO\x7e")
+
+        filtering = DlT645FilteringSocket(client_sock)
+        filtering.settimeout(2)
+        collected = bytearray()
+        while len(collected) < len(b"\x7eHELLO\x7e"):
+            chunk = filtering.recv(64)
+            if not chunk:
+                break
+            collected += chunk
+        assert bytes(collected) == b"\x7eHELLO\x7e"
+
+        server_sock.settimeout(2)
+        echo = server_sock.recv(3)
+        assert echo == b"\x00\x00\x00"
+    finally:
+        client_sock.close()
+        server_sock.close()
+
+
+def test_filtering_socket_does_not_echo_on_fewer_than_three_zero_bytes():
+    """Реальный кадр может законно начинаться после 1-2 шумовых нулевых
+    байт (не heartbeat-пакета) — эхо должно сработать ТОЛЬКО на ровно 3
+    подряд, не на меньшее количество."""
+    server_sock, client_sock = socket.socketpair()
+    try:
+        server_sock.sendall(b"\x00\x00" + b"\x7eHELLO\x7e")
+
+        filtering = DlT645FilteringSocket(client_sock)
+        filtering.settimeout(2)
+        collected = bytearray()
+        while len(collected) < len(b"\x7eHELLO\x7e"):
+            chunk = filtering.recv(64)
+            if not chunk:
+                break
+            collected += chunk
+        assert bytes(collected) == b"\x7eHELLO\x7e"
+
+        server_sock.settimeout(0.3)
+        with pytest.raises(socket.timeout):
+            server_sock.recv(3)
+    finally:
+        client_sock.close()
+        server_sock.close()
+
+
+def test_filtering_socket_echoes_heartbeat_after_dlt645_frame():
+    """Референс отвечает тем же heartbeat'ом и на DL/T645-анонс, не
+    только на голый 00 00 00 — не эхо самого анонса, а тот же
+    фиксированный трёхбайтный ответ."""
+    server_sock, client_sock = socket.socketpair()
+    try:
+        noise = _build_dummy_dlt645_frame(bytes.fromhex("522300012020"))
+        server_sock.sendall(noise + b"\x7eHELLO\x7e")
+
+        filtering = DlT645FilteringSocket(client_sock)
+        filtering.settimeout(2)
+        collected = bytearray()
+        while len(collected) < len(b"\x7eHELLO\x7e"):
+            chunk = filtering.recv(64)
+            if not chunk:
+                break
+            collected += chunk
+        assert bytes(collected) == b"\x7eHELLO\x7e"
+
+        server_sock.settimeout(2)
+        echo = server_sock.recv(3)
+        assert echo == b"\x00\x00\x00"
+    finally:
+        client_sock.close()
+        server_sock.close()
 
 
 def test_filtering_socket_deadline_is_absolute_not_reset_by_noise():
@@ -132,6 +214,27 @@ def test_read_frame_from_transport_filters_dlt645_noise_between_frames():
         client_sock.close()
 
 
+def test_json_safe_value_converts_bytes_to_hex():
+    """2026-09-10 (см. DECISIONS.md): счётчик вернул пустую octet-string
+    (валидный, но нечисловой ответ) — decode_value честно вернул bytes,
+    а json.dumps на них падал, валя отправку результатов ЦЕЛОГО батча."""
+    assert _json_safe_value(b"") == ""
+    assert _json_safe_value(b"\x01\x02\xff") == "0102ff"
+    json.dumps(_json_safe_value(b"\x01\x02\xff"))  # не бросает
+
+
+def test_json_safe_value_recurses_into_lists():
+    assert _json_safe_value([1, b"\x01", [b"\x02", "x"]]) == [1, "01", ["02", "x"]]
+    json.dumps(_json_safe_value([1, b"\x01", [b"\x02", "x"]]))  # не бросает
+
+
+def test_json_safe_value_passes_through_plain_values():
+    assert _json_safe_value(42) == 42
+    assert _json_safe_value(3.14) == 3.14
+    assert _json_safe_value(None) is None
+    assert _json_safe_value("x") == "x"
+
+
 def test_pool_sliding_window_evicts_oldest():
     pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=2)
     pool.start()
@@ -157,6 +260,27 @@ def test_pool_sliding_window_evicts_oldest():
                 s.close()
             except OSError:
                 pass
+    finally:
+        pool.stop()
+
+
+def test_pool_accepts_connections_on_multiple_ports_into_shared_pool():
+    """2026-09-11, по просьбе пользователя — несколько call-home портов
+    на одном процессе (разбить трафик РЭСов по портам), все ведут в один
+    общий пул: опознание/лимиты/событийное чтение не знают и не должны
+    знать, с какого порта пришло конкретное соединение."""
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, extra_bind_ports=[0, 0], window_size=10)
+    pool.start()
+    try:
+        ports = pool.bind_ports
+        assert len(ports) == 3
+        assert len(set(ports)) == 3  # три разных случайных порта, не задвоены
+
+        conns = [socket.create_connection(("127.0.0.1", p), timeout=3) for p in ports]
+        time.sleep(0.2)
+        assert pool.pending_count() == 3
+        for c in conns:
+            c.close()
     finally:
         pool.stop()
 
@@ -651,6 +775,166 @@ def test_maybe_trigger_immediate_read_closes_sibling_same_serial_connections(mon
     finally:
         pool.stop()
         for c in (c1, c2, c3):
+            if c is not None:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+
+
+def test_maybe_trigger_immediate_read_retries_fresh_connection_on_stuck_association(monkeypatch):
+    """2026-09-11 (см. DECISIONS.md — "покопайся в истории логов
+    сервера"): эксперимент на живом трафике показал, что ассоциация
+    может УСПЕШНО установиться (AARE получен, исключения нет), но ВСЕ
+    чтения внутри неё стабильно возвращают один и тот же мусорный ответ
+    ("залипшая" ассоциация) — раньше такой результат принимался как
+    окончательный (единственный обмен без исключения сразу прерывал
+    цикл). Теперь, если есть ещё запасные held-соединения того же
+    счётчика, при ПОЛНОСТЬЮ провальном батче (ни одного ok=True) пробуем
+    следующее соединение вместо того, чтобы сдаваться на заведомо
+    плохом."""
+    from mmws_gateway import backend_client
+    from mmws_gateway.errors import GatewayError
+    from mmws_gateway.protocols.hdlc_dlms import RegisterReadOutcome
+
+    claimed = backend_client.ClaimDueJobsResult(
+        meter_found=True, meter_id=1, protocol_profile="hdlc_dlms", password="12345678",
+        jobs=[backend_client.DueJob(job_id=7, job_type="read_current", obis="1.1.1.8.0.ff", class_id=0)],
+    )
+    call_count = {"n": 0}
+
+    def fake_claim(serial, **kw):
+        call_count["n"] += 1
+        return claimed if call_count["n"] >= 2 else None
+
+    monkeypatch.setattr(backend_client, "claim_due_jobs", fake_claim)
+
+    reported: dict = {}
+    monkeypatch.setattr(
+        backend_client, "report_job_results",
+        lambda serial, results, **kw: reported.update(results=results) or True,
+    )
+
+    attempts: list = []
+
+    def fake_read_batch(pc, **kw):
+        attempts.append(pc.conn_no)
+        if len(attempts) == 1:
+            # Ассоциация "успешна" (не бросает исключение), но чтение —
+            # мусор: ровно та картина, что поймали на живом трафике.
+            return [
+                RegisterReadOutcome(
+                    obis="1.1.1.8.0.ff", ok=False,
+                    error=GatewayError("Неожиданный choice-байт Get-Data-Result: 0x07"),
+                )
+            ]
+        return [RegisterReadOutcome(obis="1.1.1.8.0.ff", ok=True, value=42)]
+
+    monkeypatch.setattr("mmws_gateway.callhome.read_batch_via_fresh_connection", fake_read_batch)
+
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10, max_per_serial=10)
+    pool.start()
+    c1 = c2 = None
+    try:
+        addr6 = bytes.fromhex("522300012020")
+        c1 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c1.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.3)
+        assert pool.pending_count() == 1
+
+        c2 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c2.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.3)
+
+        assert len(attempts) == 2  # первая (залипшая) попытка не принята как финал
+        assert reported["results"][0].ok is True
+        assert reported["results"][0].value == 42
+    finally:
+        pool.stop()
+        for c in (c1, c2):
+            if c is not None:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+
+
+def test_maybe_trigger_immediate_read_waits_for_next_call_home_when_pool_empty(monkeypatch):
+    """2026-09-11 (по просьбе пользователя) — раньше цикл реагировал
+    только на held-соединения, УЖЕ лежавшие в пуле на момент опознания;
+    следующего дозвона не ждал вовсе. Теперь, если все испробованные
+    кончились, а общий бюджет ожидания ещё не истёк, цикл ждёт СЛЕДУЮЩЕЕ
+    подключение того же серийника (пусть оно появится и позже, не
+    мгновенно) вместо немедленной сдачи."""
+    from mmws_gateway import backend_client
+    from mmws_gateway.errors import MeterTimeoutError
+    from mmws_gateway.protocols.hdlc_dlms import RegisterReadOutcome
+
+    claimed = backend_client.ClaimDueJobsResult(
+        meter_found=True, meter_id=1, protocol_profile="hdlc_dlms", password="12345678",
+        jobs=[backend_client.DueJob(job_id=7, job_type="read_current", obis="1.1.1.8.0.ff", class_id=0)],
+    )
+    call_count = {"n": 0}
+
+    def fake_claim(serial, **kw):
+        call_count["n"] += 1
+        return claimed if call_count["n"] >= 2 else None
+
+    monkeypatch.setattr(backend_client, "claim_due_jobs", fake_claim)
+
+    reported: dict = {}
+    monkeypatch.setattr(
+        backend_client, "report_job_results",
+        lambda serial, results, **kw: reported.update(results=results) or True,
+    )
+
+    attempts: list = []
+
+    def fake_read_batch(pc, **kw):
+        attempts.append(pc.conn_no)
+        if len(attempts) == 1:
+            raise MeterTimeoutError("AARE не пришло")
+        return [RegisterReadOutcome(obis="1.1.1.8.0.ff", ok=True, value=42)]
+
+    monkeypatch.setattr("mmws_gateway.callhome.read_batch_via_fresh_connection", fake_read_batch)
+    # Опрос пула раз в 0.05с вместо боевой 1с — тест не должен ждать реальную секунду.
+    monkeypatch.setattr(CallHomePool, "_SIBLING_POLL_INTERVAL_S", 0.05)
+
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10, max_per_serial=10)
+    pool.start()
+    c1 = c2 = None
+    try:
+        addr6 = bytes.fromhex("522300012020")
+        c1 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c1.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.3)
+        assert pool.pending_count() == 1  # c1 held — "нечего читать" пока
+
+        # ВТОРОЕ соединение того же счётчика появляется НЕ сразу, а
+        # заметно позже первой (провальной) попытки — раньше это
+        # соединение просто не попало бы в кандидаты.
+        def _connect_c2_later():
+            time.sleep(0.5)
+            sock = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+            sock.sendall(_build_dummy_dlt645_frame(addr6))
+            return sock
+
+        holder: dict = {}
+        thread = threading.Thread(target=lambda: holder.update(c2=_connect_c2_later()))
+        thread.start()
+        thread.join(timeout=3)
+        c2 = holder.get("c2")
+
+        deadline = time.time() + 3
+        while time.time() < deadline and "results" not in reported:
+            time.sleep(0.05)
+
+        assert len(attempts) == 2
+        assert reported["results"][0].ok is True
+        assert reported["results"][0].value == 42
+    finally:
+        pool.stop()
+        for c in (c1, c2):
             if c is not None:
                 try:
                     c.close()

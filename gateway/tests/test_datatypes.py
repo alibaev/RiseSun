@@ -42,6 +42,16 @@ def test_decode_unsupported_tag_raises():
         datatypes.decode_value(bytes([0xEE, 0x00]))
 
 
+def test_decode_null_data_returns_none():
+    # 2026-09-11, найдено на новой партии счётчиков: раньше здесь падало
+    # "Неподдержанный тег типа данных DLMS: 0x00" — encode_null() уже
+    # существовал (используется как restricting-object в GET-запросе
+    # диапазона), а обратного разбора не было вовсе.
+    value, consumed = datatypes.decode_value(datatypes.encode_null())
+    assert value is None
+    assert consumed == 1
+
+
 def test_decode_truncated_data_raises():
     encoded = datatypes.encode_double_long_unsigned(1000)
     with pytest.raises(datatypes.DlmsDataError):

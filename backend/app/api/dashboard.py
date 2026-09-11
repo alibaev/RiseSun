@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
@@ -14,6 +15,32 @@ from ..db import get_db
 from ..models import Job, JobStatus, Meter, MeterReading, TamperLog, User
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
+
+_BISHKEK_TZ = ZoneInfo("Asia/Bishkek")
+
+
+def _bishkek_day_start_utc(now: datetime) -> datetime:
+    day_start_bishkek = now.astimezone(_BISHKEK_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    return day_start_bishkek.astimezone(timezone.utc)
+
+
+async def _read_percentage(db: AsyncSession, active_meter_ids: list[int], since: datetime) -> float:
+    """Процент активных счётчиков, у которых есть хотя бы одно
+    MeterReading (успешное чтение) начиная с ``since`` — тот же смысл,
+    что у "процент чтения", которым пользователь оперирует по данным
+    референсной системы (2026-09-08, см. DECISIONS.md). Считается по
+    ЧИСЛУ РАЗНЫХ счётчиков с показанием, а не по числу job'ов/показаний
+    — повторные чтения одного счётчика не завышают процент."""
+    if not active_meter_ids:
+        return 0.0
+    distinct_read = (
+        await db.execute(
+            select(func.count(func.distinct(MeterReading.meter_id))).where(
+                MeterReading.meter_id.in_(active_meter_ids), MeterReading.read_at >= since,
+            )
+        )
+    ).scalar_one()
+    return round(100.0 * distinct_read / len(active_meter_ids), 1)
 
 
 @router.get("")
@@ -53,8 +80,14 @@ async def get_dashboard(
         buckets[hour_key] = buckets.get(hour_key, 0) + 1
     readings_by_hour = [{"hour": hour, "count": count} for hour, count in sorted(buckets.items())]
 
+    active_meter_ids = [m.id for m in meters]
+    read_percentage_today = await _read_percentage(db, active_meter_ids, _bishkek_day_start_utc(now))
+    read_percentage_3d = await _read_percentage(db, active_meter_ids, now - timedelta(days=3))
+
     return {
         "meters_total": len(meters),
+        "read_percentage_today": read_percentage_today,
+        "read_percentage_3d": read_percentage_3d,
         "meters_online": meters_online,
         "meters_offline": len(meters) - meters_online,
         "jobs_active": jobs_active,

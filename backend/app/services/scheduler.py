@@ -26,7 +26,14 @@ Asia/Bishkek (UTC+6, без перехода на летнее), из очере
 пользователем) — аналогичный принцип, но БЕЗ суточного окна: токовый
 класс счётчика (``Meter.rated_current_amps``) — статичный параметр, не
 меняется со временем, поэтому счётчик с уже известным значением
-исключается из группы НАВСЕГДА, не только на текущие сутки."""
+исключается из группы НАВСЕГДА, не только на текущие сутки.
+
+``job_type="read_load_profile"`` + ``operation_params.skip_if_read_today``
+(2026-09-10, "постоянное чтение profile1", см. DECISIONS.md) — тот же
+принцип суточного окна, что и у ``read_current``, но проверка идёт по
+факту успешного завершения Job (``_already_succeeded_today_meter_ids``),
+а не по ``MeterReading`` — у GetRowsByRange нет единой строки-показания
+с временем чтения."""
 
 from __future__ import annotations
 
@@ -111,7 +118,18 @@ async def _resolve_payloads(db: AsyncSession, scheduled_job: ScheduledJob) -> li
             )
             return []
         return [{"obis": item["obis"]} for item in profile.items if item.get("enabled", True)]
-    return [{"obis": scheduled_job.operation_params.get("obis", "1.1.1.8.0.ff")}]
+    payload = {"obis": scheduled_job.operation_params.get("obis", "1.1.1.8.0.ff")}
+    # class_id (2026-09-10, "постоянное чтение profile1") — опциональный
+    # override для read_current, когда OBIS принадлежит не Register'у
+    # (класс по умолчанию, 0 → Register), а другому классу — например,
+    # 7 (ProfileGeneric) для простого GET текущего буфера профиля
+    # нагрузки без диапазона дат, в отличие от отдельного job_type
+    # read_load_profile (GetRowsByRange). Пробрасывается дальше в
+    # job_worker._run_read_current так же, как уже пробрасывается для
+    # ручных диагностических job (см. DECISIONS.md, Association View).
+    if scheduled_job.operation_params.get("class_id") is not None:
+        payload["class_id"] = scheduled_job.operation_params["class_id"]
+    return [payload]
 
 
 def _bishkek_day_bounds_utc(now: datetime) -> tuple[datetime, datetime]:
@@ -130,6 +148,29 @@ async def _already_read_today_meter_ids(
             MeterReading.obis_code == obis,
             MeterReading.read_at >= day_start_utc,
             MeterReading.read_at < day_end_utc,
+        )
+    )
+    return set(result.scalars().all())
+
+
+async def _already_succeeded_today_meter_ids(
+    db: AsyncSession, meter_ids: list[int], job_type: str, now: datetime
+) -> set[int]:
+    """Аналог ``_already_read_today_meter_ids``, но по факту завершения
+    Job'ы (``JobStatus.SUCCEEDED``), а не по ``MeterReading`` — для
+    ``read_load_profile`` (2026-09-10, см. DECISIONS.md, "постоянное
+    чтение profile1") нет единой строки-показания с ``read_at``, есть
+    множество строк буфера с ``timestamp`` — временем самой ЗАПИСИ на
+    счётчике, а не временем НАШЕГО чтения, поэтому для суточного окна
+    годится только время завершения самой Job."""
+    day_start_utc, day_end_utc = _bishkek_day_bounds_utc(now)
+    result = await db.execute(
+        select(Job.meter_id).where(
+            Job.meter_id.in_(meter_ids),
+            Job.job_type == job_type,
+            Job.status == JobStatus.SUCCEEDED,
+            Job.finished_at >= day_start_utc,
+            Job.finished_at < day_end_utc,
         )
     )
     return set(result.scalars().all())
@@ -163,11 +204,25 @@ async def _trigger_one(db: AsyncSession, scheduled_job: ScheduledJob) -> None:
     # MeterStatus.INVALID из-за повреждённого серийника, 2026-09-08),
     # продолжал бы попадать в jobs из старого scheduled_job.meter_ids и
     # вхолостую жечь попытки воркеров каждый цикл расписания.
-    meters = (
-        await db.execute(
-            select(Meter).where(Meter.id.in_(scheduled_job.meter_ids), Meter.is_active.is_(True))
-        )
-    ).scalars().all()
+    #
+    # operation_params.all_active_meters (2026-09-11, по просьбе
+    # пользователя — "сохрани эти функции для новых счётчиков на
+    # будущее") — meter_ids фиксируется один раз в момент создания
+    # расписания и НЕ растёт сам по себе, когда meter_discovery.py
+    # активирует новые звонящие счётчики. Для расписаний "читать весь
+    # активный парк" (показания, токовый класс) это неверно — счётчик,
+    # активированный ПОСЛЕ создания расписания, должен тоже попадать в
+    # опрос без ручного редактирования meter_ids. При этом флаге список
+    # счётчиков считается заново на каждом тике по Meter.is_active,
+    # meter_ids расписания игнорируется.
+    if scheduled_job.operation_params.get("all_active_meters"):
+        meters = (await db.execute(select(Meter).where(Meter.is_active.is_(True)))).scalars().all()
+    else:
+        meters = (
+            await db.execute(
+                select(Meter).where(Meter.id.in_(scheduled_job.meter_ids), Meter.is_active.is_(True))
+            )
+        ).scalars().all()
 
     already_outstanding = await _outstanding_job_meter_ids(
         db, [m.id for m in meters], scheduled_job.job_type
@@ -193,6 +248,16 @@ async def _trigger_one(db: AsyncSession, scheduled_job: ScheduledJob) -> None:
             )
             pairs.extend((m, payload) for m in meters if m.id not in already_read)
         skip_reason = "все счётчики группы уже опрошены сегодня по всем OBIS профиля (Asia/Bishkek)"
+    elif scheduled_job.job_type == "read_load_profile" and scheduled_job.operation_params.get("skip_if_read_today"):
+        # 2026-09-10 ("постоянное чтение profile1", см. DECISIONS.md):
+        # та же суточная логика, что и у read_current выше, но по факту
+        # успешного завершения Job (см. _already_succeeded_today_meter_ids)
+        # — GetRowsByRange не даёт одной строки-показания с read_at.
+        already_read = await _already_succeeded_today_meter_ids(
+            db, [m.id for m in meters], scheduled_job.job_type, now
+        )
+        pairs = [(m, payload) for m in meters if m.id not in already_read for payload in payloads]
+        skip_reason = "все счётчики группы уже успешно прочитаны сегодня (Asia/Bishkek)"
     elif scheduled_job.job_type == "read_rated_current":
         # Токовый класс (rated_current_amps) — статичный паспортный
         # параметр, не меняется у счётчика со временем, поэтому здесь

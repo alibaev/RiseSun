@@ -84,13 +84,36 @@ def _post_json(path: str, payload: dict, *, timeout_s: float) -> dict | None:
         return None
 
 
-def claim_due_jobs(serial: str, *, timeout_s: float = DEFAULT_CLAIM_TIMEOUT_S) -> ClaimDueJobsResult | None:
+def claim_due_jobs(
+    serial: str,
+    *,
+    peer_ip: str | None = None,
+    local_port: int | None = None,
+    timeout_s: float = DEFAULT_CLAIM_TIMEOUT_S,
+) -> ClaimDueJobsResult | None:
     """``None`` — не удалось связаться с Backend (сеть/таймаут/секрет не
     настроен) ИЛИ Backend явно ответил "ничего не должен" (фича
     выключена, счётчик не в allowlist, нет due job'ов) — вызывающий код
     в обоих случаях просто ничего не делает, соединение остаётся в
-    пуле для старого пути."""
-    body = _post_json(f"/api/internal/gateway/meters/{serial}/claim-jobs", {}, timeout_s=timeout_s)
+    пуле для старого пути.
+
+    ``peer_ip`` (2026-09-11) — IP-адрес звонящего соединения, на котором
+    опознан этот серийник; Backend сохраняет его в Meter.ip_address при
+    КАЖДОМ вызове (даже когда due job'ов нет и эта функция вернёт
+    ``None``) — call-home-счётчики сами инициируют соединение, иначе их
+    ip_address никогда и нигде не сохраняется.
+
+    ``local_port`` (2026-09-11) — локальный порт Gateway'я, на который
+    пришло это соединение (см. CallHomePool.extra_bind_ports); Backend
+    превращает его в РЭС/объект (services/res_mapping.py) и сохраняет
+    в Meter.res_name — пользователь физически разводит дозвон разных
+    РЭС по разным портам."""
+    payload: dict[str, object] = {}
+    if peer_ip:
+        payload["peer_ip"] = peer_ip
+    if local_port is not None:
+        payload["local_port"] = local_port
+    body = _post_json(f"/api/internal/gateway/meters/{serial}/claim-jobs", payload, timeout_s=timeout_s)
     if body is None:
         return None
     if not body.get("meter_found") or not body.get("jobs"):

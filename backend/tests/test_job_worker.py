@@ -152,6 +152,63 @@ async def test_read_rated_current_stores_value_on_meter_not_reading(db_session):
 
 
 @pytest.mark.asyncio
+async def test_read_rated_current_rejects_implausible_value(db_session):
+    """2026-09-11 — по прямому указанию пользователя допустимы только
+    5/7.5/100 А, остальное (встречались -4 и 0 на реальном парке) —
+    ошибка, а не паспортное значение: job падает, rated_current_amps
+    остаётся None, чтобы планировщик повторил попытку на следующем звонке."""
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202306004114",
+        is_call_home=True,
+        protocol_profile=ProtocolProfile.HDLC_DLMS,
+        password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    job = Job(job_type="read_rated_current", meter_id=meter.id, payload={})
+    db_session.add(job)
+    await db_session.commit()
+
+    with patch(
+        "app.services.job_worker.read_register",
+        new=AsyncMock(return_value=ReadResult(ok=True, value=-4)),
+    ):
+        await _run_read_rated_current(db_session, job)
+
+    assert job.status == JobStatus.FAILED
+    assert job.error["code"] == "IMPLAUSIBLE_RATED_CURRENT"
+    assert meter.rated_current_amps is None
+
+
+@pytest.mark.asyncio
+async def test_read_rated_current_accepts_known_valid_values(db_session):
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202306004115",
+        is_call_home=True,
+        protocol_profile=ProtocolProfile.HDLC_DLMS,
+        password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    job = Job(job_type="read_rated_current", meter_id=meter.id, payload={})
+    db_session.add(job)
+    await db_session.commit()
+
+    with patch(
+        "app.services.job_worker.read_register",
+        new=AsyncMock(return_value=ReadResult(ok=True, value=7.5)),
+    ):
+        await _run_read_rated_current(db_session, job)
+
+    assert job.status == JobStatus.SUCCEEDED
+    assert meter.rated_current_amps == 7.5
+
+
+@pytest.mark.asyncio
 async def test_read_rated_current_failure_leaves_meter_untouched(db_session):
     gateway = await _seed_gateway_and_user(db_session)
     meter = Meter(

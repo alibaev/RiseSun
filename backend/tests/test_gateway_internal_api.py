@@ -115,6 +115,102 @@ async def test_claim_jobs_happy_path_returns_password_and_jobs(client, db_sessio
 
 
 @pytest.mark.asyncio
+async def test_claim_jobs_passes_through_payload_class_id(client, db_session):
+    """2026-09-10: class_id из payload раньше не пробрасывался — все
+    read_current уходили Gateway'ю как class_id=0 (Register), из-за чего
+    диагностическое чтение объектов других классов (напр. Data class_id=1
+    для OBIS 0.0.60.32.77.ff) через событийный путь было невозможно."""
+    meter = await _seed_meter(db_session)
+    db_session.add(
+        Job(
+            job_type="read_current",
+            meter_id=meter.id,
+            payload={"obis": "0.0.60.32.77.ff", "class_id": 1},
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/internal/gateway/meters/{meter.serial_number}/claim-jobs", json={}, headers=_HEADERS
+    )
+    assert resp.status_code == 200
+    jobs = resp.json()["jobs"]
+    assert len(jobs) == 1
+    assert jobs[0]["obis"] == "0.0.60.32.77.ff"
+    assert jobs[0]["class_id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_jobs_records_peer_ip(client, db_session):
+    """2026-09-11 (по просьбе пользователя): call-home-счётчики сами
+    инициируют соединение, их ip_address иначе никогда не сохраняется —
+    Gateway передаёт peer_ip при КАЖДОМ опознании, Backend пишет его в
+    Meter.ip_address."""
+    meter = await _seed_meter(db_session)
+    assert meter.ip_address is None
+
+    resp = await client.post(
+        f"/api/internal/gateway/meters/{meter.serial_number}/claim-jobs",
+        json={"peer_ip": "10.86.14.39"}, headers=_HEADERS,
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(meter)
+    assert meter.ip_address == "10.86.14.39"
+
+
+@pytest.mark.asyncio
+async def test_claim_jobs_updates_peer_ip_even_without_due_jobs(client, db_session):
+    """IP пишется независимо от того, есть ли due job'ы — счётчик может
+    звонить часто без задач в очереди, IP всё равно интересен."""
+    meter = await _seed_meter(db_session)
+    # Никаких Job для этого счётчика не создано — meter_found всё равно
+    # True (счётчик активен, is_call_home), просто jobs=[].
+
+    resp = await client.post(
+        f"/api/internal/gateway/meters/{meter.serial_number}/claim-jobs",
+        json={"peer_ip": "10.86.14.40"}, headers=_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["jobs"] == []
+
+    await db_session.refresh(meter)
+    assert meter.ip_address == "10.86.14.40"
+
+
+@pytest.mark.asyncio
+async def test_claim_jobs_records_res_name_from_local_port(client, db_session):
+    """2026-09-11 (по просьбе пользователя) — счётчики физически
+    разведены по РЭС через call-home порт (см. services/res_mapping.py);
+    Gateway передаёт local_port, Backend пишет соответствующий res_name."""
+    meter = await _seed_meter(db_session)
+    assert meter.res_name is None
+
+    resp = await client.post(
+        f"/api/internal/gateway/meters/{meter.serial_number}/claim-jobs",
+        json={"local_port": 2010}, headers=_HEADERS,
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(meter)
+    assert meter.res_name == "Кок-Арт РЭС"
+
+
+@pytest.mark.asyncio
+async def test_claim_jobs_ignores_unknown_local_port(client, db_session):
+    meter = await _seed_meter(db_session)
+
+    resp = await client.post(
+        f"/api/internal/gateway/meters/{meter.serial_number}/claim-jobs",
+        json={"local_port": 9999}, headers=_HEADERS,
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(meter)
+    assert meter.res_name is None
+
+
+@pytest.mark.asyncio
 async def test_claim_jobs_does_not_double_claim_concurrent_calls(client, db_session):
     """Атомарность — второй вызов claim-jobs (имитация гонки двух
     почти одновременных call-home подключений того же счётчика) не

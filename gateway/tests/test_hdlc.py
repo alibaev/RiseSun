@@ -87,6 +87,16 @@ def test_server_hdlc_address_rejects_5_digit_overflow():
         server_hdlc_address("99999")
 
 
+def test_server_hdlc_address_rejects_non_numeric_physical_address():
+    # Найдено на практике 2026-09-11 (см. DECISIONS.md): счётчик с
+    # повреждённым (нецифровым) серийным номером ("20190123ef23")
+    # оказался помечен ACTIVE в обход штатной защиты MeterStatus.INVALID
+    # — голый int("3ef23") ронял необработанным ValueError весь
+    # gRPC-вызов Gateway'я. Теперь тоже AddressingError.
+    with pytest.raises(AddressingError):
+        server_hdlc_address("3ef23")
+
+
 def test_multi_byte_address_round_trip():
     # 18736 не влезает в 1 байт (127) и не влезает в 2 байта (16383) —
     # требует 4-байтной адресации, подтверждённой реальным трафиком.

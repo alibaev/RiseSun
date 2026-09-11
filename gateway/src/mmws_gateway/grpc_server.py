@@ -388,6 +388,18 @@ def _jsonable(value: object) -> object:
 # просто встанут в очередь ДО протокольного слоя, а не после него.
 DEFAULT_MAX_WORKERS = int(os.environ.get("MMWS_GATEWAY_MAX_WORKERS", "20"))
 
+# 2026-09-11, по просьбе пользователя — несколько дополнительных call-home
+# портов на том же процессе (напр. "2010,2011,2012"), чтобы разбить трафик
+# разных РЭСов по портам, не разворачивая отдельный Gateway-процесс на
+# каждый. Все порты ведут в ОДИН общий CallHomePool (см. его докстринг).
+def _parse_extra_call_home_ports(raw: str) -> list[int]:
+    return [int(p) for p in raw.split(",") if p.strip()]
+
+
+DEFAULT_EXTRA_CALL_HOME_PORTS = _parse_extra_call_home_ports(
+    os.environ.get("MMWS_EXTRA_CALL_HOME_PORTS", "")
+)
+
 
 def serve(
     *,
@@ -395,12 +407,19 @@ def serve(
     port: int = 50051,
     max_workers: int = DEFAULT_MAX_WORKERS,
     call_home_port: int | None = DEFAULT_CALL_HOME_PORT,
+    extra_call_home_ports: list[int] | None = None,
 ) -> tuple[grpc.Server, CallHomePool | None]:
     """``call_home_port=None`` отключает call-home пул (например, для
     тестов, где он не нужен и просто занимал бы порт)."""
     call_home_pool = None
     if call_home_port is not None:
-        call_home_pool = CallHomePool(bind_host=host, bind_port=call_home_port)
+        call_home_pool = CallHomePool(
+            bind_host=host,
+            bind_port=call_home_port,
+            extra_bind_ports=(
+                extra_call_home_ports if extra_call_home_ports is not None else DEFAULT_EXTRA_CALL_HOME_PORTS
+            ),
+        )
         call_home_pool.start()
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))

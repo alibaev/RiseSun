@@ -64,6 +64,43 @@ async def test_dashboard_counts_meters_jobs_readings(client, db_session):
     assert body["tamper_events_24h"] == 0
     assert len(body["readings_by_hour"]) == 1
     assert body["readings_by_hour"][0]["count"] == 1
+    # 1 из 2 активных счётчиков имеет показание — 50%, и сегодня, и за 3 суток.
+    assert body["read_percentage_today"] == 50.0
+    assert body["read_percentage_3d"] == 50.0
+
+
+@pytest.mark.asyncio
+async def test_dashboard_read_percentage_excludes_old_readings(client, db_session):
+    """read_percentage_today не должен учитывать показание за пределами
+    текущих суток (Asia/Bishkek), даже если оно попадает в окно 3 суток."""
+    root = await _seed_user(db_session, username="root2", password="pass1234", role=UserRole.SUPER_ADMIN)
+    gateway = Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    db_session.add(gateway)
+    await db_session.flush()
+
+    now = datetime.now(timezone.utc)
+    meter = Meter(
+        serial_number="m-old-reading", ip_address="127.0.0.1", port=4059,
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id, last_seen_at=now - timedelta(hours=30),
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    # Вчера (гарантированно вне текущих суток Бишкека), но внутри 3 суток.
+    db_session.add(
+        MeterReading(
+            meter_id=meter.id, obis_code="1.0.1.8.0.ff", value_json=1, unit="kWh",
+            read_at=now - timedelta(hours=30),
+        )
+    )
+    await db_session.commit()
+
+    token = await _login(client, "root2", "pass1234")
+    resp = await client.get("/api/dashboard", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["read_percentage_today"] == 0.0
+    assert body["read_percentage_3d"] == 100.0
 
 
 @pytest.mark.asyncio

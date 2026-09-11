@@ -54,6 +54,18 @@ def test_get_response_error_raises():
         dlms.parse_get_response(response)
 
 
+def test_get_response_invalid_choice_byte_raises_clear_error():
+    """2026-09-11, найдено на живом трафике (см. DECISIONS.md — "поймать
+    байты одного отказа"): choice-байт Get-Data-Result по стандарту может
+    быть только 0x00 (data) или 0x01 (data-access-result) — реально
+    приходил ответ ровно 4 байта (тег+тип+invoke_id+choice=0x17), CRC/HCS
+    кадра при этом сходились (не повреждение при приёме). Раньше падало
+    непонятным "Пустые данные при разборе значения DLMS"."""
+    response = bytes([dlms.GET_RESPONSE_TAG, dlms.GET_RESPONSE_NORMAL, 1, 0x17])
+    with pytest.raises(GatewayError, match="0x17"):
+        dlms.parse_get_response(response)
+
+
 def test_get_request_with_custom_class_id():
     # class 1 (Data) — параметры вроде «Current Time» (Этап 2, ТЗ п.4.2.4,
     # словарь OBIS RW_Tree_параметры), не Register (class 3).
@@ -108,6 +120,13 @@ def test_get_request_range_has_access_selection_present_flag():
     # access-parameters — структура из 4 элементов
     assert request[descriptor_end + 2] == datatypes.TAG_STRUCTURE
     assert request[descriptor_end + 3] == 4
+    # restricting_object — NULL-DATA (2026-09-10, см. DECISIONS.md: было
+    # Clock-структурой, счётчик без Clock в захватываемых колонках
+    # отвергал её data-access-result=250; сверено побайтово с реально
+    # работающей заводской программой ver2.zip).
+    assert request[descriptor_end + 4] == datatypes.TAG_NULL_DATA
+    # from_value сразу следующим элементом — octet-string (cosem-date-time).
+    assert request[descriptor_end + 5] == datatypes.TAG_OCTET_STRING
 
 
 def test_get_request_next_round_trip_shape():

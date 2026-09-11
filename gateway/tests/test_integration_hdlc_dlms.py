@@ -113,6 +113,130 @@ def test_register_read_applies_value_obis_override_for_risesun_energy():
     assert value == 4507.7
 
 
+class _FakeTransport:
+    """Минимальный фейковый транспорт (без сокетов) — очередь заранее
+    закодированных HDLC-кадров на recv, накопление отправленного на
+    send. Нужен только 3-методный интерфейс, который использует
+    ``_read_one_register_via_established_link``."""
+
+    def __init__(self, frames_to_recv: list[bytes]) -> None:
+        self._buf = b"".join(frames_to_recv)
+        self.sent: list[bytes] = []
+
+    def send(self, data: bytes) -> None:
+        self.sent.append(data)
+
+    def reset_frame_seeking(self) -> None:
+        pass
+
+    def recv_exact(self, n: int) -> bytes:
+        assert len(self._buf) >= n, "фейковый транспорт исчерпан раньше, чем ожидалось"
+        chunk, self._buf = self._buf[:n], self._buf[n:]
+        return chunk
+
+
+def _hdlc_response_frame(information: bytes, *, send_seq: int = 1, recv_seq: int = 2) -> bytes:
+    return HdlcFrame(
+        destination=0x30, source=0x01, control=control_information_frame(send_seq, recv_seq),
+        information=information,
+    ).encode()
+
+
+def test_register_read_uses_distinct_invoke_id_for_scaler_and_value():
+    """2026-09-11, найдено на живом трафике (см. DECISIONS.md — "поймать
+    байты одного отказа"): раньше scaler_unit и value внутри ОДНОЙ
+    ассоциации всегда уходили с одинаковым invoke_id=1 — рабочая
+    гипотеза в том, что часть прошивок (преимущественно новой партии
+    счётчиков) путает повторный invoke_id с ретрансляцией уже
+    обработанного запроса. Теперь второй GET должен иметь другой
+    invoke_id."""
+    scaler_info = dlms.wrap_llc_response(
+        dlms.build_get_response_data(
+            1, datatypes.encode_structure([datatypes.encode_integer(0), datatypes.encode_unsigned(30)])
+        )
+    )
+    value_info = dlms.wrap_llc_response(
+        dlms.build_get_response_data(1, datatypes.encode_double_long_unsigned(450770))
+    )
+    transport = _FakeTransport([_hdlc_response_frame(scaler_info), _hdlc_response_frame(value_info)])
+
+    hdlc_dlms._read_one_register_via_established_link(
+        transport, server_addr=0x01, client_addr=0x30,
+        send_seq=1, obis="1.1.1.8.0.ff", class_id=dlms.REGISTER_CLASS_ID,
+    )
+
+    assert len(transport.sent) == 2
+    invoke_ids = []
+    for raw_frame in transport.sent:
+        frame = HdlcFrame.decode(raw_frame)
+        payload = dlms.unwrap_llc(frame.information)
+        invoke_ids.append(payload[2])
+    assert invoke_ids[0] != invoke_ids[1]
+
+
+def test_register_read_fails_instead_of_returning_unscaled_raw_value_on_malformed_scaler():
+    """Найденный баг на живых данных (2026-09-11, см. DECISIONS.md):
+    счётчик 201901230052 получил в MeterReading значение "-1003" (без
+    дробной части — прямой признак непроскейленного сырого значения)
+    при исправном предыдущем показании 3271.18 — суммарная активная
+    энергия физически не может уменьшаться. Причина — когда GET
+    scaler_unit возвращал не ожидаемую структуру {scaler, unit}, а
+    что-то другое (здесь: одиночное целое, не список), код тихо
+    возвращал СЫРОЕ немасштабированное значение как будто оно валидное.
+    Теперь это должно быть отказом чтения (GatewayError), а не мнимым
+    успехом с недостоверным числом."""
+    malformed_scaler_info = dlms.wrap_llc_response(
+        dlms.build_get_response_data(1, datatypes.encode_integer(5))  # НЕ структура {scaler, unit}
+    )
+    value_info = dlms.wrap_llc_response(
+        dlms.build_get_response_data(1, datatypes.encode_double_long_unsigned(450770))
+    )
+    transport = _FakeTransport(
+        [_hdlc_response_frame(malformed_scaler_info), _hdlc_response_frame(value_info)]
+    )
+
+    value, next_send_seq, error = hdlc_dlms._read_one_register_via_established_link(
+        transport, server_addr=0x01, client_addr=0x30,
+        send_seq=1, obis="1.1.1.8.0.ff", class_id=dlms.REGISTER_CLASS_ID,
+    )
+
+    assert value is None
+    assert error is not None
+    assert isinstance(error, GatewayError)
+    assert next_send_seq == 3  # нумерация кадров продвинулась штатно несмотря на отказ
+
+
+def test_register_read_fails_instead_of_accepting_null_data_value():
+    """2026-09-11 — найдено на новой партии счётчиков (масштабная
+    деградация read_current: ~87% новой партии). Одна из причин: GET.
+    response-Normal иногда приходит валидным (CRC/HCS сошлись), с
+    выбором "data", но само значение — null-data (0x00), для которого
+    раньше в decode_value() не было ветки разбора вообще (падало
+    "Неподдержанный тег..."). Теперь decode_value() разбирает null-data
+    как None, но для показания энергии None так же недостоверен, как
+    немасштабированное сырое число (см. тест выше про scaler) —
+    ожидается отказ чтения, а не показание со значением None."""
+    scaler_info = dlms.wrap_llc_response(
+        dlms.build_get_response_data(
+            1, datatypes.encode_structure([datatypes.encode_integer(0), datatypes.encode_unsigned(30)])
+        )
+    )
+    null_value_info = dlms.wrap_llc_response(dlms.build_get_response_data(1, datatypes.encode_null()))
+    transport = _FakeTransport(
+        [_hdlc_response_frame(scaler_info), _hdlc_response_frame(null_value_info)]
+    )
+
+    value, next_send_seq, error = hdlc_dlms._read_one_register_via_established_link(
+        transport, server_addr=0x01, client_addr=0x30,
+        send_seq=1, obis="1.1.1.8.0.ff", class_id=dlms.REGISTER_CLASS_ID,
+    )
+
+    assert value is None
+    assert error is not None
+    assert isinstance(error, GatewayError)
+    assert next_send_seq == 3
+
+
 def test_register_read_applies_watt_hour_to_kwh_conversion():
     """Найденный баг (2026-09-07, сообщение пользователя): показания
     приходили без дробного разделителя и в 1000 раз больше нужного —
@@ -325,14 +449,20 @@ class _ConnAdapter:
         pass
 
 
-def _serve_batch_session(conn, *, obis_values: dict, disconnect_after_registers: int | None = None) -> None:
+def _serve_batch_session(
+    conn, *, obis_values: dict, disconnect_after_registers: int | None = None,
+    attribute_ids_seen: list | None = None,
+) -> None:
     """Обслуживает SNRM/UA + AARQ/AARE, затем произвольное число
     GET-пар (scaler_unit, отвечает scaler=0; value — по ``obis_values``,
     OBJECT_UNDEFINED если OBIS не найден) подряд на одной ассоциации, в
     том порядке, в каком их фактически запрашивает клиент. Если
     ``disconnect_after_registers`` задан — закрывает соединение сразу
     после этого числа полностью обслуженных регистров, не дожидаясь
-    следующего запроса (имитация обрыва посреди батча)."""
+    следующего запроса (имитация обрыва посреди батча). ``attribute_ids_seen``
+    (2026-09-11) — если передан список, в него добавляется attribute_id
+    каждого полученного GET-запроса (используется тестом на class_id=0,
+    чтобы убедиться, что scaler_unit реально запрашивается)."""
     adapter = _ConnAdapter(conn)
     snrm_frame = HdlcFrame.decode(read_frame_from_transport(adapter))
     ua = HdlcFrame(destination=snrm_frame.source, source=snrm_frame.destination, control=CONTROL_UA)
@@ -358,6 +488,8 @@ def _serve_batch_session(conn, *, obis_values: dict, disconnect_after_registers:
         except (ConnectionError, OSError):
             return
         get_request = dlms.parse_get_request(dlms.unwrap_llc(frame.information))
+        if attribute_ids_seen is not None:
+            attribute_ids_seen.append(get_request.attribute_id)
         if get_request.attribute_id == dlms.REGISTER_SCALER_UNIT_ATTRIBUTE:
             payload = datatypes.encode_structure([datatypes.encode_integer(0), datatypes.encode_unsigned(0)])
             info = dlms.build_get_response_data(get_request.invoke_id, payload)
@@ -382,7 +514,9 @@ def _serve_batch_session(conn, *, obis_values: dict, disconnect_after_registers:
                 return
 
 
-def _run_batch_server(*, obis_values: dict, disconnect_after_registers: int | None = None):
+def _run_batch_server(
+    *, obis_values: dict, disconnect_after_registers: int | None = None, attribute_ids_seen: list | None = None,
+):
     """Запускает ``_serve_batch_session`` на localhost в фоновом потоке,
     возвращает ``(host, port, thread, server_sock)`` — вызывающий
     отвечает за ``server_sock.close()``/``thread.join()`` по завершении
@@ -397,7 +531,10 @@ def _run_batch_server(*, obis_values: dict, disconnect_after_registers: int | No
     def _accept_and_serve():
         conn, _ = server_sock.accept()
         try:
-            _serve_batch_session(conn, obis_values=obis_values, disconnect_after_registers=disconnect_after_registers)
+            _serve_batch_session(
+                conn, obis_values=obis_values, disconnect_after_registers=disconnect_after_registers,
+                attribute_ids_seen=attribute_ids_seen,
+            )
         finally:
             conn.close()
 
@@ -430,6 +567,32 @@ def test_read_registers_happy_path_multiple_obis():
     assert all(o.ok for o in outcomes)
     assert outcomes[0].value == 1234567
     assert outcomes[1].value == 2200000
+
+
+def test_read_registers_normalizes_class_id_zero_to_register():
+    """2026-09-11, найдено на живом трафике (92% свежих показаний —
+    null): DueJobOut/payload передаёт class_id=0 как "используй Register
+    по умолчанию" (тот же смысл, что и в старом gRPC-пути,
+    grpc_server.py: ``class_id=request.class_id or dlms.REGISTER_CLASS_ID``),
+    но read_registers_via_established_link раньше использовал 0 как есть
+    — 0 != dlms.REGISTER_CLASS_ID(3), поэтому scaler_unit НИ РАЗУ не
+    запрашивался для обычных read_current job'ов (только они и приходят
+    с class_id=0 по умолчанию) на событийном пути. Теперь 0 должен
+    нормализоваться в REGISTER_CLASS_ID точно как на старом пути —
+    scaler_unit обязан быть запрошен."""
+    obis_values = {dlms.parse_obis(OBIS): 1234567}
+    attribute_ids_seen: list = []
+    host, port, thread, server_sock = _run_batch_server(
+        obis_values=obis_values, attribute_ids_seen=attribute_ids_seen,
+    )
+    try:
+        outcomes = _read_batch(host, port, obis_specs=[(OBIS, 0)])
+    finally:
+        thread.join(timeout=3)
+        server_sock.close()
+
+    assert outcomes[0].ok is True
+    assert dlms.REGISTER_SCALER_UNIT_ATTRIBUTE in attribute_ids_seen
 
 
 def test_read_registers_data_access_error_does_not_sink_rest_of_batch():

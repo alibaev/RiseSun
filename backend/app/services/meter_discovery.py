@@ -35,14 +35,14 @@ _CHECK_INTERVAL_S = 30.0
 # включая новые (см. докстринг модуля, 2026-09-10).
 _AUTO_ACTIVATE_PASSWORD = b"12345678"
 _AUTO_ACTIVATE_PROFILE = ProtocolProfile.HDLC_DLMS
-# По словам пользователя (2026-09-10): вся новая партия (~300 счётчиков,
-# ожидаемая этим заходом) — токовый класс 100А, в отличие от старого
-# парка (5-7.5А, смешанно, устанавливается фактическим чтением
-# read_rated_current — см. finalize_read_rated_current_job). Ставим
-# сразу при автообнаружении вместо ожидания первого удачного чтения;
-# реальное чтение (если случится) всё равно перезапишет этим же
-# значением или уточнит его.
-_NEW_BATCH_RATED_CURRENT_AMPS = 100.0
+# 2026-09-11 (по прямому указанию пользователя, отменяет решение от
+# 2026-09-10 ниже по истории): токовый класс НЕ угадывается при
+# автообнаружении — новая партия смешанная (100А, но также 5 и 7.5А
+# встречаются), а не вся 100А, как предполагалось раньше. rated_current_
+# amps остаётся None при создании счётчика и устанавливается только
+# реальным чтением (read_rated_current, см. finalize_read_rated_current_
+# job) — тем же принципом "лучше вообще без данных", что и везде
+# в проекте.
 
 
 async def _add_to_catchall_schedules(db, meter_id: int) -> None:
@@ -93,7 +93,6 @@ async def _run_once() -> None:
                     serial_number=serial, is_call_home=True, gateway_id=gateway.id,
                     status=MeterStatus.ACTIVE, protocol_profile=_AUTO_ACTIVATE_PROFILE,
                     password_encrypted=encrypt_secret(_AUTO_ACTIVATE_PASSWORD),
-                    rated_current_amps=_NEW_BATCH_RATED_CURRENT_AMPS,
                 )
                 auto_activated.append(meter)
                 db.add(meter)

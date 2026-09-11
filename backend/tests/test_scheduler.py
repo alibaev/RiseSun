@@ -88,6 +88,19 @@ async def test_resolve_payloads_read_current_default_obis(db_session):
 
 
 @pytest.mark.asyncio
+async def test_resolve_payloads_read_current_with_class_id_override():
+    """2026-09-10 (см. DECISIONS.md, "постоянное чтение profile1"):
+    class_id из operation_params должен пробрасываться в payload для
+    простого GET объектов не-Register класса (напр. 7 = ProfileGeneric,
+    буфер профиля нагрузки без диапазона дат)."""
+    job = ScheduledJob(
+        name="x", cron_expression="* * * * *", job_type="read_current",
+        operation_params={"obis": "1.1.63.1.0.ff", "class_id": 7}, meter_ids=[],
+    )
+    assert await _resolve_payloads(None, job) == [{"obis": "1.1.63.1.0.ff", "class_id": 7}]
+
+
+@pytest.mark.asyncio
 async def test_resolve_payloads_read_load_profile_window(db_session):
     job = ScheduledJob(
         name="x", cron_expression="* * * * *", job_type="read_load_profile",
@@ -163,6 +176,29 @@ async def test_trigger_one_creates_run_and_one_job_per_meter(db_session):
     assert all(j.status == JobStatus.QUEUED for j in jobs)
     assert all(j.payload == {"obis": "1.1.1.8.0.ff"} for j in jobs)
     assert scheduled_job.last_run_at is not None
+
+
+@pytest.mark.asyncio
+async def test_trigger_one_all_active_meters_includes_meter_not_in_meter_ids(db_session):
+    """2026-09-11 (по просьбе пользователя — "сохрани для новых счётчиков
+    на будущее"): при operation_params.all_active_meters=true список
+    meter_ids игнорируется, берутся ВСЕ активные счётчики — включая те,
+    что появились/активировались ПОСЛЕ создания расписания."""
+    all_ids = await _seed_gateway_and_meters(db_session, n=3)
+    meter_ids, later_meter_ids = all_ids[:2], all_ids[2:]
+    scheduled_job = ScheduledJob(
+        name="Весь парк", cron_expression="*/5 * * * *", job_type="read_current",
+        operation_params={"obis": "1.1.1.8.0.ff", "all_active_meters": True},
+        meter_ids=meter_ids,  # намеренно НЕ включает later_meter_ids — имитирует
+        # счётчик, активированный/созданный уже ПОСЛЕ создания расписания.
+    )
+    db_session.add(scheduled_job)
+    await db_session.commit()
+
+    await _trigger_one(db_session, scheduled_job)
+
+    jobs = (await db_session.execute(select(Job))).scalars().all()
+    assert {j.meter_id for j in jobs} == set(meter_ids) | set(later_meter_ids)
 
 
 @pytest.mark.asyncio
@@ -313,6 +349,35 @@ async def test_trigger_one_skip_if_read_today_creates_no_run_when_all_covered(db
     assert (await db_session.execute(select(ScheduledJobRun))).scalars().all() == []
     assert (await db_session.execute(select(Job))).scalars().all() == []
     assert scheduled_job.last_run_at is not None  # иначе тик планировщика повторялся бы немедленно
+
+
+@pytest.mark.asyncio
+async def test_trigger_one_read_load_profile_skip_if_read_today_excludes_succeeded(db_session):
+    """2026-09-10 ("постоянное чтение profile1", см. DECISIONS.md):
+    skip_if_read_today для read_load_profile проверяет успешно
+    завершённую Job (нет единой строки-показания с read_at, в отличие
+    от read_current/MeterReading)."""
+    meter_ids = await _seed_gateway_and_meters(db_session, n=2)
+    already_read_id, pending_id = meter_ids
+    db_session.add(
+        Job(
+            job_type="read_load_profile", meter_id=already_read_id, status=JobStatus.SUCCEEDED,
+            payload={}, finished_at=datetime.now(timezone.utc),
+        )
+    )
+    await db_session.commit()
+
+    scheduled_job = ScheduledJob(
+        name="Профиль1 постоянно", cron_expression="*/5 * * * *", job_type="read_load_profile",
+        operation_params={"skip_if_read_today": True, "window_hours": 6}, meter_ids=meter_ids,
+    )
+    db_session.add(scheduled_job)
+    await db_session.commit()
+
+    await _trigger_one(db_session, scheduled_job)
+
+    jobs = (await db_session.execute(select(Job).where(Job.status == JobStatus.QUEUED))).scalars().all()
+    assert {j.meter_id for j in jobs} == {pending_id}
 
 
 @pytest.mark.asyncio

@@ -60,10 +60,19 @@ _DATETIME_DATE_OBIS = "1.0.0.9.2.ff"
 _DATA_CLASS_ID = 1
 
 
+# Эксперимент "эмуляция ver2.zip" (2026-09-10, см. DECISIONS.md) завершён
+# и дал отрицательный результат — исключение снято, множество пустое.
+# Оставлено (не удалено) на случай повторного точечного эксперимента.
+_VER2_EMULATION_EXPERIMENT_EXCLUDED_METER_IDS: set[int] = set()
+
+
 async def _claim_next_job(db: AsyncSession) -> Job | None:
     result = await db.execute(
         select(Job)
-        .where(Job.status == JobStatus.QUEUED)
+        .where(
+            Job.status == JobStatus.QUEUED,
+            Job.meter_id.not_in(_VER2_EMULATION_EXPERIMENT_EXCLUDED_METER_IDS),
+        )
         .order_by(Job.created_at)
         .limit(1)
         .with_for_update(skip_locked=True)
@@ -198,6 +207,22 @@ async def finalize_read_current_job(db: AsyncSession, job: Job, meter: Meter, ou
 # статичный паспортный параметр).
 RATED_CURRENT_OBIS = "1.1.0.6.3.ff"
 
+# Допустимые номиналы тока для этого парка счётчиков — по прямому указанию
+# пользователя (2026-09-11): "Ампер может быть - 5, 7.5, 100, другие значения
+# ошибочные, нужен повторный запрос". Значение вне этого множества трактуется
+# как ошибка протокола/декодирования (например, ранее встречались -4 и 0 —
+# физически невозможные номиналы), а не как достоверный паспортный параметр —
+# тот же принцип "лучше вообще без данных", что и в чтении показаний
+# (см. DECISIONS.md, hdlc_dlms.py). Job в этом случае падает FAILED,
+# rated_current_amps НЕ записывается и остаётся None — это заставляет
+# планировщик (scheduler.py: `rated_current_amps is None`) повторить попытку
+# на следующем звонке счётчика, а не запомнить ошибочное значение навсегда.
+VALID_RATED_CURRENT_AMPS = (5, 7.5, 100)
+
+
+def _is_valid_rated_current(value: float) -> bool:
+    return any(abs(value - valid) < 0.01 for valid in VALID_RATED_CURRENT_AMPS)
+
 
 async def _run_read_rated_current(db: AsyncSession, job: Job) -> None:
     meter = await db.get(Meter, job.meter_id)
@@ -229,7 +254,15 @@ async def finalize_read_rated_current_job(db: AsyncSession, job: Job, meter: Met
     """См. docstring ``finalize_read_current_job`` — тот же принцип
     (используется и старым воркером, и новым эндпоинтом job-results)."""
     now = datetime.now(timezone.utc)
-    if outcome.ok and isinstance(outcome.value, (int, float)):
+    if outcome.ok and isinstance(outcome.value, (int, float)) and not _is_valid_rated_current(float(outcome.value)):
+        job.status = JobStatus.FAILED
+        job.error = {
+            "code": "IMPLAUSIBLE_RATED_CURRENT",
+            "message": f"Получено {outcome.value!r} — вне допустимого множества {VALID_RATED_CURRENT_AMPS}",
+            "is_partial": False,
+        }
+        meter.last_seen_at = now
+    elif outcome.ok and isinstance(outcome.value, (int, float)):
         job.status = JobStatus.SUCCEEDED
         job.result = {"obis": RATED_CURRENT_OBIS, "rated_current_amps": outcome.value}
         meter.rated_current_amps = float(outcome.value)

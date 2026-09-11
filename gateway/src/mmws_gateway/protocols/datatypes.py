@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+TAG_NULL_DATA = 0x00  # без значения — сам по себе один байт
 TAG_ARRAY = 0x01  # count (1 байт) + N вложенных значений
 TAG_STRUCTURE = 0x02  # count (1 байт) + N вложенных значений
 TAG_DOUBLE_LONG = 0x05  # int32, big-endian
@@ -58,6 +59,18 @@ class DlmsDataError(ValueError):
 
 def tag_name(tag: int) -> str:
     return _TAG_NAMES.get(tag, f"0x{tag:02X}")
+
+
+def encode_null() -> bytes:
+    """NULL-DATA (тег 0x00, без значения) — 2026-09-10, см. DECISIONS.md:
+    найдено побайтовым разбором декомпилированного ``ver2.zip``
+    (``TpDLMS.cs::organizeFrame_GetLoadProfile``), что заводская
+    сервисная программа отправляет ИМЕННО NULL, а не структуру
+    Clock-объекта, в поле ``restricting_object`` access-parameters для
+    range-descriptor при чтении профиля нагрузки — счётчик, у которого
+    Clock не входит в захватываемые колонки буфера, отвергал нашу
+    Clock-структуру кодом data-access-result=250."""
+    return bytes([TAG_NULL_DATA])
 
 
 def encode_double_long_unsigned(value: int) -> bytes:
@@ -154,6 +167,13 @@ def decode_value(data: bytes, offset: int = 0) -> tuple[object, int]:
     tag = data[offset]
     pos = offset + 1
 
+    if tag == TAG_NULL_DATA:
+        # 2026-09-11 — найдено на новой партии счётчиков: значение может
+        # легитимно прийти как null-data (нет данных прямо сейчас), а не
+        # только использоваться нами как restricting-object в GET-запросе
+        # диапазона (см. encode_null() выше). Раньше здесь не было ветки
+        # разбора вовсе — падало "Неподдержанный тег типа данных DLMS: 0x00".
+        return None, 1
     if tag == TAG_DOUBLE_LONG_UNSIGNED:
         _require(data, pos, 4)
         return int.from_bytes(data[pos : pos + 4], "big", signed=False), 5

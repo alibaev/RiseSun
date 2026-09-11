@@ -88,8 +88,23 @@ def server_hdlc_address(physical_address: str, *, logical_device: int = 1) -> in
     ``lower`` — тогда поднимается ``AddressingError`` (а не падение
     необработанным исключением, как раньше), поскольку правильная схема
     кодирования для таких серийников не подтверждена реальным трафиком.
-    """
-    lower = int(physical_address)
+
+    Найдено на практике 2026-09-11: счётчик с ПОВРЕЖДЁННЫМ (нецифровым)
+    серийным номером (напр. "20190123ef23") мог оказаться помеченным
+    ACTIVE по ошибке (в обход штатной защиты MeterStatus.INVALID,
+    см. DECISIONS.md) — тогда ``physical_address`` (последние 5 сырых
+    символов серийника) содержит буквы, и голый ``int(...)`` падал
+    необработанным ``ValueError``, роняя весь gRPC-вызов Gateway'я.
+    Теперь это тоже ``AddressingError`` — тот же принцип, что и выше:
+    некорректный адрес не должен ронять процесс, только эту одну
+    попытку чтения."""
+    try:
+        lower = int(physical_address)
+    except ValueError as exc:
+        raise AddressingError(
+            f"Физический адрес {physical_address!r} не является числом — "
+            "вероятно, повреждённый серийный номер счётчика"
+        ) from exc
     if not 0 <= logical_device < (1 << 14) or not 0 <= lower < (1 << 14):
         raise AddressingError(
             f"Компоненты адреса вне диапазона 14 бит: logical_device={logical_device}, "

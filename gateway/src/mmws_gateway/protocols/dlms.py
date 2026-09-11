@@ -92,6 +92,16 @@ MECHANISM_NAME_LLS = (2, 16, 756, 5, 8, 2, 1)
 SENDER_ACSE_REQUIREMENTS = bytes.fromhex("8a020780")
 USER_INFORMATION_INITIATE = bytes.fromhex("be10040e01000000065f1f040000081d0800")
 
+# Байты AARQ декомпилированного `TpDLMS.cs::organizeFrame_AARQ` (ver2.zip,
+# "заводская сервисная программа" — 2026-09-10, см. DECISIONS.md) —
+# идентичны нашим ВО ВСЁМ, кроме client-max-receive-pdu-size: там `0000`
+# (0), не `0800`. Скорее всего это и есть источник того самого
+# исторического успешного сеанса 2026-08-18 с `0000` (см. комментарий
+# выше) — вероятно, ОБЕ референс-программы реально работали с разными
+# парками/сессиями. Используется только экспериментальным путём
+# эмуляции ver2.zip (``callhome.py``), НЕ значением по умолчанию.
+USER_INFORMATION_INITIATE_VER2_VARIANT = bytes.fromhex("be10040e01000000065f1f040000081d0000")
+
 REGISTER_CLASS_ID = 3
 REGISTER_VALUE_ATTRIBUTE = 2
 # Атрибут 3 (scaler_unit) — structure {scaler: integer (десятичный
@@ -184,7 +194,7 @@ def parse_obis(text: str) -> bytes:
     return bytes(values)
 
 
-def build_aarq(password: bytes, *, mechanism_id: int = 1) -> bytes:
+def build_aarq(password: bytes, *, mechanism_id: int = 1, user_information: bytes | None = None) -> bytes:
     """Строит AARQ с calling-authentication-value = пароль низкого уровня.
 
     Состав полей (application-context, sender-acse-requirements,
@@ -202,7 +212,14 @@ def build_aarq(password: bytes, *, mechanism_id: int = 1) -> bytes:
     заполняется как для LLS (сырой пароль), что для настоящего HLS
     протокольно некорректно (там ожидается вызов-ответ, не пароль) —
     годится только чтобы проверить, реагирует ли счётчик на смену OID
-    вообще, не для завершения полноценной HLS-ассоциации."""
+    вообще, не для завершения полноценной HLS-ассоциации.
+
+    ``user_information`` — переопределяет ``USER_INFORMATION_INITIATE``
+    (дефолт — ``None``, используется модульная константа). Добавлено
+    2026-09-10 для эксперимента "эмуляция ver2.zip": декомпилированный
+    ``TpDLMS.cs::organizeFrame_AARQ`` шлёт те же байты, что и наша
+    константа, ЗА ИСКЛЮЧЕНИЕМ последних двух (client-max-receive-pdu-size
+    = ``0000``, а не ``0800``) — см. DECISIONS.md."""
     context_oid = encode_oid(APPLICATION_CONTEXT_LN_NO_CIPHERING)
     application_context = bytes([0xA1, len(context_oid) + 2, 0x06, len(context_oid)]) + context_oid
     mechanism_oid = encode_oid((2, 16, 756, 5, 8, 2, mechanism_id)) if mechanism_id != 1 else encode_oid(MECHANISM_NAME_LLS)
@@ -214,7 +231,7 @@ def build_aarq(password: bytes, *, mechanism_id: int = 1) -> bytes:
         + SENDER_ACSE_REQUIREMENTS
         + mechanism_name
         + calling_auth
-        + USER_INFORMATION_INITIATE
+        + (user_information if user_information is not None else USER_INFORMATION_INITIATE)
     )
     if len(body) > 0x7F:
         raise GatewayError(
@@ -366,6 +383,22 @@ def parse_get_response(data: bytes) -> object:
     if result == RESULT_DATA_ACCESS_ERROR:
         code = data[4] if len(data) > 4 else -1
         raise GatewayError(f"Счётчик вернул data-access-result={code} на GET-запрос")
+    if result != RESULT_DATA:
+        # 2026-09-11, найдено на живом трафике (см. DECISIONS.md — "поймать
+        # байты одного отказа"): choice-байт Get-Data-Result по стандарту
+        # может быть только 0 (data) или 1 (data-access-result) — но
+        # реально приходит, напр., 0x17, за которым СРАЗУ конец кадра
+        # (только 4 байта во всём GET.response-Normal, CRC/HCS кадра при
+        # этом честно сходятся — это не повреждение при приёме, счётчик
+        # прислал именно это). Раньше такой байт молча трактовался как
+        # "дальше идёт значение" и decode_value() падал с непонятным
+        # "Пустые данные"/"неподдержанный тег" — теперь отдельная, ясная
+        # ошибка на самом источнике проблемы, ближе к правде о том, что
+        # произошло.
+        raise GatewayError(
+            f"Неожиданный choice-байт Get-Data-Result: 0x{result:02X} (ожидался 0x00 data "
+            f"или 0x01 data-access-result) — вероятно, счётчик прислал укороченный ответ"
+        )
     value, _consumed = datatypes.decode_value(data, offset=4)
     return value
 
@@ -475,15 +508,29 @@ def parse_set_response(data: bytes) -> None:
 # отсутствует, уже используется в build_get_request через явный [0x00]
 # в конце), затем при наличии: [0x01, access-selector, access-parameters].
 # Для профиля нагрузки — access-selector=1 (range-descriptor),
-# access-parameters — структура из 4 полей: restricting_object (обычно
-# ссылка на объект Clock, класс 8, OBIS 0.0.1.0.0.255, атрибут 2 —
-# "время" — используется как колонка сортировки), from_value/to_value
-# (диапазон как octet-string с сырыми 12 байтами cosem-date-time),
-# selected_values (пустой массив = вернуть все захватываемые колонки).
+# access-parameters — структура из 4 полей: restricting_object,
+# from_value/to_value (диапазон как octet-string с сырыми 12 байтами
+# cosem-date-time), selected_values (пустой массив = вернуть все
+# захватываемые колонки).
+#
+# restricting_object — ИЗНАЧАЛЬНО кодировался как структура-ссылка на
+# объект Clock (класс 8, OBIS 0.0.1.0.0.255, атрибут 2), по аналогии
+# со "стандартным" описанием range-descriptor в Green Book. НАЙДЕНО
+# 2026-09-10 (см. DECISIONS.md, "read_load_profile — ноль успехов за
+# всю историю"): это было ОШИБКОЙ для этих счётчиков — реальный экспорт
+# объектной модели (2026-08-19) уже показал, что захватываемые колонки
+# буфера НЕ включают объект Clock, и Clock-структура в restricting_object
+# каждый раз отвергалась data-access-result=250 ("other-reason").
+# Побайтовый разбор декомпилированного `ver2.zip`
+# (`TpDLMS.cs::organizeFrame_GetLoadProfile`) — РЕАЛЬНО работающей
+# заводской программы — показал, что она отправляет здесь ОДИН байт
+# 0x00 (NULL-DATA), а не Clock-структуру. Заменено на
+# ``datatypes.encode_null()``.
 
 RANGE_DESCRIPTOR_SELECTOR = 1
+ENTRY_DESCRIPTOR_SELECTOR = 2
 CLOCK_CLASS_ID = 8
-CLOCK_OBIS = bytes([0, 0, 1, 0, 0, 0xFF])  # стандартный OBIS объекта Clock
+CLOCK_OBIS = bytes([0, 0, 1, 0, 0, 0xFF])  # стандартный OBIS объекта Clock — больше не используется по умолчанию, см. выше
 
 GET_REQUEST_NEXT = 0x02
 GET_RESPONSE_WITH_DATABLOCK = 0x02
@@ -499,9 +546,6 @@ def build_get_request_range(
     to_dt,
     invoke_id: int = 1,
     attribute_id: int = REGISTER_VALUE_ATTRIBUTE,
-    restricting_class_id: int = CLOCK_CLASS_ID,
-    restricting_obis: bytes = CLOCK_OBIS,
-    restricting_attribute_id: int = 2,
 ) -> bytes:
     """GET.request-Normal с access-selection=range-descriptor — просит
     у счётчика только записи буфера профиля нагрузки за ``[from_dt,
@@ -510,14 +554,7 @@ def build_get_request_range(
         raise GatewayError("OBIS для GET.request должен быть ровно 6 байт")
     descriptor = class_id.to_bytes(2, "big") + obis + bytes([attribute_id])
 
-    restricting_object = datatypes.encode_structure(
-        [
-            datatypes.encode_long_unsigned(restricting_class_id),
-            datatypes.encode_octet_string(restricting_obis),
-            datatypes.encode_integer(restricting_attribute_id),
-            datatypes.encode_long_unsigned(0),
-        ]
-    )
+    restricting_object = datatypes.encode_null()
     from_value = datatypes.encode_octet_string(datatypes.encode_cosem_date_time(from_dt))
     to_value = datatypes.encode_octet_string(datatypes.encode_cosem_date_time(to_dt))
     selected_values = datatypes.encode_array([])

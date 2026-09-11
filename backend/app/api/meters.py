@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
@@ -25,9 +25,13 @@ from ..models import (
     ParameterWriteHistory,
     TamperLog,
     User,
+    _is_same_bishkek_day,
 )
 from ..schemas import (
     ActivateMeterRequest,
+    ApplyLowConsumptionRangeRequest,
+    ApplyLowConsumptionRangeResponse,
+    ResStatsOut,
     JobOut,
     LoadProfileRowOut,
     MeterCreate,
@@ -40,6 +44,7 @@ from ..schemas import (
     WriteParameterRequest,
 )
 from ..services.audit import record_audit
+from ..services.low_consumption import apply_low_consumption_range
 from ..services.write_parameters import WRITABLE_INT_PARAMETERS
 
 router = APIRouter(prefix="/api/meters", tags=["meters"])
@@ -70,6 +75,7 @@ async def list_meters(
     protocol_profile: str | None = None,
     is_active: bool | None = None,
     search: str | None = None,
+    res_name: str | None = None,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_permission(Permission.VIEW_METERS)),
 ) -> list[Meter]:
@@ -80,6 +86,8 @@ async def list_meters(
         query = query.where(Meter.protocol_profile == protocol_profile)
     if is_active is not None:
         query = query.where(Meter.is_active == is_active)
+    if res_name:
+        query = query.where(Meter.res_name == res_name)
     if search:
         pattern = f"%{search}%"
         query = query.where(
@@ -102,6 +110,78 @@ async def list_meters(
     for meter in meters:
         meter.last_reading_value = values_by_meter_id.get(meter.id)
     return meters
+
+
+@router.post("/low-consumption/apply-range", response_model=ApplyLowConsumptionRangeResponse)
+async def apply_low_consumption_range_endpoint(
+    body: ApplyLowConsumptionRangeRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.MANAGE_METERS)),
+) -> ApplyLowConsumptionRangeResponse:
+    # Размещён перед "/{meter_id}", чтобы литеральный путь "low-consumption"
+    # не мог быть перехвачен маршрутом с int-параметром (порядок в FastAPI
+    # важен, даже если {meter_id}: int формально отклонил бы нечисловое
+    # значение с 422, а не молча его принял).
+    matched = await apply_low_consumption_range(db, min_kwh=body.min_kwh, max_kwh=body.max_kwh)
+    await db.commit()
+    for meter in matched:
+        await db.refresh(meter)
+    return ApplyLowConsumptionRangeResponse(matched_meters=matched)
+
+
+@router.get("/res-stats", response_model=list[ResStatsOut])
+async def res_stats(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.VIEW_METERS)),
+) -> list[ResStatsOut]:
+    # Размещён перед "/{meter_id}" — тот же принцип, что и у
+    # low-consumption/apply-range выше. Группировка по res_name (см.
+    # services/res_mapping.py) — is_online не колонка БД, а Python-
+    # свойство (models.Meter.is_online), поэтому считаем агрегаты в
+    # Python, а не SQL GROUP BY.
+    result = await db.execute(select(Meter).where(Meter.res_name.is_not(None)))
+    meters = result.scalars().all()
+
+    # "Процент чтения" (2026-09-11, по просьбе пользователя) — доля
+    # АКТИВНЫХ счётчиков РЭС с показанием (last_read_at) за период,
+    # тот же industry-стандартный смысл, что и "Acquisition Rate".
+    # Знаменатель — активные счётчики (неактивные/INVALID не должны
+    # занижать процент — от них показаний и не ждём). "Сегодня" — тот же
+    # календарный день по Asia/Bishkek, что использует is_online/
+    # scheduler.skip_if_read_today; "за 3 дня" — скользящее окно 72ч.
+    now = datetime.now(timezone.utc)
+    read_today_by_res: dict[str, int] = {}
+    read_3d_by_res: dict[str, int] = {}
+    active_by_res: dict[str, int] = {}
+
+    stats: dict[str, ResStatsOut] = {}
+    for meter in meters:
+        entry = stats.setdefault(
+            meter.res_name,
+            ResStatsOut(
+                res_name=meter.res_name, meters_total=0, meters_active=0, meters_online=0,
+                pct_read_today=0.0, pct_read_3d=0.0,
+            ),
+        )
+        entry.meters_total += 1
+        if meter.is_active:
+            entry.meters_active += 1
+            active_by_res[meter.res_name] = active_by_res.get(meter.res_name, 0) + 1
+            if meter.last_read_at is not None:
+                if _is_same_bishkek_day(meter.last_read_at, now):
+                    read_today_by_res[meter.res_name] = read_today_by_res.get(meter.res_name, 0) + 1
+                if now - meter.last_read_at <= timedelta(days=3):
+                    read_3d_by_res[meter.res_name] = read_3d_by_res.get(meter.res_name, 0) + 1
+        if meter.is_online:
+            entry.meters_online += 1
+
+    for res_name, entry in stats.items():
+        active = active_by_res.get(res_name, 0)
+        if active > 0:
+            entry.pct_read_today = round(100.0 * read_today_by_res.get(res_name, 0) / active, 1)
+            entry.pct_read_3d = round(100.0 * read_3d_by_res.get(res_name, 0) / active, 1)
+
+    return sorted(stats.values(), key=lambda s: s.res_name)
 
 
 @router.get("/{meter_id}", response_model=MeterOut)
@@ -430,16 +510,24 @@ async def list_write_history(
 @router.get("/{meter_id}/readings", response_model=list[MeterReadingOut])
 async def list_readings(
     meter_id: int,
-    limit: int = 50,
+    limit: int = 500,
+    from_iso: str | None = None,
+    to_iso: str | None = None,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_permission(Permission.VIEW_METERS)),
 ) -> list[MeterReading]:
-    result = await db.execute(
-        select(MeterReading)
-        .where(MeterReading.meter_id == meter_id)
-        .order_by(MeterReading.read_at.desc())
-        .limit(limit)
-    )
+    """``from_iso``/``to_iso`` (2026-09-11, UI: вкладка "Показания" с
+    выбором периода) — необязательный фильтр по ``read_at``; без них
+    поведение прежнее (последние ``limit`` показаний). ``limit`` поднят
+    с 50 до 500 по умолчанию — при выбранном периоде обычно нужны все
+    показания диапазона, а не только самые свежие."""
+    query = select(MeterReading).where(MeterReading.meter_id == meter_id)
+    if from_iso:
+        query = query.where(MeterReading.read_at >= datetime.fromisoformat(from_iso))
+    if to_iso:
+        query = query.where(MeterReading.read_at <= datetime.fromisoformat(to_iso))
+    query = query.order_by(MeterReading.read_at.desc()).limit(limit)
+    result = await db.execute(query)
     return list(result.scalars().all())
 
 

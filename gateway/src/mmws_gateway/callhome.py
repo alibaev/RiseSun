@@ -123,6 +123,24 @@ DEFAULT_ASSOCIATION_TIMEOUT_MS = 45000
 # соединения счётчика сразу, оставляя себе только один "бросок кубика".
 DEFAULT_IMMEDIATE_READ_MAX_WAIT_S = 150.0
 
+# Эксперимент "эмуляция ver2.zip" (2026-09-10, см. DECISIONS.md — по
+# просьбе пользователя буквально воспроизвести поведение декомпилированной
+# заводской сервисной программы ``IECMeterManage.exe``, а не наши
+# накопленные эвристики). Серийники в этом множестве при событийном чтении
+# идут НЕ через обычный ``read_batch_via_fresh_connection``, а через тот
+# же вызов с параметрами, byte-в-byte списанными с
+# ``MeterDLMS.cs::Handclasp``/``TpDLMS.cs::organizeFrame_AARQ``: AARQ с
+# client-max-receive-pdu-size=0 (не 2048), ожидание AARE 20с (не 5с) на
+# попытку, до 3 попыток, БЕЗ безусловного DISC перед повтором AARQ (в
+# декомпилированном коде DISC перед повтором шлётся не всегда, а только
+# при рассинхронизации кадра). Пустое множество — заполняется точечно
+# вручную для диагностики, не через конфиг (это разовый эксперимент, не
+# постоянная фича).
+# Эксперимент завершён 2026-09-10 (см. DECISIONS.md) — отрицательный
+# результат, множество очищено. Механизм оставлен для повторных
+# точечных экспериментов, если понадобится.
+VER2_EMULATION_TEST_SERIALS: set[str] = set()
+
 _DLT645_START = 0x68
 
 
@@ -194,7 +212,13 @@ class DlT645FilteringSocket:
     чтение из нижележащего сокета (напрямую или через
     ``_raw_recv_exact``/``recv``), — пересчитывает остаток времени и
     выставляет ``settimeout()`` заново ПЕРЕД каждым отдельным вызовом,
-    так что накопленное время не может незаметно продлеваться шумом."""
+    так что накопленное время не может незаметно продлеваться шумом.
+
+    ВАЖНО (четвёртая находка, 2026-09-10, см. DECISIONS.md — полный
+    аудит ``ver2.zip``): раньше нулевые keepalive-байты и DL/T645-анонсы
+    молча съедались, без какого-либо ответа. Теперь на ровно 3 подряд
+    нулевых байта и на DL/T645-анонс отправляется эхо ``00 00 00`` —
+    см. ``_echo_heartbeat()``."""
 
     # Сколько последних сырых байт держать в буфере диагностики (2026-09-10,
     # см. DECISIONS.md — по просьбе пользователя, вдохновлено находкой в
@@ -292,17 +316,45 @@ class DlT645FilteringSocket:
             # Уже внутри кадра, начало которого нашли ранее — отдаём
             # байты как есть, без какой-либо фильтрации.
             return self._raw_recv(bufsize)
+        consecutive_zero_bytes = 0
         while True:
             first = self._raw_recv(1)
             if not first:
                 return b""
             if first == b"\x00":
-                continue  # одиночный keepalive-байт на границе кадров, не начало кадра
+                consecutive_zero_bytes += 1
+                if consecutive_zero_bytes == 3:
+                    # GPRS-heartbeat (2026-09-10, см. DECISIONS.md — найдено
+                    # в декомпилированном SocketServer.cs::OnReceiveCompleted
+                    # реально работавшей заводской программы ver2.zip): если
+                    # по TCP пришло РОВНО 3 нулевых байта, она отвечает теми
+                    # же 3 нулевыми байтами. Мы раньше эти байты молча
+                    # съедали, никогда не отвечая — гипотеза в том, что
+                    # модем ждёт этого эха как подтверждения живости канала
+                    # НЕЗАВИСИМО от HDLC/DLMS, и не получив его, перестаёт
+                    # доверять каналу ДО того, как реально закроет TCP —
+                    # что выглядело бы точно как наша картина (TCP жив,
+                    # AARQ доставлен, AARE не приходит).
+                    self._echo_heartbeat()
+                    consecutive_zero_bytes = 0
+                continue
+            consecutive_zero_bytes = 0
             if first == bytes([_DLT645_START]):
                 self._discard_one_dlt645_frame()
+                # Тот же референс отвечает 3 нулевыми байтами и на
+                # DL/T645-анонс, не только на голый "00 00 00" — не просто
+                # эхо анонса, а тот же фиксированный heartbeat-ответ.
+                self._echo_heartbeat()
                 continue
             self._seeking = False  # нашли начало кадра — дальше не фильтруем
             return first
+
+    def _echo_heartbeat(self) -> None:
+        try:
+            self._sock.sendall(b"\x00\x00\x00")
+            logger.info("GPRS-heartbeat: отправлено эхо 00 00 00 на %s", self._sock.getpeername())
+        except OSError:
+            pass  # соединение уже могло закрыться — не мешаем вызывающему коду увидеть это через recv()
 
 
 @dataclass
@@ -311,6 +363,12 @@ class _PooledConnection:
     raw_sock: socket.socket
     peer: tuple
     accepted_at: float
+    # 2026-09-11 — локальный порт, на который пришло это соединение (см.
+    # extra_bind_ports выше): логируется, чтобы можно было сопоставить
+    # отказы чтений с тем, как именно пользователь разбил трафик РЭСов
+    # по портам, и проверить, зависит ли доля отказов новой партии от
+    # нагрузки на конкретный порт.
+    local_port: int
     serial: str | None = None
     cancelled: threading.Event = field(default_factory=threading.Event)
 
@@ -326,18 +384,31 @@ class CallHomePool:
         *,
         bind_host: str = "0.0.0.0",
         bind_port: int,
+        extra_bind_ports: list[int] | None = None,
         window_size: int = DEFAULT_WINDOW_SIZE,
         max_per_serial: int = DEFAULT_MAX_PER_SERIAL,
     ) -> None:
+        # 2026-09-11 (по просьбе пользователя — разбить трафик РЭСов по
+        # разным портам, отчасти как диагностика: помогает понять, растёт
+        # ли доля отказов от общей нагрузки на пул/поток соединений, или
+        # это независимо от того, сколько РЭСов на одном порту).
+        # ``bind_port`` остаётся "основным" портом (для обратной
+        # совместимости — HealthCheck/лог и т.п. репортят именно его),
+        # ``extra_bind_ports`` — дополнительные, все слушаются НЕЗАВИСИМО,
+        # но принимают соединения в ОДИН общий self._pool — опознание,
+        # событийное чтение, лимиты на серийник/окно и вся остальная
+        # логика не знают и не должны знать, с какого именно порта
+        # пришло соединение.
         self._bind_host = bind_host
         self._bind_port = bind_port
+        self._extra_bind_ports = list(extra_bind_ports or [])
         self._window_size = window_size
         self._max_per_serial = max_per_serial
         self._lock = threading.Lock()
         self._pool: dict[int, _PooledConnection] = {}  # порядок вставки = порядок подключения
         self._next_conn_no = 0
-        self._listener: socket.socket | None = None
-        self._accept_thread: threading.Thread | None = None
+        self._listeners: list[socket.socket] = []
+        self._accept_threads: list[threading.Thread] = []
         self._stop = threading.Event()
         # Этап 6 (обнаружение новых счётчиков) — сколько раз/когда впервые
         # опознан каждый серийный номер, НЕЗАВИСИМО от скользящего окна
@@ -354,29 +425,48 @@ class CallHomePool:
         self._seen_serials: dict[str, float] = {}
 
     def start(self) -> None:
-        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._listener.bind((self._bind_host, self._bind_port))
-        self._bind_port = self._listener.getsockname()[1]  # если был передан 0 (случайный порт)
-        self._listener.listen(self._window_size + 5)
-        self._listener.settimeout(1.0)
-        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
-        self._accept_thread.start()
+        primary = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        primary.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        primary.bind((self._bind_host, self._bind_port))
+        self._bind_port = primary.getsockname()[1]  # если был передан 0 (случайный порт)
+        self._listeners.append(primary)
+
+        for port in self._extra_bind_ports:
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((self._bind_host, port))
+            self._listeners.append(listener)
+
+        for listener in self._listeners:
+            listener.listen(self._window_size + 5)
+            listener.settimeout(1.0)
+            thread = threading.Thread(target=self._accept_loop, args=(listener,), daemon=True)
+            thread.start()
+            self._accept_threads.append(thread)
+
         logger.info(
-            "Call-home пул запущен на %s:%s (окно=%d)",
-            self._bind_host, self._bind_port, self._window_size,
+            "Call-home пул запущен на %s:%s%s (окно=%d)",
+            self._bind_host, self.bind_ports, "" if len(self.bind_ports) == 1 else " (несколько портов)",
+            self._window_size,
         )
 
     @property
     def bind_port(self) -> int:
         return self._bind_port
 
+    @property
+    def bind_ports(self) -> list[int]:
+        """Все порты, на которых слушает пул — основной первым."""
+        if self._listeners:
+            return [sock.getsockname()[1] for sock in self._listeners]
+        return [self._bind_port, *self._extra_bind_ports]
+
     def stop(self) -> None:
         self._stop.set()
-        if self._listener is not None:
-            self._listener.close()
-        if self._accept_thread is not None:
-            self._accept_thread.join(timeout=3)
+        for listener in self._listeners:
+            listener.close()
+        for thread in self._accept_threads:
+            thread.join(timeout=3)
         with self._lock:
             for pc in self._pool.values():
                 pc.cancelled.set()
@@ -386,18 +476,18 @@ class CallHomePool:
                     pass
             self._pool.clear()
 
-    def _accept_loop(self) -> None:
-        assert self._listener is not None
+    def _accept_loop(self, listener: socket.socket) -> None:
+        local_port = listener.getsockname()[1]
         while not self._stop.is_set():
             try:
-                raw_sock, peer = self._listener.accept()
+                raw_sock, peer = listener.accept()
             except socket.timeout:
                 continue
             except OSError:
                 break
-            self._admit(raw_sock, peer)
+            self._admit(raw_sock, peer, local_port)
 
-    def _admit(self, raw_sock: socket.socket, peer: tuple) -> None:
+    def _admit(self, raw_sock: socket.socket, peer: tuple, local_port: int) -> None:
         with self._lock:
             self._next_conn_no += 1
             conn_no = self._next_conn_no
@@ -405,7 +495,9 @@ class CallHomePool:
             if len(self._pool) >= self._window_size:
                 oldest_no = next(iter(self._pool))
                 evicted = self._pool.pop(oldest_no)
-            pc = _PooledConnection(conn_no=conn_no, raw_sock=raw_sock, peer=peer, accepted_at=time.time())
+            pc = _PooledConnection(
+                conn_no=conn_no, raw_sock=raw_sock, peer=peer, accepted_at=time.time(), local_port=local_port,
+            )
             self._pool[conn_no] = pc
 
         if evicted is not None:
@@ -416,7 +508,7 @@ class CallHomePool:
                 pass
             logger.info("Вытеснено соединение #%d (окно из %d заполнено)", evicted.conn_no, self._window_size)
 
-        logger.info("Call-home: принято соединение #%d от %s", conn_no, peer)
+        logger.info("Call-home: принято соединение #%d от %s на порт %d", conn_no, peer, local_port)
         threading.Thread(target=self._identify, args=(pc,), daemon=True).start()
 
     def _identify(self, pc: _PooledConnection) -> None:
@@ -468,7 +560,10 @@ class CallHomePool:
                     "Вытеснено соединение #%d — у счётчика %s уже %d held-соединений (лимит на счётчик)",
                     evicted.conn_no, pc.serial, self._max_per_serial,
                 )
-            logger.info("Call-home: соединение #%d опознано как счётчик %s", pc.conn_no, pc.serial)
+            logger.info(
+                "Call-home: соединение #%d (порт %d) опознано как счётчик %s",
+                pc.conn_no, pc.local_port, pc.serial,
+            )
         except (socket.timeout, OSError):
             return
 
@@ -509,6 +604,29 @@ class CallHomePool:
             del self._pool[chosen.conn_no]
             return chosen
 
+    _SIBLING_POLL_INTERVAL_S = 1.0
+
+    def _wait_for_sibling_connection(
+        self, serial: str, deadline: float
+    ) -> "_PooledConnection | None":
+        """2026-09-11 (по просьбе пользователя) — опрашивает пул (раз в
+        ``_SIBLING_POLL_INTERVAL_S``) в ожидании СЛЕДУЮЩЕГО дозвона того
+        же счётчика, пока не истечёт ``deadline`` — используется
+        ``_maybe_trigger_immediate_read``, когда все уже испробованные
+        held-соединения кончились (провалом или "залипшей" ассоциацией),
+        а общий бюджет ожидания ещё позволяет попробовать ещё раз.
+        ``None``, если дождаться не удалось за отведённое время."""
+        while True:
+            with self._lock:
+                for p in self._pool.values():
+                    if p.serial == serial:
+                        del self._pool[p.conn_no]
+                        return p
+            remaining_budget = deadline - time.time()
+            if remaining_budget <= 0:
+                return None
+            time.sleep(min(self._SIBLING_POLL_INTERVAL_S, remaining_budget))
+
     def _maybe_trigger_immediate_read(self, pc: _PooledConnection) -> None:
         """Событийная попытка прочитать ВСЕ due job'ы счётчика сразу
         после опознания серийника на свежепринятом соединении
@@ -525,7 +643,7 @@ class CallHomePool:
         try:
             from . import backend_client
 
-            claimed = backend_client.claim_due_jobs(pc.serial)
+            claimed = backend_client.claim_due_jobs(pc.serial, peer_ip=pc.peer[0], local_port=pc.local_port)
             if claimed is None or not claimed.jobs:
                 return
 
@@ -567,19 +685,75 @@ class CallHomePool:
             deadline = time.time() + DEFAULT_IMMEDIATE_READ_MAX_WAIT_S
             outcomes: list = []
             remaining = list(candidates)
-            while remaining:
+            while True:
                 if time.time() >= deadline:
                     logger.info(
-                        "Immediate-read: общий бюджет ожидания (%.0fс) для счётчика %s исчерпан, "
-                        "%d соединений не пробовали",
-                        DEFAULT_IMMEDIATE_READ_MAX_WAIT_S, pc.serial, len(remaining),
+                        "Immediate-read: общий бюджет ожидания (%.0fс) для счётчика %s исчерпан%s",
+                        DEFAULT_IMMEDIATE_READ_MAX_WAIT_S, pc.serial,
+                        f", {len(remaining)} соединений не пробовали" if remaining else "",
                     )
                     break
+                if not remaining:
+                    # 2026-09-11 (по просьбе пользователя) — все уже
+                    # случайно оказавшиеся в пуле held-соединения этого
+                    # счётчика исчерпаны (либо провалом, либо "залипшей"
+                    # ассоциацией, см. ниже), а бюджет ожидания ещё не
+                    # истёк: ждём СЛЕДУЮЩИЙ дозвон этого же счётчика,
+                    # вместо немедленной сдачи — раньше цикл реагировал
+                    # только на то, что уже лежало в пуле на момент
+                    # опознания, следующего дозвона не ждал вовсе.
+                    next_pc = self._wait_for_sibling_connection(pc.serial, deadline)
+                    if next_pc is None:
+                        break
+                    logger.info(
+                        "Immediate-read: дождались следующего дозвона счётчика %s — соединение #%d",
+                        pc.serial, next_pc.conn_no,
+                    )
+                    remaining.append(next_pc)
+                    continue
                 candidate = remaining.pop(0)
                 try:
-                    outcomes = read_batch_via_fresh_connection(
-                        candidate, serial=pc.serial, password=password_bytes, obis_specs=obis_specs,
-                    )
+                    if pc.serial in VER2_EMULATION_TEST_SERIALS:
+                        from .protocols import dlms as dlms_module
+
+                        logger.info(
+                            "Immediate-read: соединение #%d — эксперимент 'эмуляция ver2.zip' "
+                            "для счётчика %s", candidate.conn_no, pc.serial,
+                        )
+                        outcomes = read_batch_via_fresh_connection(
+                            candidate, serial=pc.serial, password=password_bytes, obis_specs=obis_specs,
+                            aarq_user_information=dlms_module.USER_INFORMATION_INITIATE_VER2_VARIANT,
+                            aare_per_attempt_timeout_s=20.0,
+                            aare_max_attempts=3,
+                            send_disc_before_retry=False,
+                        )
+                    else:
+                        outcomes = read_batch_via_fresh_connection(
+                            candidate, serial=pc.serial, password=password_bytes, obis_specs=obis_specs,
+                        )
+                    if outcomes and not any(o.ok for o in outcomes):
+                        # 2026-09-11, см. DECISIONS.md ("покопайся в
+                        # истории логов сервера") — эксперимент показал:
+                        # ассоциация может успешно установиться (AARE
+                        # получен), но ВСЕ последующие чтения (проверено
+                        # на 8 разных OBIS = 16 GET в одной ассоциации)
+                        # стабильно возвращают один и тот же мусорный
+                        # ответ — "залипшая" ассоциация, не помогает ни
+                        # разнообразие OBIS, ни отдельные invoke_id. Раньше
+                        # такой результат принимался как окончательный
+                        # (единственный успешный обмен без исключения —
+                        # цикл сразу прерывался). Теперь пробуем СВЕЖУЮ
+                        # ассоциацию вместо того, чтобы сдаваться на
+                        # заведомо плохой — либо уже готовую запасную из
+                        # пула, либо (см. ветку "not remaining" выше)
+                        # дождавшись следующего дозвона.
+                        logger.info(
+                            "Immediate-read: соединение #%d — ассоциация установилась, но все %d "
+                            "чтений вернулись с ошибкой (похоже на «залипшую» ассоциацию) — "
+                            "пробуем следующую",
+                            candidate.conn_no, len(outcomes),
+                        )
+                        continue
                     break
                 except GatewayError as exc:
                     logger.info(
@@ -614,7 +788,8 @@ class CallHomePool:
             if outcomes:
                 results = [
                     backend_client.JobResultReport(
-                        job_id=job.job_id, obis=job.obis, ok=outcome.ok, value=outcome.value,
+                        job_id=job.job_id, obis=job.obis, ok=outcome.ok,
+                        value=_json_safe_value(outcome.value),
                         error_code=outcome.error.code if outcome.error else None,
                         error_message=outcome.error.message if outcome.error else None,
                         is_partial=False,
@@ -767,6 +942,24 @@ def read_via_call_home(
     raise GatewayError(f"Не удалось прочитать регистр со счётчика {serial} за {max_wait_s}с")
 
 
+def _json_safe_value(value: object) -> object:
+    """Приводит декодированное DLMS-значение к JSON-совместимому виду
+    перед отправкой в Backend (2026-09-10, см. DECISIONS.md — найденный
+    на живом трафике краш: счётчик вернул пустую octet-string, `datatypes.
+    decode_value` честно вернул ``bytes``, а ``json.dumps`` в
+    ``backend_client._post_json`` падал с ``TypeError: Object of type
+    bytes is not JSON serializable`` — это валило отправку РЕЗУЛЬТАТОВ
+    ЦЕЛОГО батча (включая уже успешно прочитанные соседние OBIS той же
+    ассоциации), не только этот один объект). ``bytes`` — в hex-строку
+    (тот же принцип, что и у ``captured_hex()``); списки/кортежи (Array/
+    Structure) — рекурсивно, поэлементно."""
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    return value
+
+
 def _log_captured_on_failure(filtering_sock: "DlT645FilteringSocket", conn_no: int, stage: str) -> None:
     """Диагностика (2026-09-10, см. DECISIONS.md — находка в референсной
     C#-программе: штатный DLMS-парсер для части моделей счётчиков может
@@ -800,6 +993,10 @@ def read_batch_via_fresh_connection(
     per_attempt_timeout_ms: int = DEFAULT_PER_ATTEMPT_TIMEOUT_MS,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS_PER_CONNECTION,
     association_timeout_ms: int = DEFAULT_ASSOCIATION_TIMEOUT_MS,
+    aarq_user_information: bytes | None = None,
+    aare_per_attempt_timeout_s: float | None = None,
+    aare_max_attempts: int | None = None,
+    send_disc_before_retry: bool = True,
 ) -> list:
     """Событийный путь (2026-09-09, см. DECISIONS.md и план
     ticklish-popping-bear.md; вызывается из ``CallHomePool.
@@ -814,7 +1011,13 @@ def read_batch_via_fresh_connection(
     внешнего цикла по held-соединениям, которого здесь нет смысла
     заводить — соединение только что принято, других кандидатов на
     этот же серийник специально не остаётся (см. вызывающий код,
-    закрывает соседние held-соединения того же счётчика)."""
+    закрывает соседние held-соединения того же счётчика).
+
+    ``aarq_user_information``/``aare_per_attempt_timeout_s``/
+    ``aare_max_attempts``/``send_disc_before_retry`` — переопределения
+    для эксперимента "эмуляция ver2.zip" (2026-09-10, см. DECISIONS.md
+    и ``VER2_EMULATION_TEST_SERIALS`` ниже); ``None``/дефолт — обычное
+    боевое поведение, не меняется."""
     from .protocols import hdlc_dlms
     from .transport import TcpServerTransport
 
@@ -853,9 +1056,17 @@ def read_batch_via_fresh_connection(
 
     filtering_sock.set_deadline(time.time() + association_timeout_ms / 1000)
     filtering_sock.clear_captured()  # SNRM/UA уже прошли — интересны только байты ПОСЛЕ этого
+    kwargs = {}
+    if aarq_user_information is not None:
+        kwargs["aarq_user_information"] = aarq_user_information
+    if aare_per_attempt_timeout_s is not None:
+        kwargs["aare_per_attempt_timeout_s"] = aare_per_attempt_timeout_s
+    if aare_max_attempts is not None:
+        kwargs["aare_max_attempts"] = aare_max_attempts
+    kwargs["send_disc_before_retry"] = send_disc_before_retry
     try:
         return hdlc_dlms.read_registers_via_established_link(
-            transport, serial=serial, password=password, obis_specs=obis_specs
+            transport, serial=serial, password=password, obis_specs=obis_specs, **kwargs
         )
     except Exception:
         _log_captured_on_failure(filtering_sock, pc.conn_no, "AARQ/AARE/GET")
@@ -932,7 +1143,22 @@ def read_load_profile_via_call_home(
             time.sleep(retry_interval_s)
 
         if linked:
-            filtering_sock.settimeout(association_timeout_ms / 1000)
+            # 2026-09-11 (найдено при разборе, почему старый путь не получает
+            # AARE в отличие от read_via_call_home/read_batch_via_fresh_
+            # connection) — раньше здесь вызывался settimeout(), а не
+            # set_deadline(). DlT645FilteringSocket.settimeout() — no-op,
+            # если единый дедлайн уже включён (см. её docstring), а если ещё
+            # НЕ включён (как здесь), просто ставит таймаут на сырой сокет,
+            # который ничего не знает про накопленное время ожидания — тот
+            # же самый баг №3, что был найден и исправлён 2026-09-08 именно
+            # в read_via_call_home (см. её докстринг и DECISIONS.md,
+            # «эксперимент с ожиданием AARE 150с»), но так и не перенесён
+            # сюда, в её сестринскую функцию для профиля нагрузки. Кроме
+            # того, после успешного AARQ/AARE _send_aarq_and_await_aare
+            # восстанавливает "исходный" дедлайн — а он был None (settimeout
+            # его не трогает), так что все ПОСЛЕДУЮЩИЕ GET (capture_period,
+            # диапазон, датаблоки) остались бы вовсе без общего дедлайна.
+            filtering_sock.set_deadline(time.time() + association_timeout_ms / 1000)
             try:
                 yield from hdlc_dlms.read_load_profile_via_established_link(
                     transport, serial=serial, password=password, obis=obis,

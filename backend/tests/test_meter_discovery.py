@@ -61,7 +61,10 @@ async def test_new_serial_auto_activated_and_added_to_catchall_schedule(db_sessi
     assert meter.status == MeterStatus.ACTIVE
     assert meter.protocol_profile == ProtocolProfile.HDLC_DLMS
     assert decrypt_secret(meter.password_encrypted) == b"12345678"
-    assert meter.rated_current_amps == 100.0
+    # 2026-09-11 — токовый класс новой партии смешанный (100А, но
+    # встречаются и 5/7.5А), больше не угадывается при автообнаружении,
+    # устанавливается только реальным чтением read_rated_current.
+    assert meter.rated_current_amps is None
 
     await db_session.refresh(catchall)
     await db_session.refresh(smoke)

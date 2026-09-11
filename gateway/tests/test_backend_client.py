@@ -84,6 +84,46 @@ def test_claim_due_jobs_happy_path_round_trip():
     assert _StubHandler.last_headers["X-Internal-Secret"] == "test-secret"
 
 
+def test_claim_due_jobs_sends_peer_ip_in_request_body():
+    """2026-09-11: peer_ip должен попасть в тело запроса — Backend
+    пишет его в Meter.ip_address при каждом опознании call-home-
+    счётчика (никакого другого способа узнать IP звонящего счётчика
+    нет — см. DECISIONS.md)."""
+    _StubHandler.response_body = {
+        "meter_found": True, "meter_id": 42, "protocol_profile": "hdlc_dlms",
+        "password": "12345678", "jobs": [{"job_id": 1, "job_type": "read_current", "obis": "1.1.1.8.0.ff", "class_id": 0}],
+    }
+    backend_client.claim_due_jobs("202306004113", peer_ip="10.86.14.39")
+    assert _StubHandler.last_request["peer_ip"] == "10.86.14.39"
+
+
+def test_claim_due_jobs_omits_peer_ip_when_not_given():
+    _StubHandler.response_body = {
+        "meter_found": False, "meter_id": None, "protocol_profile": None, "password": None, "jobs": [],
+    }
+    backend_client.claim_due_jobs("202306004113")
+    assert "peer_ip" not in _StubHandler.last_request
+
+
+def test_claim_due_jobs_sends_local_port_in_request_body():
+    """2026-09-11 (по просьбе пользователя) — local_port нужен Backend'у,
+    чтобы определить РЭС/объект (см. services/res_mapping.py на Backend'е,
+    counterpart этого фикса)."""
+    _StubHandler.response_body = {
+        "meter_found": False, "meter_id": None, "protocol_profile": None, "password": None, "jobs": [],
+    }
+    backend_client.claim_due_jobs("202306004113", local_port=2010)
+    assert _StubHandler.last_request["local_port"] == 2010
+
+
+def test_claim_due_jobs_omits_local_port_when_not_given():
+    _StubHandler.response_body = {
+        "meter_found": False, "meter_id": None, "protocol_profile": None, "password": None, "jobs": [],
+    }
+    backend_client.claim_due_jobs("202306004113")
+    assert "local_port" not in _StubHandler.last_request
+
+
 def test_claim_due_jobs_returns_none_when_meter_not_found():
     _StubHandler.response_body = {
         "meter_found": False, "meter_id": None, "protocol_profile": None, "password": None, "jobs": [],

@@ -129,6 +129,7 @@ def _read_one_register_via_established_link(
     send_seq: int,
     obis: str,
     class_id: int,
+    invoke_id: int = 1,
 ) -> tuple[object | None, int, GatewayError | None]:
     """Тело GET одного регистра (scaler_unit + value, см. докстринг
     ``read_register_via_established_link`` про порядок и вендорскую
@@ -137,6 +138,23 @@ def _read_one_register_via_established_link(
     чтобы читать НЕСКОЛЬКО регистров за одну ассоциацию (см.
     ``read_registers_via_established_link``), продолжая нумерацию
     HDLC-кадров через все них, а не начиная её заново на каждый GET.
+
+    ``invoke_id`` (2026-09-11, см. DECISIONS.md — "поймать байты одного
+    отказа"): раньше ОБА GET внутри одного вызова (scaler_unit и value)
+    жёстко использовали invoke_id=1 (значение по умолчанию
+    ``dlms.build_get_request``), то есть КАЖДЫЙ GET за всю ассоциацию
+    (включая все OBIS батча в ``read_registers_via_established_link``)
+    отправлялся с одинаковым invoke_id. Найдено на живом трафике: второй
+    (и далее) GET в ассоциации у части счётчиков (преимущественно новой
+    партии) стабильно возвращает усечённый/невалидный ответ независимо
+    от того, какой именно OBIS запрашивается (проверено на разных OBIS —
+    показание энергии через VALUE_OBIS_OVERRIDES и токовый класс без
+    него, оба ломаются одинаково) — рабочая гипотеза в том, что часть
+    прошивок трактует повторный invoke_id как повтор УЖЕ обработанного
+    запроса. Старый парк (381 исходный счётчик) читается нормально при
+    том же поведении — значит, не все прошивки к этому чувствительны, но
+    исправление безопасно для всех (invoke-id — advisory поле, ничего
+    здесь не проверяет входящий invoke_id при разборе ответа).
 
     Возвращает ``(значение, следующий свободный send_seq, ошибка)`` —
     ошибка на GET самого значения (напр. data-access-error: счётчик
@@ -157,6 +175,7 @@ def _read_one_register_via_established_link(
     if class_id == dlms.REGISTER_CLASS_ID:
         scaler_request = dlms.build_get_request(
             parsed_obis, class_id=class_id, attribute_id=dlms.REGISTER_SCALER_UNIT_ATTRIBUTE,
+            invoke_id=invoke_id,
         )
         _send_i_frame(
             transport, server_addr, client_addr, send_seq=send_seq, recv_seq=send_seq,
@@ -172,9 +191,18 @@ def _read_one_register_via_established_link(
                 obis, exc.code, value_obis,
             )
             scaler_unit = None
+        except DlmsDataError as exc:
+            # см. комментарий у аналогичного except ниже (2026-09-10, DECISIONS.md)
+            logger.warning(
+                "Register %s: GET scaler_unit вернул некорректные данные (%s) — значение "
+                "(OBIS %s) будет возвращено без применения масштаба",
+                obis, exc, value_obis,
+            )
+            scaler_unit = None
 
     value_send_seq = send_seq + 1 if class_id == dlms.REGISTER_CLASS_ID else send_seq
-    request = dlms.build_get_request(parsed_value_obis, class_id=class_id)
+    value_invoke_id = invoke_id + 1 if class_id == dlms.REGISTER_CLASS_ID else invoke_id
+    request = dlms.build_get_request(parsed_value_obis, class_id=class_id, invoke_id=value_invoke_id)
     _send_i_frame(
         transport, server_addr, client_addr, send_seq=value_send_seq, recv_seq=value_send_seq,
         information=dlms.wrap_llc_command(request),
@@ -185,18 +213,57 @@ def _read_one_register_via_established_link(
         raw_value = dlms.parse_get_response(dlms.unwrap_llc(response_frame.information))
     except GatewayError as exc:
         return None, next_send_seq, exc
+    except DlmsDataError as exc:
+        # 2026-09-10, см. DECISIONS.md: DlmsDataError — обычный ValueError,
+        # НЕ подкласс GatewayError, поэтому раньше не ловился здесь и
+        # улетал необработанным исключением из read_registers_via_
+        # established_link — валил ВЕСЬ батч immediate-read (соседние уже
+        # прочитанные OBIS этой же ассоциации терялись, job'ы не
+        # репортились Backend'у и зависали до реанимации по таймауту)
+        # вместо того, чтобы посчитаться отказом одного конкретно этого
+        # OBIS, как и полагается data-access-error. Найдено на живом
+        # трафике: счётчик ответил валидным GET.response, но с пустым
+        # содержимым значения — редкий, но легитимный edge case.
+        return None, next_send_seq, GatewayError(f"Некорректные данные в GET.response: {exc}")
+
+    if class_id == dlms.REGISTER_CLASS_ID and raw_value is None:
+        # 2026-09-11, найдено на новой партии счётчиков: GET.response-
+        # Normal может прийти валидным (CRC/HCS сошлись), с выбором
+        # "data" (не data-access-error), но со значением null-data
+        # (0x00) — decode_value() теперь это разбирает как None вместо
+        # падения "неподдержанный тег", но для показания энергии None
+        # так же бессмысленен, как немасштабированное сырое число (см.
+        # комментарий про scaler_unit чуть ниже) — тот же принцип "лучше
+        # вообще без данных", отказ чтения вместо записи пустого
+        # показания.
+        return None, next_send_seq, GatewayError(
+            f"Счётчик вернул null-data (0x00) вместо значения для {obis}"
+        )
 
     if class_id != dlms.REGISTER_CLASS_ID or not isinstance(raw_value, (int, float)):
         return raw_value, next_send_seq, None
 
     if not (isinstance(scaler_unit, list) and len(scaler_unit) == 2 and isinstance(scaler_unit[0], int)):
-        if scaler_unit is not None:
-            logger.warning(
-                "Register %s (value read at %s): scaler_unit имеет неожиданный вид %r — "
-                "возвращается сырое значение %r без применения масштаба",
-                obis, value_obis, scaler_unit, raw_value,
-            )
-        return raw_value, next_send_seq, None
+        # 2026-09-11, см. DECISIONS.md: раньше в этом случае возвращалось
+        # СЫРОЕ немасштабированное значение как будто оно валидное — и
+        # оно попадало в MeterReading как обычное успешное показание.
+        # Найдено на живых данных: 201901230052 получил "-1003" (без
+        # дробной части — очевидный признак непроскейленного сырого
+        # значения) при исправном предыдущем показании 3271.18 —
+        # суммарная энергия не может уменьшаться, тем более уходить в
+        # минус. Немасштабированное "сырое" число, тихо выданное за
+        # валидное показание, вводит в заблуждение сильнее, чем честный
+        # отказ чтения (который просто повторится на следующем цикле) —
+        # поэтому теперь это GatewayError, а не успех.
+        logger.warning(
+            "Register %s (value read at %s): scaler_unit имеет неожиданный вид %r — "
+            "отказ чтения вместо возврата непроскейленного сырого значения %r",
+            obis, value_obis, scaler_unit, raw_value,
+        )
+        return None, next_send_seq, GatewayError(
+            f"Не удалось прочитать масштаб (scaler_unit) для {obis} — значение {raw_value!r} "
+            "не может быть достоверно интерпретировано"
+        )
     scaler, unit = scaler_unit[0], scaler_unit[1]
     # unit=30 (Wh, Green Book) — единственная подтверждённая реальным
     # трафиком Risesun DTZY217 единица для этого регистра (см.
@@ -233,6 +300,10 @@ def read_registers_via_established_link(
     serial: str,
     password: bytes,
     obis_specs: list[tuple[str, int]],
+    aarq_user_information: bytes | None = None,
+    aare_per_attempt_timeout_s: float | None = None,
+    aare_max_attempts: int | None = None,
+    send_disc_before_retry: bool = True,
 ) -> list[RegisterReadOutcome]:
     """AARQ/AARE ОДИН РАЗ, затем последовательно GET на каждый (obis,
     class_id) из ``obis_specs`` — событийное чтение call-home сразу при
@@ -255,25 +326,59 @@ def read_registers_via_established_link(
     вовсе) вместе с обычными ``ConnectionError``/``OSError`` прерывают
     цикл — соединение более не пригодно для следующего GET. Уже
     собранные до этого момента результаты возвращаются вызывающему
-    (частичный успех), а не теряются в брошенном исключении."""
+    (частичный успех), а не теряются в брошенном исключении.
+
+    ``aarq_user_information``/``aare_per_attempt_timeout_s``/
+    ``aare_max_attempts``/``send_disc_before_retry`` — переопределения
+    для эксперимента "эмуляция ver2.zip" (2026-09-10, см. DECISIONS.md
+    и ``callhome.read_batch_via_fresh_connection_ver2_emulation``);
+    дефолты воспроизводят обычное боевое поведение без изменений."""
     server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
     client_addr = DEFAULT_CLIENT_ADDRESS
 
-    aarq = dlms.build_aarq(password)
+    aarq = dlms.build_aarq(password, user_information=aarq_user_information)
     aare_frame = _send_aarq_and_await_aare(
         transport, server_addr, client_addr, dlms.wrap_llc_command(aarq),
+        per_attempt_timeout_s=(
+            aare_per_attempt_timeout_s
+            if aare_per_attempt_timeout_s is not None
+            else DEFAULT_AARQ_PER_ATTEMPT_TIMEOUT_S
+        ),
+        max_attempts=aare_max_attempts if aare_max_attempts is not None else DEFAULT_AARQ_MAX_ATTEMPTS,
+        send_disc_before_retry=send_disc_before_retry,
     )
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))  # AuthFailedError и т.п. — весь батч падает, это верно
 
     results: list[RegisterReadOutcome] = []
     send_seq = 1
-    for obis, class_id in obis_specs:
+    invoke_id = 1
+    for obis, raw_class_id in obis_specs:
+        # 2026-09-11, найдено на живом трафике (92% свежих показаний —
+        # null): class_id=0 из payload/DueJobOut ("по умолчанию Register")
+        # НИГДЕ не превращался в dlms.REGISTER_CLASS_ID=3 на этом,
+        # событийном пути — в отличие от старого gRPC-пути
+        # (grpc_server.py: ``class_id=request.class_id or dlms.
+        # REGISTER_CLASS_ID``). В результате _read_one_register_via_
+        # established_link все обычные read_current (класс не указан явно
+        # -> 0) считал "не Register" — ни разу не читал scaler_unit и
+        # возвращал СЫРОЕ значение как есть (а после сегодняшнего фикса
+        # null-data — прямо None) как будто это валидный успех.
+        class_id = raw_class_id or dlms.REGISTER_CLASS_ID
         try:
             value, send_seq, error = _read_one_register_via_established_link(
                 transport, server_addr, client_addr, send_seq=send_seq, obis=obis, class_id=class_id,
+                invoke_id=invoke_id,
             )
         except (ConnectionLostError, MeterTimeoutError, ConnectionError, OSError):
             break
+        # Каждый GET получает свой invoke_id (см. докстринг
+        # _read_one_register_via_established_link) — Register тратит 2
+        # (scaler_unit + value), прочие классы — 1. Цикл 1..14, чтобы
+        # invoke_id+1 внутри одного вызова не вышел за 4-битный диапазон
+        # invoke-id (0-15).
+        invoke_id += 2 if class_id == dlms.REGISTER_CLASS_ID else 1
+        if invoke_id > 14:
+            invoke_id = 1
         if error is not None:
             results.append(RegisterReadOutcome(obis=obis, ok=False, error=error))
         else:
@@ -459,6 +564,7 @@ def _send_aarq_and_await_aare(
     *,
     per_attempt_timeout_s: float = DEFAULT_AARQ_PER_ATTEMPT_TIMEOUT_S,
     max_attempts: int = DEFAULT_AARQ_MAX_ATTEMPTS,
+    send_disc_before_retry: bool = True,
 ) -> HdlcFrame:
     """Отправляет AARQ (I(0,0)) и ждёт AARE, повторно отправляя AARQ
     короткими окнами вместо одного долгого пассивного ожидания (см.
@@ -478,7 +584,7 @@ def _send_aarq_and_await_aare(
     last_error: MeterTimeoutError | None = None
     try:
         for attempt in range(1, max_attempts + 1):
-            if attempt > 1:
+            if attempt > 1 and send_disc_before_retry:
                 # Рекомендация производителя (2026-09-10, см. DECISIONS.md):
                 # "Сначала отправьте кадр разрыва соединения, затем
                 # отправьте AARQ" — перед ПОВТОРНОЙ отправкой AARQ (не
@@ -487,6 +593,13 @@ def _send_aarq_and_await_aare(
                 # (control=0x53). Ответ не ждём и не разбираем — если
                 # придёт, это S/U-кадр, безопасно проглотится как
                 # супервизорный в _recv_i_frame ниже.
+                #
+                # ``send_disc_before_retry=False`` — эмуляция ver2.zip
+                # (см. DECISIONS.md 2026-09-10): декомпилированный
+                # ``MeterDLMS.cs::Handclasp`` шлёт DISC перед повтором
+                # AARQ НЕ безусловно, а только в конкретных случаях
+                # рассинхронизации кадра — по умолчанию просто повторяет
+                # AARQ без разрыва.
                 disc_frame = HdlcFrame(
                     destination=server_addr, source=client_addr, control=CONTROL_DISC,
                 )
@@ -590,6 +703,7 @@ def read_load_profile_via_established_link(
     period_request = dlms.build_get_request(
         parsed_obis, class_id=class_id,
         attribute_id=dlms.PROFILE_GENERIC_CAPTURE_PERIOD_ATTRIBUTE,
+        invoke_id=1,
     )
     _send_i_frame(
         transport, server_addr, client_addr, send_seq=1, recv_seq=1,
@@ -602,8 +716,12 @@ def read_load_profile_via_established_link(
             f"Некорректный capture_period профиля нагрузки: {capture_period_seconds!r}"
         )
 
+    # invoke_id=2 (2026-09-11, тот же принцип, что и в
+    # _read_one_register_via_established_link) — не переиспользуем
+    # invoke_id=1 от предыдущего GET (capture_period) на этой же
+    # ассоциации.
     request = dlms.build_get_request_range(
-        parsed_obis, class_id=class_id, from_dt=from_dt, to_dt=to_dt,
+        parsed_obis, class_id=class_id, from_dt=from_dt, to_dt=to_dt, invoke_id=2,
     )
     _send_i_frame(
         transport, server_addr, client_addr, send_seq=2, recv_seq=2,
@@ -662,7 +780,12 @@ def read_load_profile_via_established_link(
                 )
             return
 
-        request_next = dlms.build_get_request_next(block.block_number + 1)
+        # GET.request-Next продолжает УЖЕ начатую блочную передачу ответа
+        # на GET-диапазон (invoke_id=2 выше) — по смыслу это тот же самый
+        # запрос, не новый, поэтому намеренно переиспользует его invoke_id
+        # (в отличие от НЕЗАВИСИМЫХ GET из _read_one_register_via_
+        # established_link, где как раз наоборот нужны разные invoke_id).
+        request_next = dlms.build_get_request_next(block.block_number + 1, invoke_id=2)
         _send_i_frame(
             transport, server_addr, client_addr, send_seq=send_seq, recv_seq=send_seq,
             information=dlms.wrap_llc_command(request_next),

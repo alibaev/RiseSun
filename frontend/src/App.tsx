@@ -5,6 +5,7 @@ import { Layout } from "./components/Layout";
 import { LoginPage } from "./pages/LoginPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { MetersListPage } from "./pages/MetersListPage";
+import { ResPage } from "./pages/ResPage";
 import { MeterDetailPage } from "./pages/MeterDetailPage";
 import { ObisCatalogPage } from "./pages/ObisCatalogPage";
 import { ParameterSchemesPage } from "./pages/ParameterSchemesPage";
@@ -25,6 +26,7 @@ export function App() {
           <Route element={<Layout />}>
             <Route path="/" element={<DashboardPage />} />
             <Route path="/meters" element={<MetersListPage />} />
+            <Route path="/res" element={<ResPage />} />
             <Route path="/meters/:id" element={<MeterDetailPage />} />
             <Route path="/schemes" element={<ParameterSchemesPage />} />
             <Route path="/obis-catalog" element={<ObisCatalogPage />} />

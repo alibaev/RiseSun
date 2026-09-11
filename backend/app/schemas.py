@@ -128,6 +128,12 @@ class MeterUpdate(BaseModel):
     location: str | None = None
     model: str | None = None
     is_active: bool | None = None
+    is_low_consumption: bool | None = None
+    # 2026-09-11 — обычно проставляется автоматически по call-home порту
+    # (см. res_mapping.py), но ручная правка нужна как минимум для
+    # счётчиков в "Общий" (порт 2009, ещё не разведённых по конкретному
+    # порту вручную).
+    res_name: str | None = None
 
 
 class MeterOut(BaseModel):
@@ -151,12 +157,46 @@ class MeterOut(BaseModel):
     last_seen_at: datetime | None
     last_read_at: datetime | None
     rated_current_amps: float | None
+    is_low_consumption: bool
+    res_name: str | None
     created_at: datetime
     # Значение последнего показания (meter_readings.value_json на момент
     # last_read_at) — подмешивается отдельным запросом в list_meters, не
     # ORM-связь (см. app/api/meters.py); нужно списку счётчиков, чтобы не
     # заставлять фронтенд делать по отдельному запросу на каждый счётчик.
     last_reading_value: object | None = None
+
+
+class ApplyLowConsumptionRangeRequest(BaseModel):
+    # 2026-09-11 — ручное массовое добавление в «Малое потребление» по
+    # диапазону последнего показания энергии (кВт·ч), см.
+    # services/low_consumption.py.
+    min_kwh: float = Field(ge=0)
+    max_kwh: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _min_not_greater_than_max(self) -> "ApplyLowConsumptionRangeRequest":
+        if self.min_kwh > self.max_kwh:
+            raise ValueError("min_kwh не может быть больше max_kwh")
+        return self
+
+
+class ApplyLowConsumptionRangeResponse(BaseModel):
+    matched_meters: list[MeterOut]
+
+
+class ResStatsOut(BaseModel):
+    # 2026-09-11 — статистика по РЭС/объектам (меню "Архив" -> "РЭСы и
+    # Объекты"), см. services/res_mapping.py.
+    res_name: str
+    meters_total: int
+    meters_active: int
+    meters_online: int
+    # Доля АКТИВНЫХ счётчиков этого РЭС, у которых есть показание
+    # (last_read_at) за период — "процент чтения" (Acquisition Rate),
+    # см. list_meters/res_stats. 0, если активных счётчиков в РЭС нет.
+    pct_read_today: float
+    pct_read_3d: float
 
 
 class ActivateMeterRequest(BaseModel):
@@ -340,6 +380,25 @@ class DueJobOut(BaseModel):
 class ClaimDueJobsRequest(BaseModel):
     job_types: list[str] = ["read_current", "read_rated_current"]
     max_jobs: int | None = Field(default=None, description="По умолчанию — settings.gateway_internal_claim_batch_max")
+    peer_ip: str | None = Field(
+        default=None,
+        description=(
+            "IP-адрес TCP-соединения, на котором опознан звонящий счётчик (2026-09-11) — "
+            "call-home-счётчики сами инициируют соединение, поэтому их ip_address "
+            "иначе никогда и нигде не сохраняется. Пишется в Meter.ip_address при "
+            "каждом опознании (не только когда есть due job'ы), даже если IP "
+            "динамический и меняется между сеансами."
+        ),
+    )
+    local_port: int | None = Field(
+        default=None,
+        description=(
+            "Локальный порт Gateway'я, на который пришло это соединение (2026-09-11) — "
+            "пользователь развёл дозвон разных РЭС/объектов по разным портам "
+            "(см. services/res_mapping.py). Пишется в Meter.res_name при каждом "
+            "опознании через PORT_TO_RES_NAME; неизвестный порт — res_name не трогается."
+        ),
+    )
 
 
 class ClaimDueJobsResponse(BaseModel):

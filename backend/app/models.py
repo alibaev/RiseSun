@@ -194,6 +194,18 @@ class Meter(Base):
     gateway_id: Mapped[int] = mapped_column(ForeignKey("gateways.id"), nullable=False)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Отдельная от status категория (2026-09-11, по просьбе пользователя)
+    # — счётчик активен и штатно опрашивается, но показывает
+    # пренебрежимо малое/нулевое потребление продолжительное время
+    # (напр. счётчик 202001002236: 0.03 кВт·ч, без расхода за прошлый
+    # месяц) — повод для отдельного внимания (обрыв линии у абонента?
+    # незаселённый объект? неисправность самого счётчика?), но НЕ
+    # признак неисправности сбора данных, поэтому отдельно от
+    # MeterStatus.INVALID. Проставляется вручную через UI/API либо
+    # разовой сверкой (см. DECISIONS.md) — автоматического постоянного
+    # детектора пока нет (историю показаний хватает не у всех счётчиков
+    # для надёжного суждения "нет расхода за месяц").
+    is_low_consumption: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Токовый класс счётчика (Maximum Current, атрибут "Imax", OBIS
     # `1.1.0.6.3.ff` — гипотеза, не подтверждена реальным трафиком на
     # момент добавления поля, см. DECISIONS.md 2026-09-07) — статичный
@@ -201,6 +213,15 @@ class Meter(Base):
     # "read_rated_current", services/scheduler.py) и больше не
     # запрашивается повторно, раз уже известен.
     rated_current_amps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # РЭС/объект (2026-09-11, по просьбе пользователя) — определяется по
+    # тому, на какой call-home порт Gateway'я приходит соединение
+    # счётчика (пользователь физически развёл дозвон разных РЭС по
+    # портам, см. services/res_mapping.py, docker-compose.yml), пишется
+    # автоматически при каждом опознании (тем же неблокирующим фоновым
+    # путём, что и ip_address) — не "один раз узнали и забыли", а всегда
+    # свежее значение, т.к. переразводка портов пользователем меняет
+    # фактическую принадлежность.
+    res_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     gateway: Mapped[Gateway] = relationship(back_populates="meters", lazy="selectin")

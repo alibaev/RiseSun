@@ -44,6 +44,20 @@ export interface Meter {
   created_at: string;
   last_reading_value: unknown | null;
   rated_current_amps: number | null;
+  is_low_consumption: boolean;
+  res_name: string | null;
+}
+
+// Меню "Архив" -> "РЭСы и Объекты" (2026-09-11) — определяется по
+// call-home порту (счётчики физически разведены по РЭС/объектам через
+// разные порты Gateway'я).
+export interface ResStats {
+  res_name: string;
+  meters_total: number;
+  meters_active: number;
+  meters_online: number;
+  pct_read_today: number;
+  pct_read_3d: number;
 }
 
 export interface MeterReading {
