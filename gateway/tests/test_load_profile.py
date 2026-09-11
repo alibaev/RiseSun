@@ -15,13 +15,16 @@ F=255 -> "ff": итоговая строка "1.1.63.1.0.ff". Буфер НЕ з
 вычисляет её из отдельно прочитанного capture_period (см.
 hdlc_dlms.read_load_profile)."""
 
+import socket
+
 from datetime import datetime, timedelta
 
 import pytest
 
 from mmws_gateway.emulators.common import ConnectionCounter, ErrorInjection, ThreadedEmulatorServer
-from mmws_gateway.emulators.hdlc_dlms_emulator import make_hdlc_dlms_handler
+from mmws_gateway.emulators.hdlc_dlms_emulator import _read_frame, make_hdlc_dlms_handler
 from mmws_gateway.protocols import datatypes, dlms, hdlc_dlms
+from mmws_gateway.protocols.hdlc import CONTROL_UA, HdlcFrame, control_information_frame
 from mmws_gateway.transport import TcpTransport, TransportConfig
 
 SERIAL = "202006003607"
@@ -111,3 +114,114 @@ def test_empty_load_profile_returns_no_rows():
     with _start_server([], block_size=4096) as server:
         decoded = _read_all(server)
     assert decoded == []
+
+
+def test_read_profile_capture_objects_decodes_column_list():
+    """2026-09-12 — диагностика причины data-access-error=250 на GET с
+    диапазоном (см. DECISIONS.md, "покопай почему"): атрибут 3
+    (capture_objects) — обычный GET без access-selection, отдельная
+    ассоциация от чтения самого буфера. Проверяет только разбор ответа
+    (декодирование ARRAY-of-STRUCTURE) — семантику самих полей (class_id/
+    OBIS/attribute_index/data_index) подтвердит только живой счётчик."""
+    capture_objects = datatypes.encode_array([
+        datatypes.encode_structure([
+            datatypes.encode_long_unsigned(8),  # class_id — Clock
+            datatypes.encode_octet_string(bytes([0, 0, 1, 0, 0, 0xFF])),  # OBIS 0.0.1.0.0.255
+            datatypes.encode_integer(2),  # attribute_index
+            datatypes.encode_long_unsigned(0),  # data_index
+        ]),
+        datatypes.encode_structure([
+            datatypes.encode_long_unsigned(3),  # class_id — Register
+            datatypes.encode_octet_string(bytes([1, 1, 1, 8, 0, 0xFF])),  # OBIS 1.1.1.8.0.255
+            datatypes.encode_integer(2),
+            datatypes.encode_long_unsigned(0),
+        ]),
+    ])
+    counter = ConnectionCounter()
+    data_values = {dlms.parse_obis(LOAD_PROFILE_OBIS): capture_objects}
+    handler = make_hdlc_dlms_handler(
+        password=PASSWORD, obis_values={}, error_injection=ErrorInjection(),
+        counter=counter, data_values=data_values,
+    )
+    with ThreadedEmulatorServer(handler) as server:
+        config = TransportConfig(host=server.host, port=server.port, timeout_ms=1000, max_retries=1)
+        with TcpTransport(config) as transport:
+            hdlc_dlms.establish_link(transport, serial=SERIAL)
+            decoded = hdlc_dlms.read_profile_capture_objects_via_established_link(
+                transport, serial=SERIAL, password=PASSWORD,
+                obis=LOAD_PROFILE_OBIS, class_id=LOAD_PROFILE_CLASS_ID,
+            )
+
+    assert decoded == [
+        [8, bytes([0, 0, 1, 0, 0, 0xFF]), 2, 0],
+        [3, bytes([1, 1, 1, 8, 0, 0xFF]), 2, 0],
+    ]
+
+
+def test_read_profile_capture_objects_follows_datablock_transfer():
+    """2026-09-12 — живая проверка на реальном счётчике показала, что
+    ответ на GET атрибута 3 (capture_objects) приходит НЕ одним PDU
+    (GET.response-normal), а через GET.response-with-datablock + GET.
+    request-Next (регрессия, найденная сразу после первого деплоя этой
+    функции — см. DECISIONS.md). Универсальный эмулятор (``data_values``)
+    этого не форсирует (в отличие от ``_serve_load_profile`` для самого
+    буфера), поэтому здесь — минимальный ручной сервер, режущий
+    закодированный ответ на два датаблока (тот же приём, что и
+    ``_run_fake_meter_load_profile`` в test_callhome.py)."""
+    capture_objects = datatypes.encode_array([
+        datatypes.encode_structure([
+            datatypes.encode_long_unsigned(3),
+            datatypes.encode_octet_string(bytes([1, 1, 1, 8, 0, 0xFF])),
+            datatypes.encode_integer(2),
+            datatypes.encode_long_unsigned(0),
+        ]),
+    ])
+    mid = len(capture_objects) // 2
+
+    def handler(conn: socket.socket) -> None:
+        snrm_frame = HdlcFrame.decode(_read_frame(conn))
+        ua = HdlcFrame(destination=snrm_frame.source, source=snrm_frame.destination, control=CONTROL_UA)
+        conn.sendall(ua.encode())
+
+        aarq_frame = HdlcFrame.decode(_read_frame(conn))
+        aare = dlms.build_aare(accepted=True)
+        aare_frame = HdlcFrame(
+            destination=aarq_frame.source, source=aarq_frame.destination,
+            control=control_information_frame(0, 1), information=dlms.wrap_llc_response(aare),
+        )
+        conn.sendall(aare_frame.encode())
+
+        get_frame = HdlcFrame.decode(_read_frame(conn))
+        get_payload = dlms.unwrap_llc(get_frame.information)
+        invoke_id = get_payload[2]
+
+        block1 = dlms.build_get_response_datablock(
+            invoke_id, last_block=False, block_number=1, raw_data=capture_objects[:mid],
+        )
+        frame1 = HdlcFrame(
+            destination=get_frame.source, source=get_frame.destination,
+            control=control_information_frame(1, 2), information=dlms.wrap_llc_response(block1),
+        )
+        conn.sendall(frame1.encode())
+
+        next_frame = HdlcFrame.decode(_read_frame(conn))
+
+        block2 = dlms.build_get_response_datablock(
+            invoke_id, last_block=True, block_number=2, raw_data=capture_objects[mid:],
+        )
+        frame2 = HdlcFrame(
+            destination=next_frame.source, source=next_frame.destination,
+            control=control_information_frame(2, 3), information=dlms.wrap_llc_response(block2),
+        )
+        conn.sendall(frame2.encode())
+
+    with ThreadedEmulatorServer(handler) as server:
+        config = TransportConfig(host=server.host, port=server.port, timeout_ms=1000, max_retries=1)
+        with TcpTransport(config) as transport:
+            hdlc_dlms.establish_link(transport, serial=SERIAL)
+            decoded = hdlc_dlms.read_profile_capture_objects_via_established_link(
+                transport, serial=SERIAL, password=PASSWORD,
+                obis=LOAD_PROFILE_OBIS, class_id=LOAD_PROFILE_CLASS_ID,
+            )
+
+    assert decoded == [[3, bytes([1, 1, 1, 8, 0, 0xFF]), 2, 0]]

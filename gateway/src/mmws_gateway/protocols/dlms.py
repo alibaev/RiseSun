@@ -156,6 +156,16 @@ PROFILE_GENERIC_CLASS_ID = 7  # буфер профиля нагрузки (Эт
 # строки, поэтому Gateway обязан прочитать capture_period ДО чтения
 # буфера и вычислить метки сам (см. read_load_profile в hdlc_dlms.py).
 PROFILE_GENERIC_CAPTURE_PERIOD_ATTRIBUTE = 4
+# Атрибут 3 (capture_objects) — список фактически захватываемых колонок
+# буфера (каждый элемент: class_id, logical_name, attribute_index,
+# data_index) — 2026-09-12, диагностика причины data-access-error=250 на
+# GET с access-selection=range-descriptor (см. DECISIONS.md): побайтовый
+# разбор декомпилированного TpDLMS.cs::organizeFrame_GetLoadProfile
+# показал, что рабочий референс указывает в selected_values ОДИН
+# конкретный объект-колонку, а не пустой список ("верни всё") — узнать
+# реальные колонки вместо угадывания можно этим же атрибутом, обычным
+# GET без access-selection (как и capture_period).
+PROFILE_GENERIC_CAPTURE_OBJECTS_ATTRIBUTE = 3
 
 
 def encode_oid(components: tuple[int, ...]) -> bytes:

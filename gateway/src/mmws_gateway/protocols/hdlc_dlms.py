@@ -805,3 +805,77 @@ def read_load_profile_via_established_link(
             information=dlms.wrap_llc_command(request_next),
         )
         send_seq += 1
+
+
+def read_profile_capture_objects_via_established_link(
+    transport: TcpTransport, *, serial: str, password: bytes, obis: str, class_id: int,
+) -> object:
+    """Диагностика (2026-09-12, по просьбе пользователя "покопай почему
+    data-access-error 250") — читает атрибут 3 (capture_objects) объекта
+    профиля нагрузки ОБЫЧНЫМ GET без access-selection (как и
+    ``PROFILE_GENERIC_CAPTURE_PERIOD_ATTRIBUTE`` в ``read_load_profile_
+    via_established_link``), а не GET-с-диапазоном. Совсем отдельная
+    ассоциация/функция, не переиспользует и не трогает основной путь
+    чтения буфера — цель узнать РЕАЛЬНЫЕ захватываемые колонки этого
+    конкретного счётчика (каждый элемент ответа — структура class_id/
+    logical_name/attribute_index/data_index), а не гадать, что подставлять
+    в ``selected_values`` GET-запроса с диапазоном (см. DECISIONS.md:
+    побайтовый разбор декомпилированного TpDLMS.cs::
+    organizeFrame_GetLoadProfile показал, что рабочий референс указывает
+    там ОДИН конкретный объект, а не пустой список "все колонки", как
+    сейчас у нас в build_get_request_range).
+
+    2026-09-12 (живая проверка) — ответ на этот GET у реального счётчика
+    НЕ уместился в один PDU (``GET.response-normal``) — пришёл как
+    ``GET.response-with-datablock``, поэтому функция следует той же
+    логике накопления датаблоков + ``GET.request-Next``, что и чтение
+    самого буфера в ``read_load_profile_via_established_link`` (но
+    декодирует результат целиком одним значением, а не построчным
+    генератором — это разовая диагностика, не потоковое чтение)."""
+    server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
+    client_addr = DEFAULT_CLIENT_ADDRESS
+
+    aarq = dlms.build_aarq(password)
+    aare_frame = _send_aarq_and_await_aare(
+        transport, server_addr, client_addr, dlms.wrap_llc_command(aarq),
+    )
+    dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))
+
+    parsed_obis = dlms.parse_obis(obis)
+    request = dlms.build_get_request(
+        parsed_obis, class_id=class_id,
+        attribute_id=dlms.PROFILE_GENERIC_CAPTURE_OBJECTS_ATTRIBUTE,
+        invoke_id=1,
+    )
+    _send_i_frame(
+        transport, server_addr, client_addr, send_seq=1, recv_seq=1,
+        information=dlms.wrap_llc_command(request),
+    )
+
+    send_seq = 2
+    buf = bytearray()
+    while True:
+        response_frame = _recv_i_frame(transport)
+        payload = dlms.unwrap_llc(response_frame.information)
+        response_type = payload[1] if len(payload) > 1 else None
+
+        if response_type == dlms.GET_RESPONSE_NORMAL:
+            return dlms.parse_get_response(payload)
+
+        if response_type != dlms.GET_RESPONSE_WITH_DATABLOCK:
+            raise GatewayError(
+                f"Неожиданный тип GET.response при чтении capture_objects: {payload[:2].hex()}"
+            )
+
+        block = dlms.parse_get_response_datablock(payload)
+        buf.extend(block.raw_data)
+        if block.last_block:
+            value, _consumed = datatypes.decode_value(bytes(buf), offset=0)
+            return value
+
+        request_next = dlms.build_get_request_next(block.block_number + 1, invoke_id=1)
+        _send_i_frame(
+            transport, server_addr, client_addr, send_seq=send_seq, recv_seq=send_seq,
+            information=dlms.wrap_llc_command(request_next),
+        )
+        send_seq += 1

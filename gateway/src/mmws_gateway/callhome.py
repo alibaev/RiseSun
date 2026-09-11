@@ -142,6 +142,16 @@ DEFAULT_IMMEDIATE_READ_MAX_WAIT_S = 150.0
 # точечных экспериментов, если понадобится.
 VER2_EMULATION_TEST_SERIALS: set[str] = set()
 
+# 2026-09-12 (по просьбе пользователя "покопай почему data-access-error
+# 250") — тот же принцип точечного эксперимента, что и у
+# VER2_EMULATION_TEST_SERIALS выше: серийники в этом множестве вместо
+# обычного _maybe_trigger_immediate_read получают ОДНОРАЗОВОЕ
+# диагностическое чтение атрибута 3 (capture_objects) профиля нагрузки
+# (см. read_profile_capture_objects_via_established_link) — полностью
+# изолировано от job'ов/Backend, только логирует результат. Пусто по
+# умолчанию — заполняется на время конкретного эксперимента.
+CAPTURE_OBJECTS_DIAGNOSTIC_SERIALS: set[str] = set()
+
 _DLT645_START = 0x68
 
 
@@ -568,6 +578,15 @@ class CallHomePool:
         except (socket.timeout, OSError):
             return
 
+        if pc.serial in CAPTURE_OBJECTS_DIAGNOSTIC_SERIALS:
+            # 2026-09-12 — разовый диагностический эксперимент (см.
+            # выше), заменяет собой обычную обработку ЭТОГО конкретного
+            # соединения целиком: счётчик из allowlist перезванивает
+            # очень часто (проверено живым трафиком), следующий дозвон
+            # получит обычное событийное чтение как обычно.
+            self._run_capture_objects_diagnostic(pc)
+            return
+
         # Событийное чтение сразу при подключении (2026-09-09, см.
         # DECISIONS.md и план ticklish-popping-bear.md) — единственный
         # момент, когда есть реальный шанс успеть SNRM/AARQ/GET до
@@ -627,6 +646,105 @@ class CallHomePool:
             if remaining_budget <= 0:
                 return None
             time.sleep(min(self._SIBLING_POLL_INTERVAL_S, remaining_budget))
+
+    def _run_capture_objects_diagnostic(self, pc: _PooledConnection) -> None:
+        """2026-09-12, по просьбе пользователя ("покопай почему data-
+        access-error 250") — разовый диагностический эксперимент,
+        ПОЛНОСТЬЮ изолированный от обычного событийного пути и job'ов:
+        читает атрибут 3 (capture_objects) объекта профиля нагрузки
+        обычным GET (как и capture_period), логирует результат и
+        закрывает соединение. Управляется allowlist'ом
+        ``CAPTURE_OBJECTS_DIAGNOSTIC_SERIALS`` (пуст по умолчанию, см.
+        выше). Пароль берётся тем же способом, что и в
+        ``_maybe_trigger_immediate_read`` (claim-jobs отдаёт его
+        независимо от наличия due job'ов) — если у этого же счётчика
+        случайно окажется настоящая due job'а, она будет молча забрана
+        и НЕ обработана (вернётся в очередь через stale_job_reaper_loop
+        на Backend'е по таймауту, как и при любом другом сетевом сбое) —
+        приемлемо для точечного эксперимента на одном выбранном
+        серийнике, не для постоянной работы."""
+        try:
+            from . import backend_client
+            from .protocols import hdlc_dlms
+            from .transport import TcpServerTransport
+
+            claimed = backend_client.claim_due_jobs(pc.serial, peer_ip=pc.peer[0], local_port=pc.local_port)
+            if claimed is None or not claimed.password:
+                logger.warning(
+                    "Диагностика capture_objects: не удалось получить пароль для %s (Backend недоступен?)",
+                    pc.serial,
+                )
+                return
+            password_bytes = claimed.password.encode("ascii")
+
+            with self._lock:
+                if self._pool.get(pc.conn_no) is not pc:
+                    return
+                del self._pool[pc.conn_no]
+
+            hdlc_dlms.server_hdlc_address(hdlc_dlms.physical_address(pc.serial, hdlc_dlms.HDLC_DLMS))
+            filtering_sock = DlT645FilteringSocket(pc.raw_sock)
+            transport = None
+            linked = False
+            last_error: GatewayError | None = None
+            try:
+                for attempt in range(1, DEFAULT_MAX_ATTEMPTS_PER_CONNECTION + 1):
+                    transport = TcpServerTransport.from_accepted_socket(
+                        filtering_sock, peer_host=pc.peer[0], peer_port=pc.peer[1],
+                        timeout_ms=DEFAULT_PER_ATTEMPT_TIMEOUT_MS,
+                    )
+                    try:
+                        hdlc_dlms.establish_link(transport, serial=pc.serial)
+                        linked = True
+                        break
+                    except GatewayError as exc:
+                        last_error = exc
+                        logger.info(
+                            "Диагностика capture_objects: попытка %d SNRM на соединении #%d — %s, повтор",
+                            attempt, pc.conn_no, exc.code,
+                        )
+                    except (ConnectionError, OSError) as exc:
+                        logger.warning(
+                            "Диагностика capture_objects: обрыв соединения #%d при SNRM (%s)",
+                            pc.conn_no, exc,
+                        )
+                        return
+                    time.sleep(DEFAULT_RETRY_INTERVAL_S)
+
+                if not linked:
+                    logger.warning(
+                        "Диагностика capture_objects: счётчик %s не подтвердил SNRM за %d попыток (%s)",
+                        pc.serial, DEFAULT_MAX_ATTEMPTS_PER_CONNECTION, last_error,
+                    )
+                    return
+
+                filtering_sock.set_deadline(time.time() + DEFAULT_ASSOCIATION_TIMEOUT_MS / 1000)
+                # OBIS "1.1.63.1.0.ff" — та же рабочая гипотеза адреса
+                # буфера профиля нагрузки, что и в load_profile.
+                # DEFAULT_LOAD_PROFILE_OBIS (backend), продублирована
+                # здесь литералом — это разовый эксперимент, не общий код.
+                try:
+                    result = hdlc_dlms.read_profile_capture_objects_via_established_link(
+                        transport, serial=pc.serial, password=password_bytes,
+                        obis="1.1.63.1.0.ff", class_id=7,
+                    )
+                    logger.warning(
+                        "Диагностика capture_objects (%s): УСПЕХ, атрибут 3 = %r", pc.serial, result,
+                    )
+                except Exception as exc:  # noqa: BLE001 — любой исход интересен для диагностики
+                    logger.warning(
+                        "Диагностика capture_objects (%s): не удалось прочитать атрибут 3 — %s: %s",
+                        pc.serial, type(exc).__name__, exc,
+                    )
+            finally:
+                try:
+                    pc.raw_sock.close()
+                except OSError:
+                    pass
+        except Exception:
+            logger.exception(
+                "Диагностика capture_objects: неожиданная ошибка при обработке соединения #%d", pc.conn_no,
+            )
 
     def _maybe_trigger_immediate_read(self, pc: _PooledConnection) -> None:
         """Событийная попытка прочитать ВСЕ due job'ы счётчика сразу
