@@ -519,28 +519,36 @@ def parse_set_response(data: bytes) -> None:
 # в конце), затем при наличии: [0x01, access-selector, access-parameters].
 # Для профиля нагрузки — access-selector=1 (range-descriptor),
 # access-parameters — структура из 4 полей: restricting_object,
-# from_value/to_value (диапазон как octet-string с сырыми 12 байтами
-# cosem-date-time), selected_values (пустой массив = вернуть все
-# захватываемые колонки).
+# from_value/to_value (диапазон, см. ``datatypes.encode_date_time`` —
+# тег ``date_time`` 0x19, 2026-09-12), selected_values (пустой массив =
+# вернуть все захватываемые колонки).
 #
-# restricting_object — ИЗНАЧАЛЬНО кодировался как структура-ссылка на
-# объект Clock (класс 8, OBIS 0.0.1.0.0.255, атрибут 2), по аналогии
-# со "стандартным" описанием range-descriptor в Green Book. НАЙДЕНО
-# 2026-09-10 (см. DECISIONS.md, "read_load_profile — ноль успехов за
-# всю историю"): это было ОШИБКОЙ для этих счётчиков — реальный экспорт
-# объектной модели (2026-08-19) уже показал, что захватываемые колонки
-# буфера НЕ включают объект Clock, и Clock-структура в restricting_object
-# каждый раз отвергалась data-access-result=250 ("other-reason").
-# Побайтовый разбор декомпилированного `ver2.zip`
-# (`TpDLMS.cs::organizeFrame_GetLoadProfile`) — РЕАЛЬНО работающей
-# заводской программы — показал, что она отправляет здесь ОДИН байт
-# 0x00 (NULL-DATA), а не Clock-структуру. Заменено на
-# ``datatypes.encode_null()``.
+# restricting_object — история метаний (см. DECISIONS.md за подробным
+# разбором каждого шага):
+# 1. Изначально — структура-ссылка на объект Clock (класс 8, OBIS
+#    0.0.1.0.0.255, атрибут 2), по "стандартному" описанию range-
+#    descriptor в Green Book.
+# 2. 2026-09-10 — заменено на NULL-DATA: экспорт объектной модели
+#    (2026-08-19) показал, что захватываемые колонки буфера НЕ включают
+#    Clock, а разбор декомпилированного `ver2.zip` (`TpDLMS.cs::
+#    organizeFrame_GetLoadProfile`) показал, что реально работающая
+#    программа отправляет там NULL. НО тот эксперимент с Clock
+#    тестировался СО СТАРОЙ (октет-строка) кодировкой дат.
+# 3. 2026-09-12 — снова Clock-структура, вместе с НОВОЙ кодировкой дат
+#    (date_time, п.1 выше): другой декомпилированный референс
+#    (`GXDLMSReader.cs::RS_PostProcessingProfileGenericsDates`) патчит
+#    ТОЛЬКО кодировку дат в исходящем запросе стандартной Gurux.DLMS —
+#    restricting_object он не трогает вовсе, значит у него остаётся
+#    Gurux'овское значение по умолчанию (Clock-ссылка). "NULL +
+#    date_time" на живой проверке дал ТОТ ЖЕ отказ (data-access-
+#    result=250), что и раньше — комбинация "Clock + date_time" ещё не
+#    была опробована, хотя именно она ближе всего к тому, что реально
+#    отправляет второй референс.
 
 RANGE_DESCRIPTOR_SELECTOR = 1
 ENTRY_DESCRIPTOR_SELECTOR = 2
 CLOCK_CLASS_ID = 8
-CLOCK_OBIS = bytes([0, 0, 1, 0, 0, 0xFF])  # стандартный OBIS объекта Clock — больше не используется по умолчанию, см. выше
+CLOCK_OBIS = bytes([0, 0, 1, 0, 0, 0xFF])  # стандартный OBIS объекта Clock
 
 GET_REQUEST_NEXT = 0x02
 GET_RESPONSE_WITH_DATABLOCK = 0x02
@@ -559,14 +567,42 @@ def build_get_request_range(
 ) -> bytes:
     """GET.request-Normal с access-selection=range-descriptor — просит
     у счётчика только записи буфера профиля нагрузки за ``[from_dt,
-    to_dt]`` вместо выгрузки всего буфера целиком."""
+    to_dt]`` вместо выгрузки всего буфера целиком.
+
+    2026-09-12 (по просьбе пользователя — "покопай, может тут сдвиг
+    байта") — from/to кодируются тегом ``date_time`` (0x19, см.
+    ``datatypes.encode_date_time``), НЕ ``octet-string`` (0x09) с
+    сырыми 12 байтами внутри, как было раньше. Найдено в
+    декомпилированном `GXDLMSReader.cs::RS_PostProcessingProfileGenericsDates`
+    (см. DECISIONS.md): легаси-программа хирургически патчит исходящий
+    запрос от стандартной Gurux.DLMS, заменяя байты ``09 0C`` (ровно то,
+    что кодировал старый вариант этой функции) на один байт ``0x19`` —
+    прямое свидетельство, что прошивка счётчика не разбирает дату,
+    завёрнутую в octet-string.
+
+    ``restricting_object`` (2026-09-12, тот же повод) — снова структура-
+    ссылка на объект Clock (класс 8, OBIS 0.0.1.0.0.255, атрибут 2), а
+    НЕ ``NULL-DATA`` (см. запись 2026-09-10 в DECISIONS.md — тогда её
+    заменили на NULL, но тот эксперимент использовал СТАРУЮ кодировку
+    дат через octet-string; живая проверка 2026-09-12 показала, что
+    ``NULL + date_time`` даёт ТОТ ЖЕ САМЫЙ data-access-result=250, что
+    и раньше — то есть настоящая причина отказа, возможно, вообще не в
+    ``restricting_object``, а сочетание "Clock-ссылка + правильная
+    кодировка дат" — единственная комбинация, которую наша реализация
+    ещё не пробовала (легаси ``RS_``-патч меняет ТОЛЬКО кодировку дат,
+    оставляя Gurux.DLMS's Clock-ссылку по умолчанию нетронутой) — пока
+    не проверена."""
     if len(obis) != 6:
         raise GatewayError("OBIS для GET.request должен быть ровно 6 байт")
     descriptor = class_id.to_bytes(2, "big") + obis + bytes([attribute_id])
 
-    restricting_object = datatypes.encode_null()
-    from_value = datatypes.encode_octet_string(datatypes.encode_cosem_date_time(from_dt))
-    to_value = datatypes.encode_octet_string(datatypes.encode_cosem_date_time(to_dt))
+    restricting_object = datatypes.encode_structure([
+        datatypes.encode_long_unsigned(CLOCK_CLASS_ID),
+        datatypes.encode_octet_string(CLOCK_OBIS),
+        datatypes.encode_integer(2),
+    ])
+    from_value = datatypes.encode_date_time(from_dt)
+    to_value = datatypes.encode_date_time(to_dt)
     selected_values = datatypes.encode_array([])
     access_parameters = datatypes.encode_structure(
         [restricting_object, from_value, to_value, selected_values]

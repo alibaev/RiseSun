@@ -96,3 +96,27 @@ def test_cosem_date_time_round_trip():
     assert len(raw) == 12
     decoded = datatypes.decode_cosem_date_time(raw)
     assert decoded == dt
+
+
+def test_encode_date_time_uses_dedicated_tag_without_length_byte():
+    """2026-09-12 — see DECISIONS.md: GXDLMSReader.cs::RS_PostProcessingProfileGenericsDates
+    patches outgoing octet-string(cosem-date-time) ("09 0C" + 12 raw
+    bytes) into a single date_time tag (0x19) + 12 raw bytes — no
+    separate length byte, unlike octet-string."""
+    from datetime import datetime
+
+    dt = datetime(2026, 8, 19, 12, 30, 45)
+    encoded = datatypes.encode_date_time(dt)
+    assert encoded[0] == datatypes.TAG_DATE_TIME
+    assert len(encoded) == 13  # 1 (тег) + 12 (сырые байты), без байта длины
+    assert encoded[1:] == datatypes.encode_cosem_date_time(dt)
+
+
+def test_decode_value_handles_date_time_tag():
+    from datetime import datetime
+
+    dt = datetime(2026, 8, 19, 12, 30, 45)
+    encoded = datatypes.encode_date_time(dt)
+    decoded, consumed = datatypes.decode_value(encoded)
+    assert decoded == dt
+    assert consumed == 13

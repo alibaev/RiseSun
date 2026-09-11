@@ -30,6 +30,7 @@ TAG_LONG_UNSIGNED = 0x12  # uint16, big-endian
 TAG_LONG64 = 0x14  # int64, big-endian
 TAG_LONG64_UNSIGNED = 0x15  # uint64, big-endian
 TAG_ENUM = 0x16  # uint8 (перечисление, напр. код единицы измерения)
+TAG_DATE_TIME = 0x19  # 12 сырых байт (год/месяц/день/... — см. encode_cosem_date_time), БЕЗ байта длины
 
 # array/structure(0x02)/long64/enum добавлены по итогам разбора реального
 # трафика Risesun 2026-08-18 (структура scaler_unit, вендорское значение
@@ -50,6 +51,7 @@ _TAG_NAMES = {
     TAG_LONG64: "long64",
     TAG_LONG64_UNSIGNED: "long64-unsigned",
     TAG_ENUM: "enum",
+    TAG_DATE_TIME: "date_time",
 }
 
 
@@ -129,11 +131,7 @@ def encode_array(items: list[bytes]) -> bytes:
 # DLMS cosem-date-time (12 сырых байт, Green Book): год(2, BE) + месяц +
 # день + день_недели(1=Пн..7=Вс, 0xff=не задан) + час + минута + секунда
 # + сотые_доли(0xff=не заданы) + отклонение_от_UTC(2, BE, минуты,
-# 0x8000=не задано) + статус(0xff=не задан). Используется как СЫРОЕ
-# содержимое octet-string (тег 0x09) в параметрах range-descriptor —
-# не отдельный Common-Data-Type тег (нестандартно, но это общепринятая
-# практика реализаций DLMS для access-selection, не выгружено из ТЗ/
-# словаря OBIS напрямую — сверить при живой проверке Этапа 3).
+# 0x8000=не задано) + статус(0xff=не задан).
 def encode_cosem_date_time(dt) -> bytes:
     dow = dt.isoweekday()
     return (
@@ -142,6 +140,23 @@ def encode_cosem_date_time(dt) -> bytes:
         + (0x8000).to_bytes(2, "big")
         + bytes([0xFF])
     )
+
+
+def encode_date_time(dt) -> bytes:
+    """2026-09-12, по просьбе пользователя ("покопай, может тут сдвиг
+    байта") — найдено в декомпилированном GXDLMSReader.cs
+    (`RS_PostProcessingProfileGenericsDates`, см. DECISIONS.md):
+    легаси-программа ХИРУРГИЧЕСКИ патчит исходящий запрос диапазона от
+    стандартной библиотеки Gurux.DLMS, заменяя байты ``09 0C`` (тег
+    ``octet-string`` + явная длина 12 — именно так ``build_get_request_
+    range`` кодировал from/to ДО этого фикса) на ОДИН байт ``0x19`` —
+    отдельный Common-Data-Type тег ``date_time`` (Green Book): 12 сырых
+    байт БЕЗ отдельного байта длины (длина у него фиксированная и
+    подразумевается самим тегом, в отличие от octet-string). Судя по
+    этому патчу, прошивка счётчика (или её DLMS-стек) не разбирает дату
+    в range-descriptor, завёрнутую в octet-string, и ждёт именно этот
+    "родной" тег."""
+    return bytes([TAG_DATE_TIME]) + encode_cosem_date_time(dt)
 
 
 def decode_cosem_date_time(raw: bytes):
@@ -216,6 +231,9 @@ def decode_value(data: bytes, offset: int = 0) -> tuple[object, int]:
             items.append(item)
             pos += consumed
         return items, pos - offset
+    if tag == TAG_DATE_TIME:
+        _require(data, pos, 12)
+        return decode_cosem_date_time(data[pos : pos + 12]), 13
 
     raise DlmsDataError(f"Неподдержанный тег типа данных DLMS: 0x{tag:02X}")
 

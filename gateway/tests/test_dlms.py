@@ -120,13 +120,29 @@ def test_get_request_range_has_access_selection_present_flag():
     # access-parameters — структура из 4 элементов
     assert request[descriptor_end + 2] == datatypes.TAG_STRUCTURE
     assert request[descriptor_end + 3] == 4
-    # restricting_object — NULL-DATA (2026-09-10, см. DECISIONS.md: было
-    # Clock-структурой, счётчик без Clock в захватываемых колонках
-    # отвергал её data-access-result=250; сверено побайтово с реально
-    # работающей заводской программой ver2.zip).
-    assert request[descriptor_end + 4] == datatypes.TAG_NULL_DATA
-    # from_value сразу следующим элементом — octet-string (cosem-date-time).
-    assert request[descriptor_end + 5] == datatypes.TAG_OCTET_STRING
+    # restricting_object — снова Clock-структура (2026-09-12, см.
+    # DECISIONS.md: NULL+date_time дал тот же отказ на живой проверке,
+    # что и раньше — единственная непроверенная комбинация: Clock-ссылка
+    # ВМЕСТЕ с новой кодировкой дат, т.к. RS_-патч трогает только даты).
+    assert request[descriptor_end + 4] == datatypes.TAG_STRUCTURE
+    assert request[descriptor_end + 5] == 3  # class_id, logical_name, attribute_index
+    assert request[descriptor_end + 6] == datatypes.TAG_LONG_UNSIGNED
+    assert request[descriptor_end + 7 : descriptor_end + 9] == (8).to_bytes(2, "big")  # class Clock
+    restricting_end = descriptor_end + 9
+    assert request[restricting_end] == datatypes.TAG_OCTET_STRING
+    assert request[restricting_end + 1] == 6
+    assert request[restricting_end + 2 : restricting_end + 8] == bytes([0, 0, 1, 0, 0, 0xFF])
+    assert request[restricting_end + 8] == datatypes.TAG_INTEGER
+    assert request[restricting_end + 9] == 2  # attribute_index (value)
+    # from_value сразу следующим элементом — тег date_time (2026-09-12,
+    # см. DECISIONS.md: было octet-string(cosem-date-time) — найдено
+    # побайтовым разбором GXDLMSReader.cs::RS_PostProcessingProfileGenericsDates,
+    # легаси-программа патчит именно такой исходящий запрос от Gurux.DLMS,
+    # заменяя "09 0C" на один байт 0x19).
+    from_pos = restricting_end + 10
+    assert request[from_pos] == datatypes.TAG_DATE_TIME
+    # date_time — БЕЗ отдельного байта длины (фиксированные 12 байт сразу).
+    assert request[from_pos + 1 : from_pos + 3] == (2026).to_bytes(2, "big")
 
 
 def test_get_request_next_round_trip_shape():
