@@ -5,9 +5,41 @@ import { tokenStorage } from "../auth/tokenStorage";
 import { useAuth, canTriggerRead, canWriteParameter } from "../auth/AuthContext";
 import { ConfirmModal } from "../components/ConfirmModal";
 import { formatValue } from "../lib/format";
-import type { Job, LogEntry, Meter, MeterReading } from "../api/types";
+import type { Job, LoadProfileRow, LogEntry, Meter, MeterReading } from "../api/types";
 
 const DEFAULT_OBIS = "1.1.1.8.0.ff"; // активная энергия, приём, всего (ТЗ Приложение Г.3)
+
+// Профиль нагрузки (Этап 3, ТЗ п.4.2.3) — "Profile 1"/канал 1 счётчика
+// DTZY217 (см. DECISIONS.md, разбор реальных байтовых трасс 2026-09-12):
+// values_json — сырой массив в ПОРЯДКЕ capture_objects счётчика: V1,V2,
+// V3, I1,I2,I3, PF1,PF2,PF3, доп.колонка (OBIS 1.1.96.80.0.255, не
+// показывается — назначение не уточнено), активная энергия (последняя).
+// Форма и порядок столбцов таблицы — по образцу референсной программы
+// счётчика (скриншот "screen1", по просьбе пользователя 2026-09-12).
+const LOAD_PROFILE_COLUMNS: { label: string; index: number }[] = [
+  { label: "Активная энергия", index: 10 },
+  { label: "Нагрузка, фаза A", index: 3 },
+  { label: "Нагрузка, фаза B", index: 4 },
+  { label: "Нагрузка, фаза C", index: 5 },
+  { label: "Напряжение, фаза A", index: 0 },
+  { label: "Напряжение, фаза B", index: 1 },
+  { label: "Напряжение, фаза C", index: 2 },
+  { label: "Коэф. мощности, фаза A", index: 6 },
+  { label: "Коэф. мощности, фаза B", index: 7 },
+  { label: "Коэф. мощности, фаза C", index: 8 },
+];
+const LOAD_PROFILE_PAGE_SIZE = 20;
+
+function profileCellValue(row: LoadProfileRow, index: number): string {
+  const value = row.values_json[index];
+  if (value == null) return "—";
+  return typeof value === "number" ? String(value) : String(value);
+}
+
+function toDateInput(date: Date): string {
+  const offsetMs = date.getTimezoneOffset() * 60000;
+  return new Date(date.getTime() - offsetMs).toISOString().slice(0, 10);
+}
 
 // <input type="datetime-local"> ждёт "YYYY-MM-DDTHH:mm" в локальном
 // времени пользователя, без секунд/зоны — обрезаем toISOString() (UTC)
@@ -45,6 +77,17 @@ export function MeterDetailPage() {
   const [readingsFrom, setReadingsFrom] = useState(() => toDatetimeLocal(new Date(Date.now() - 86400000)));
   const [readingsTo, setReadingsTo] = useState(() => toDatetimeLocal(new Date()));
 
+  // Вкладка "Профиль нагрузки" (2026-09-12, по просьбе пользователя —
+  // форма как в референсной программе счётчика): по умолчанию — сегодня
+  // целиком, правится вручную и применяется кнопкой "Найти".
+  const [profileFrom, setProfileFrom] = useState(() => toDateInput(new Date()));
+  const [profileTo, setProfileTo] = useState(() => toDateInput(new Date()));
+  const [profileRows, setProfileRows] = useState<LoadProfileRow[]>([]);
+  const [profilePage, setProfilePage] = useState(1);
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const [profileJob, setProfileJob] = useState<Job | null>(null);
+  const profileWsRef = useRef<WebSocket | null>(null);
+
   const loadReadings = useCallback(async () => {
     if (!id) return;
     try {
@@ -57,6 +100,22 @@ export function MeterDetailPage() {
       setError(err instanceof ApiError ? err.message : "Не удалось загрузить показания");
     }
   }, [id, readingsFrom, readingsTo]);
+
+  const loadProfileRows = useCallback(async () => {
+    if (!id) return;
+    setProfileError(null);
+    try {
+      const params = new URLSearchParams({
+        from_iso: `${profileFrom}T00:00:00`,
+        to_iso: `${profileTo}T23:59:59`,
+      });
+      const rows = await api.get<LoadProfileRow[]>(`/api/meters/${id}/load-profile?${params}`);
+      setProfileRows(rows);
+      setProfilePage(1);
+    } catch (err) {
+      setProfileError(err instanceof ApiError ? err.message : "Не удалось загрузить профиль нагрузки");
+    }
+  }, [id, profileFrom, profileTo]);
 
   const loadAll = useCallback(async () => {
     if (!id) return;
@@ -82,12 +141,14 @@ export function MeterDetailPage() {
   useEffect(() => {
     loadAll();
     loadReadings();
+    loadProfileRows();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   useEffect(() => () => wsRef.current?.close(), []);
   useEffect(() => () => datetimeWsRef.current?.close(), []);
   useEffect(() => () => disconnectWsRef.current?.close(), []);
+  useEffect(() => () => profileWsRef.current?.close(), []);
 
   function watchJob(job: Job, wsRef: { current: WebSocket | null }, onUpdate: (job: Job) => void) {
     const token = tokenStorage.getAccess();
@@ -154,6 +215,24 @@ export function MeterDetailPage() {
         };
       })
       .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось запустить чтение"));
+  }
+
+  function handleTriggerProfileRead() {
+    if (!id) return;
+    setProfileError(null);
+    api
+      .post<Job>(`/api/meters/${id}/read-load-profile`, {
+        from_iso: `${profileFrom}T00:00:00`,
+        to_iso: `${profileTo}T23:59:59`,
+      })
+      .then((job) => {
+        setProfileJob(job);
+        watchJob(job, profileWsRef, (updated) => {
+          setProfileJob(updated);
+          if (updated.status === "succeeded") loadProfileRows();
+        });
+      })
+      .catch((err) => setProfileError(err instanceof ApiError ? err.message : "Не удалось запустить чтение профиля"));
   }
 
   if (error && !meter) {
@@ -320,6 +399,94 @@ export function MeterDetailPage() {
               })}
             </tbody>
           </table>
+        )}
+      </section>
+
+      <section className="card">
+        <div className="card-header">
+          <h2>Профиль нагрузки (Profile 1)</h2>
+          {canTriggerRead(role) && (
+            <button
+              onClick={handleTriggerProfileRead}
+              disabled={profileJob?.status === "queued" || profileJob?.status === "running"}
+            >
+              {profileJob?.status === "queued" || profileJob?.status === "running"
+                ? "Читаю..."
+                : "Обновить профиль"}
+            </button>
+          )}
+        </div>
+        <div className="filters">
+          <label>
+            Начальная дата
+            <br />
+            <input type="date" value={profileFrom} onChange={(e) => setProfileFrom(e.target.value)} />
+          </label>
+          <label>
+            Конечная дата
+            <br />
+            <input type="date" value={profileTo} onChange={(e) => setProfileTo(e.target.value)} />
+          </label>
+          <button onClick={() => loadProfileRows()}>Найти</button>
+        </div>
+        {profileJob?.status === "failed" && (
+          <div className="error-message">
+            Ошибка чтения профиля: {profileJob.error?.code} — {profileJob.error?.message}
+          </div>
+        )}
+        {profileError && <div className="error-message">{profileError}</div>}
+        {profileRows.length === 0 ? (
+          <p>Данных профиля нагрузки за выбранный период нет.</p>
+        ) : (
+          <>
+            <div style={{ overflowX: "auto" }}>
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Дата и время</th>
+                    {LOAD_PROFILE_COLUMNS.map((col) => (
+                      <th key={col.label}>{col.label}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {profileRows
+                    .slice((profilePage - 1) * LOAD_PROFILE_PAGE_SIZE, profilePage * LOAD_PROFILE_PAGE_SIZE)
+                    .map((row) => (
+                      <tr key={row.id}>
+                        <td>{new Date(row.timestamp).toLocaleString("ru-RU")}</td>
+                        {LOAD_PROFILE_COLUMNS.map((col) => (
+                          <td key={col.label}>{profileCellValue(row, col.index)}</td>
+                        ))}
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+            {profileRows.length > LOAD_PROFILE_PAGE_SIZE && (
+              <div className="filters" style={{ alignItems: "center" }}>
+                <button
+                  className="secondary"
+                  onClick={() => setProfilePage((p) => Math.max(1, p - 1))}
+                  disabled={profilePage <= 1}
+                >
+                  ‹
+                </button>
+                <span>
+                  Стр. {profilePage} из {Math.ceil(profileRows.length / LOAD_PROFILE_PAGE_SIZE)}
+                </span>
+                <button
+                  className="secondary"
+                  onClick={() =>
+                    setProfilePage((p) => Math.min(Math.ceil(profileRows.length / LOAD_PROFILE_PAGE_SIZE), p + 1))
+                  }
+                  disabled={profilePage >= Math.ceil(profileRows.length / LOAD_PROFILE_PAGE_SIZE)}
+                >
+                  ›
+                </button>
+              </div>
+            )}
+          </>
         )}
       </section>
 
