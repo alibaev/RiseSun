@@ -158,6 +158,19 @@ DEFAULT_IMMEDIATE_READ_MAX_WAIT_S = 150.0
 # точечных экспериментов, если понадобится.
 VER2_EMULATION_TEST_SERIALS: set[str] = set()
 
+# Точечный эксперимент (2026-09-12, по просьбе пользователя "может надо
+# отправить хардбит?", см. DECISIONS.md) — живая проверка на нескольких
+# счётчиках показала: AARQ ретраится честно (до 20 раз по рекомендации
+# производителя, см. DEFAULT_AARQ_PER_ATTEMPT_TIMEOUT_S), но на ПРИЁМ
+# не приходит ВООБЩЕ НИ БАЙТА — даже документированного 2026-09-10
+# heartbeat-шума GPRS-модема "00 00 00" (на который мы отвечаем эхом,
+# когда его шлёт СЧЁТЧИК). Гипотеза: может быть, модем ждёт активности
+# ОТ НАС, чтобы посчитать канал живым. Серийники в этом множестве при
+# каждой повторной отправке AARQ дополнительно шлют те же 3 нулевых
+# байта (см. hdlc_dlms._send_aarq_and_await_aare). Пусто по умолчанию —
+# заполняется точечно для конкретного эксперимента, не постоянная фича.
+HEARTBEAT_PROBE_TEST_SERIALS: set[str] = set()
+
 # 2026-09-12 (по просьбе пользователя "покопай почему data-access-error
 # 250") — тот же принцип точечного эксперимента, что и у
 # VER2_EMULATION_TEST_SERIALS выше: серийники в этом множестве вместо
@@ -1102,6 +1115,7 @@ class CallHomePool:
                 rows, error = read_load_profile_via_fresh_connection(
                     candidate, serial=pc.serial, password=password_bytes,
                     obis=job.obis, class_id=job.class_id, from_dt=from_dt, to_dt=to_dt,
+                    send_heartbeat_probe=pc.serial in HEARTBEAT_PROBE_TEST_SERIALS,
                 )
             except GatewayError as exc:
                 logger.info(
@@ -1445,6 +1459,7 @@ def read_load_profile_via_fresh_connection(
     per_attempt_timeout_ms: int = DEFAULT_PER_ATTEMPT_TIMEOUT_MS,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS_PER_CONNECTION,
     association_timeout_ms: int = DEFAULT_ASSOCIATION_TIMEOUT_MS,
+    send_heartbeat_probe: bool = False,
 ) -> tuple[list[tuple[object, object]], "GatewayError | None"]:
     """Профиль нагрузки через событийный путь (2026-09-11, см.
     DECISIONS.md — перенос read_load_profile на immediate-read; живой
@@ -1505,7 +1520,7 @@ def read_load_profile_via_fresh_connection(
     try:
         for row in hdlc_dlms.read_load_profile_via_established_link(
             transport, serial=serial, password=password, obis=obis, class_id=class_id,
-            from_dt=from_dt, to_dt=to_dt,
+            from_dt=from_dt, to_dt=to_dt, send_heartbeat_probe=send_heartbeat_probe,
         ):
             rows.append(row)
     except GatewayError as exc:

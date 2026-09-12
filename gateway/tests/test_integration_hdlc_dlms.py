@@ -21,7 +21,7 @@ from mmws_gateway.protocols.hdlc import (
     read_frame_from_transport,
 )
 from mmws_gateway.session import run_with_retries
-from mmws_gateway.transport import TcpTransport, TransportConfig
+from mmws_gateway.transport import TcpServerTransport, TcpTransport, TransportConfig
 
 SERIAL = "202006003607"
 PASSWORD = b"12345678"
@@ -733,3 +733,102 @@ def test_aarq_is_resent_when_aare_delayed():
     assert aarq_count["n"] == 2
     assert outcomes[0].ok is True
     assert outcomes[0].value == 1234567
+
+
+def test_send_aarq_and_await_aare_sends_heartbeat_probe_when_enabled():
+    """2026-09-12 (по просьбе пользователя "может надо отправить
+    хардбит?", см. DECISIONS.md) — точечный эксперимент: живая проверка
+    показала, что AARQ ретраится честно, но на приём не приходит ВООБЩЕ
+    НИ БАЙТА, даже документированного heartbeat-шума GPRS-модема
+    "00 00 00". ``send_heartbeat_probe=True`` шлёт те же 3 нулевых байта
+    (паттерн, который модем сам использует как keepalive) перед КАЖДОЙ
+    отправкой AARQ, включая самую первую — сервер здесь молчит на все
+    попытки, проверяем только то, что клиент реально шлёт пробу."""
+    from mmws_gateway.errors import MeterTimeoutError
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.bind(("127.0.0.1", 0))
+    server_sock.listen(1)
+    host, port = server_sock.getsockname()
+    received = bytearray()
+
+    def _serve():
+        conn, _ = server_sock.accept()
+        conn.settimeout(2)
+        try:
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                received.extend(chunk)
+        except socket.timeout:
+            pass
+        finally:
+            conn.close()
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+
+    client_sock = socket.create_connection((host, port), timeout=2)
+    transport = TcpServerTransport.from_accepted_socket(
+        client_sock, peer_host=host, peer_port=port, timeout_ms=100
+    )
+    try:
+        with pytest.raises(MeterTimeoutError):
+            hdlc_dlms._send_aarq_and_await_aare(
+                transport, server_addr=1, client_addr=16, aarq_information=b"\x01\x02",
+                per_attempt_timeout_s=0.05, max_attempts=3, send_disc_before_retry=False,
+                send_heartbeat_probe=True,
+            )
+    finally:
+        client_sock.close()
+    thread.join(timeout=3)
+    server_sock.close()
+
+    assert received.count(b"\x00\x00\x00") == 3  # одна проба перед каждой из 3 попыток AARQ
+
+
+def test_send_aarq_and_await_aare_no_heartbeat_probe_by_default():
+    """Обратная сторона предыдущего теста — по умолчанию (боевое
+    поведение, не эксперимент) проба НЕ отправляется."""
+    from mmws_gateway.errors import MeterTimeoutError
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.bind(("127.0.0.1", 0))
+    server_sock.listen(1)
+    host, port = server_sock.getsockname()
+    received = bytearray()
+
+    def _serve():
+        conn, _ = server_sock.accept()
+        conn.settimeout(2)
+        try:
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                received.extend(chunk)
+        except socket.timeout:
+            pass
+        finally:
+            conn.close()
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+
+    client_sock = socket.create_connection((host, port), timeout=2)
+    transport = TcpServerTransport.from_accepted_socket(
+        client_sock, peer_host=host, peer_port=port, timeout_ms=100
+    )
+    try:
+        with pytest.raises(MeterTimeoutError):
+            hdlc_dlms._send_aarq_and_await_aare(
+                transport, server_addr=1, client_addr=16, aarq_information=b"\x01\x02",
+                per_attempt_timeout_s=0.05, max_attempts=2, send_disc_before_retry=False,
+            )
+    finally:
+        client_sock.close()
+    thread.join(timeout=3)
+    server_sock.close()
+
+    assert b"\x00\x00\x00" not in bytes(received)

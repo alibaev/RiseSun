@@ -303,6 +303,7 @@ def read_registers_via_established_link(
     aare_per_attempt_timeout_s: float | None = None,
     aare_max_attempts: int | None = None,
     send_disc_before_retry: bool = True,
+    send_heartbeat_probe: bool = False,
 ) -> list[RegisterReadOutcome]:
     """AARQ/AARE ОДИН РАЗ, затем последовательно GET на каждый (obis,
     class_id) из ``obis_specs`` — событийное чтение call-home сразу при
@@ -345,6 +346,7 @@ def read_registers_via_established_link(
         ),
         max_attempts=aare_max_attempts if aare_max_attempts is not None else DEFAULT_AARQ_MAX_ATTEMPTS,
         send_disc_before_retry=send_disc_before_retry,
+        send_heartbeat_probe=send_heartbeat_probe,
     )
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))  # AuthFailedError и т.п. — весь батч падает, это верно
 
@@ -564,6 +566,7 @@ def _send_aarq_and_await_aare(
     per_attempt_timeout_s: float = DEFAULT_AARQ_PER_ATTEMPT_TIMEOUT_S,
     max_attempts: int = DEFAULT_AARQ_MAX_ATTEMPTS,
     send_disc_before_retry: bool = True,
+    send_heartbeat_probe: bool = False,
 ) -> HdlcFrame:
     """Отправляет AARQ (I(0,0)) и ждёт AARE, повторно отправляя AARQ
     короткими окнами вместо одного долгого пассивного ожидания (см.
@@ -574,7 +577,19 @@ def _send_aarq_and_await_aare(
     Для обычного ``TcpTransport`` (прямое IP-подключение) — сокет и так
     использует фиксированный таймаут на каждый ``recv()``, поэтому
     ``get_deadline``/``set_deadline`` там просто отсутствуют (duck typing),
-    и повтор AARQ происходит на этом же, уже существующем таймауте."""
+    и повтор AARQ происходит на этом же, уже существующем таймауте.
+
+    ``send_heartbeat_probe`` (2026-09-12, точечный эксперимент, см.
+    DECISIONS.md и ``callhome.HEARTBEAT_PROBE_TEST_SERIALS``) — по
+    просьбе пользователя: если за весь бюджет ожидания AARE не приходит
+    ВООБЩЕ НИ БАЙТА (даже документированного 2026-09-10 heartbeat-шума
+    GPRS-модема "00 00 00", на который мы отвечаем эхом, когда его
+    шлёт СЧЁТЧИК) — рабочая гипотеза: может быть, модем ждёт активности
+    ОТ НАС, чтобы посчитать канал живым. Перед каждой повторной отправкой
+    AARQ дополнительно шлём те же 3 нулевых байта (тот же паттерн, что
+    counter/модем сам использует как keepalive) — дёшево и безопасно по
+    построению (см. обоснование echo-фикса выше): если гипотеза неверна,
+    это просто три лишних байта."""
     sock = getattr(transport, "_sock", None)
     get_deadline = getattr(sock, "get_deadline", None)
     set_deadline = getattr(sock, "set_deadline", None)
@@ -603,6 +618,8 @@ def _send_aarq_and_await_aare(
                     destination=server_addr, source=client_addr, control=CONTROL_DISC,
                 )
                 transport.send(disc_frame.encode())
+            if send_heartbeat_probe:
+                transport.send(b"\x00\x00\x00")
             _send_i_frame(
                 transport, server_addr, client_addr, send_seq=0, recv_seq=0,
                 information=aarq_information,
@@ -667,6 +684,7 @@ def read_load_profile_via_established_link(
     class_id: int,
     from_dt,
     to_dt,
+    send_heartbeat_probe: bool = False,
 ) -> Iterator[tuple[object, object]]:
     """AARQ/AARE + GET профиля нагрузки поверх УЖЕ установленной (SNRM/UA
     пройден) HDLC-связи — используется как обычным ``read_load_profile``,
@@ -699,6 +717,7 @@ def read_load_profile_via_established_link(
     aarq = dlms.build_aarq(password)
     aare_frame = _send_aarq_and_await_aare(
         transport, server_addr, client_addr, dlms.wrap_llc_command(aarq),
+        send_heartbeat_probe=send_heartbeat_probe,
     )
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))
 
