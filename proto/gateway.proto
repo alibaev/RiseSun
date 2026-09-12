@@ -154,6 +154,13 @@ message HealthCheckResponse {
   // изменено в обход панели (например, переменной окружения при
   // перезапуске контейнера).
   int32 call_home_port = 3;
+  // 2026-09-12 (по просьбе пользователя — панель "Шлюзы" показывала
+  // только call_home_port=2009, хотя реально слушаются 17 портов по
+  // РЭСам) — ВСЕ порты, на которых сейчас реально принимает соединения
+  // call-home пул этого Gateway (основной + extra_bind_ports), в
+  // порядке CallHomePool.bind_ports: [call_home_port, ...остальные].
+  // Пусто, если call-home не запущен на этом экземпляре.
+  repeated int32 call_home_ports = 4;
 }
 
 message ListCallHomeSerialsRequest {}

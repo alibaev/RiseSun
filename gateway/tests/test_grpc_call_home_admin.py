@@ -30,6 +30,7 @@ def test_health_check_reports_call_home_port_zero_when_disabled():
         stub = gateway_pb2_grpc.GatewayServiceStub(grpc.insecure_channel(f"127.0.0.1:{grpc_port}"))
         response = stub.HealthCheck(gateway_pb2.HealthCheckRequest())
         assert response.call_home_port == 0
+        assert list(response.call_home_ports) == []
     finally:
         server.stop(None)
 
@@ -42,6 +43,27 @@ def test_health_check_reports_actual_call_home_port():
         stub = gateway_pb2_grpc.GatewayServiceStub(grpc.insecure_channel(f"127.0.0.1:{grpc_port}"))
         response = stub.HealthCheck(gateway_pb2.HealthCheckRequest())
         assert response.call_home_port == call_home_port
+        assert list(response.call_home_ports) == [call_home_port]
+    finally:
+        server.stop(None)
+        pool.stop()
+
+
+def test_health_check_reports_all_extra_call_home_ports():
+    """2026-09-12 (по просьбе пользователя — панель "Шлюзы" показывала
+    только основной порт, хотя реально слушаются 17 портов по РЭСам) —
+    ``call_home_ports`` перечисляет ВСЕ реально слушаемые порты
+    (основной + ``extra_call_home_ports``), не только основной."""
+    grpc_port = _free_port()
+    call_home_port = _free_port()
+    extra_ports = [_free_port(), _free_port()]
+    server, pool = grpc_server.serve(
+        host="127.0.0.1", port=grpc_port, call_home_port=call_home_port, extra_call_home_ports=extra_ports,
+    )
+    try:
+        stub = gateway_pb2_grpc.GatewayServiceStub(grpc.insecure_channel(f"127.0.0.1:{grpc_port}"))
+        response = stub.HealthCheck(gateway_pb2.HealthCheckRequest())
+        assert list(response.call_home_ports) == [call_home_port, *extra_ports]
     finally:
         server.stop(None)
         pool.stop()

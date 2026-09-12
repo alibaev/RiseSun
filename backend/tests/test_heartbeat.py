@@ -20,7 +20,9 @@ from mmws_gateway.grpc_generated import gateway_pb2, gateway_pb2_grpc
 
 class _FakeGatewayService(gateway_pb2_grpc.GatewayServiceServicer):
     def HealthCheck(self, request, context):
-        return gateway_pb2.HealthCheckResponse(ok=True, driver_version="test", call_home_port=2009)
+        return gateway_pb2.HealthCheckResponse(
+            ok=True, driver_version="test", call_home_port=2009, call_home_ports=[2009, 2010, 2011],
+        )
 
 
 @pytest.fixture
@@ -53,6 +55,9 @@ async def test_heartbeat_marks_reachable_gateway_online(db_session, fake_grpc_se
     assert gateway.last_heartbeat_at is not None
     assert gateway.is_online is True
     assert gateway.call_home_port == 2009  # Этап 6 — отражён фактический порт из HealthCheck
+    # 2026-09-12 — все реально слушаемые порты, не только основной
+    # (см. models.Gateway.call_home_ports).
+    assert gateway.call_home_ports == [2009, 2010, 2011]
 
 
 @pytest.mark.asyncio

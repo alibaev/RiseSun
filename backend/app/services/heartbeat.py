@@ -65,6 +65,9 @@ async def _run_once() -> None:
                 # при перезапуске контейнера, не только через
                 # SetCallHomePort — см. app/api/gateways.py).
                 db_gateway.call_home_port = response.call_home_port or None
+                # 2026-09-12 — все реально слушаемые порты (см.
+                # models.Gateway.call_home_ports), не только основной.
+                db_gateway.call_home_ports = list(response.call_home_ports) or None
         await db.commit()
 
 

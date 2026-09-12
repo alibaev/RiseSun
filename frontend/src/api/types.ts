@@ -22,6 +22,7 @@ export interface Gateway {
   status: GatewayStatus;
   last_heartbeat_at: string | null;
   call_home_port: number | null;
+  call_home_ports: number[] | null;
   is_online: boolean;
   created_at: string;
 }

@@ -154,11 +154,19 @@ export function GatewaysPage() {
               <dd>{STATUS_LABELS[g.status] ?? g.status}</dd>
               <dt>Последний heartbeat</dt>
               <dd>{g.last_heartbeat_at ? new Date(g.last_heartbeat_at).toLocaleString("ru-RU") : "—"}</dd>
-              <dt>Текущий call-home порт</dt>
+              <dt>Основной call-home порт</dt>
               <dd>{g.call_home_port ?? "—"}</dd>
+              <dt>Все слушаемые call-home порты</dt>
+              <dd>
+                {g.call_home_ports && g.call_home_ports.length > 0
+                  ? g.call_home_ports.join(", ")
+                  : g.call_home_port ?? "—"}
+              </dd>
             </dl>
             <label>
-              Новый call-home порт (применяется вживую, без перезапуска Gateway)
+              Новый ОСНОВНОЙ call-home порт (применяется вживую, без перезапуска Gateway;
+              остальные порты из списка выше настраиваются переменной окружения Gateway'я и
+              вживую не меняются)
               <br />
               <input
                 type="number"

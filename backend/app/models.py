@@ -139,6 +139,14 @@ class Gateway(Base):
     # разу не получен heartbeat с этим полем (старый Gateway/только что
     # зарегистрирован) либо call-home на этом экземпляре не запущен.
     call_home_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 2026-09-12 (по просьбе пользователя — панель "Шлюзы" показывала
+    # только основной порт, хотя реально слушаются 17 портов по РЭСам,
+    # см. services/res_mapping.py) — ВСЕ фактически слушаемые порты
+    # (основной + extra_bind_ports), отражается на каждом heartbeat так
+    # же, как и call_home_port. NULL/пустой список — то же самое, что и
+    # у call_home_port (heartbeat ещё не было, либо call-home не
+    # запущен).
+    call_home_ports: Mapped[list[int] | None] = mapped_column(JSONB, nullable=True)
     registered_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     approved_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

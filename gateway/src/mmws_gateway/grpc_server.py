@@ -301,7 +301,10 @@ class GatewayServiceServicer(gateway_pb2_grpc.GatewayServiceServicer):
 
     def HealthCheck(self, request, context):
         call_home_port = self._call_home_pool.bind_port if self._call_home_pool is not None else 0
-        return gateway_pb2.HealthCheckResponse(ok=True, driver_version=DRIVER_VERSION, call_home_port=call_home_port)
+        call_home_ports = self._call_home_pool.bind_ports if self._call_home_pool is not None else []
+        return gateway_pb2.HealthCheckResponse(
+            ok=True, driver_version=DRIVER_VERSION, call_home_port=call_home_port, call_home_ports=call_home_ports,
+        )
 
     def ListCallHomeSerials(self, request, context):
         seen = self._call_home_pool.list_seen_serials() if self._call_home_pool is not None else {}

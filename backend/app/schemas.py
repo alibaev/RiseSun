@@ -83,6 +83,7 @@ class GatewayOut(BaseModel):
     status: GatewayStatus
     last_heartbeat_at: datetime | None
     call_home_port: int | None
+    call_home_ports: list[int] | None
     is_online: bool
     created_at: datetime
 
