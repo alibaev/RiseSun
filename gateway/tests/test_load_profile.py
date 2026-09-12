@@ -177,6 +177,7 @@ def test_read_profile_capture_objects_follows_datablock_transfer():
         ]),
     ])
     mid = len(capture_objects) // 2
+    captured: dict = {}
 
     def handler(conn: socket.socket) -> None:
         snrm_frame = HdlcFrame.decode(_read_frame(conn))
@@ -205,6 +206,9 @@ def test_read_profile_capture_objects_follows_datablock_transfer():
         conn.sendall(frame1.encode())
 
         next_frame = HdlcFrame.decode(_read_frame(conn))
+        next_payload = dlms.unwrap_llc(next_frame.information)
+        captured["next_invoke_id"] = next_payload[2]
+        captured["original_invoke_id"] = invoke_id
 
         block2 = dlms.build_get_response_datablock(
             invoke_id, last_block=True, block_number=2, raw_data=capture_objects[mid:],
@@ -225,3 +229,89 @@ def test_read_profile_capture_objects_follows_datablock_transfer():
             )
 
     assert decoded == [[3, bytes([1, 1, 1, 8, 0, 0xFF]), 2, 0]]
+    # 2026-09-12 (по просьбе пользователя "покопай ver2.zip, он же
+    # работает") — GET.request-Next несёт НАРАСТАЮЩИЙ invoke_id, а не
+    # тот же самый, что у исходного GET (см. DECISIONS.md: побайтовый
+    # разбор TpDLMS.cs::organizeFrame_GetLoadProfile показал, что
+    # meter.incInvokeId() вызывается перед КАЖДЫМ GET, включая Next).
+    assert captured["next_invoke_id"] == captured["original_invoke_id"] + 1
+
+
+def test_read_load_profile_get_request_next_uses_incrementing_invoke_id():
+    """2026-09-12 (по просьбе пользователя "покопай ver2.zip, он же
+    работает") — тот же фикс, что и для capture_objects, но для
+    основного чтения буфера (``read_load_profile_via_established_link``).
+    Ручной сервер (общий эмулятор ``_serve_load_profile`` не годится —
+    он не проверяет и не отдаёт invoke_id из входящего Next), полный
+    сценарий: capture_period (invoke_id=1) -> GET-диапазон (invoke_id=2)
+    -> датаблок 1 -> Next (ожидаем invoke_id=3, было бы 2 до фикса) ->
+    датаблок 2."""
+    rows = [_row(3000), _row(3001)]
+    array_bytes = datatypes.encode_array([datatypes.encode_structure(r) for r in rows])
+    mid = len(array_bytes) // 2
+    captured: dict = {}
+
+    def handler(conn: socket.socket) -> None:
+        snrm_frame = HdlcFrame.decode(_read_frame(conn))
+        ua = HdlcFrame(destination=snrm_frame.source, source=snrm_frame.destination, control=CONTROL_UA)
+        conn.sendall(ua.encode())
+
+        aarq_frame = HdlcFrame.decode(_read_frame(conn))
+        aare = dlms.build_aare(accepted=True)
+        aare_frame = HdlcFrame(
+            destination=aarq_frame.source, source=aarq_frame.destination,
+            control=control_information_frame(0, 1), information=dlms.wrap_llc_response(aare),
+        )
+        conn.sendall(aare_frame.encode())
+
+        period_frame = HdlcFrame.decode(_read_frame(conn))
+        period_payload = dlms.unwrap_llc(period_frame.information)
+        period_info = dlms.build_get_response_data(
+            period_payload[2], datatypes.encode_double_long_unsigned(CAPTURE_PERIOD_SECONDS),
+        )
+        period_response = HdlcFrame(
+            destination=period_frame.source, source=period_frame.destination,
+            control=control_information_frame(1, 2), information=dlms.wrap_llc_response(period_info),
+        )
+        conn.sendall(period_response.encode())
+
+        range_frame = HdlcFrame.decode(_read_frame(conn))
+        range_payload = dlms.unwrap_llc(range_frame.information)
+        range_invoke_id = range_payload[2]
+        captured["range_invoke_id"] = range_invoke_id
+
+        block1 = dlms.build_get_response_datablock(
+            range_invoke_id, last_block=False, block_number=1, raw_data=array_bytes[:mid],
+        )
+        frame1 = HdlcFrame(
+            destination=range_frame.source, source=range_frame.destination,
+            control=control_information_frame(2, 3), information=dlms.wrap_llc_response(block1),
+        )
+        conn.sendall(frame1.encode())
+
+        next_frame = HdlcFrame.decode(_read_frame(conn))
+        next_payload = dlms.unwrap_llc(next_frame.information)
+        captured["next_invoke_id"] = next_payload[2]
+
+        block2 = dlms.build_get_response_datablock(
+            range_invoke_id, last_block=True, block_number=2, raw_data=array_bytes[mid:],
+        )
+        frame2 = HdlcFrame(
+            destination=next_frame.source, source=next_frame.destination,
+            control=control_information_frame(3, 4), information=dlms.wrap_llc_response(block2),
+        )
+        conn.sendall(frame2.encode())
+
+    with ThreadedEmulatorServer(handler) as server:
+        config = TransportConfig(host=server.host, port=server.port, timeout_ms=1000, max_retries=1)
+        with TcpTransport(config) as transport:
+            decoded = list(
+                hdlc_dlms.read_load_profile(
+                    transport, serial=SERIAL, password=PASSWORD,
+                    obis=LOAD_PROFILE_OBIS, class_id=LOAD_PROFILE_CLASS_ID,
+                    from_dt=FROM_DT, to_dt=TO_DT,
+                )
+            )
+
+    assert len(decoded) == 2
+    assert captured["next_invoke_id"] == captured["range_invoke_id"] + 1

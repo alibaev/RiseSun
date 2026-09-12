@@ -151,6 +151,15 @@ VER2_EMULATION_TEST_SERIALS: set[str] = set()
 # изолировано от job'ов/Backend, только логирует результат. Пусто по
 # умолчанию — заполняется на время конкретного эксперимента.
 CAPTURE_OBJECTS_DIAGNOSTIC_SERIALS: set[str] = set()
+# 2026-09-12 — пароль берётся отсюда НАПРЯМУЮ, а не через backend_client.
+# claim_due_jobs(): тот неизбежно гоняется за due job'ами со старым
+# FIFO-воркером (job_worker.worker_loop, независимый опрос раз в ~1с) —
+# у активного счётчика, дозванивающегося раз в ~1 мин, воркер выигрывает
+# эту гонку ПОЧТИ ВСЕГДА, отправляя диагностику раз за разом в "не
+# удалось получить пароль". Значение — реальный (уже известный из
+# предыдущей ручной проверки claim-jobs) пароль этого конкретного
+# счётчика, только для точечного эксперимента.
+CAPTURE_OBJECTS_DIAGNOSTIC_PASSWORDS: dict[str, str] = {}
 
 _DLT645_START = 0x68
 
@@ -662,20 +671,25 @@ class CallHomePool:
         и НЕ обработана (вернётся в очередь через stale_job_reaper_loop
         на Backend'е по таймауту, как и при любом другом сетевом сбое) —
         приемлемо для точечного эксперимента на одном выбранном
-        серийнике, не для постоянной работы."""
+        серийнике, не для постоянной работы.
+
+        Пароль (2026-09-12) — из ``CAPTURE_OBJECTS_DIAGNOSTIC_PASSWORDS``
+        напрямую, НЕ через ``backend_client.claim_due_jobs()`` — тот
+        гоняется за due job'ами со старым FIFO-воркером (опрос раз в
+        ~1с) и почти всегда проигрывает эту гонку на активном счётчике,
+        оставляя диагностику без пароля раз за разом."""
         try:
-            from . import backend_client
             from .protocols import hdlc_dlms
             from .transport import TcpServerTransport
 
-            claimed = backend_client.claim_due_jobs(pc.serial, peer_ip=pc.peer[0], local_port=pc.local_port)
-            if claimed is None or not claimed.password:
+            password = CAPTURE_OBJECTS_DIAGNOSTIC_PASSWORDS.get(pc.serial)
+            if not password:
                 logger.warning(
-                    "Диагностика capture_objects: не удалось получить пароль для %s (Backend недоступен?)",
+                    "Диагностика capture_objects: нет пароля в CAPTURE_OBJECTS_DIAGNOSTIC_PASSWORDS для %s",
                     pc.serial,
                 )
                 return
-            password_bytes = claimed.password.encode("ascii")
+            password_bytes = password.encode("ascii")
 
             with self._lock:
                 if self._pool.get(pc.conn_no) is not pc:

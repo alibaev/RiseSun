@@ -743,6 +743,7 @@ def read_load_profile_via_established_link(
     )
 
     send_seq = 3
+    invoke_id = 2
     buf = bytearray()
     cursor = 0
     total_count: int | None = None
@@ -795,11 +796,21 @@ def read_load_profile_via_established_link(
             return
 
         # GET.request-Next продолжает УЖЕ начатую блочную передачу ответа
-        # на GET-диапазон (invoke_id=2 выше) — по смыслу это тот же самый
-        # запрос, не новый, поэтому намеренно переиспользует его invoke_id
-        # (в отличие от НЕЗАВИСИМЫХ GET из _read_one_register_via_
-        # established_link, где как раз наоборот нужны разные invoke_id).
-        request_next = dlms.build_get_request_next(block.block_number + 1, invoke_id=2)
+        # на GET-диапазон — 2026-09-12 (по просьбе пользователя "покопай
+        # ver2.zip, он же работает"): раньше здесь переиспользовался
+        # invoke_id=2 от исходного GET-диапазона (по "стандартному"
+        # описанию DLMS — тот же invoke_id для всей длинной операции).
+        # Живая проверка через новую диагностику capture_objects (см.
+        # DECISIONS.md) получила честный отказ data-access-result=16
+        # ("No Long Get Or Read In Progress") именно на втором датаблоке
+        # с ПОВТОРЁННЫМ invoke_id. Побайтовый разбор `TpDLMS.cs::
+        # organizeFrame_GetLoadProfile` (декомпилированный `ver2.zip`)
+        # показал: `meter.incInvokeId()` вызывается БЕЗУСЛОВНО перед
+        # КАЖДЫМ GET, включая Get-Request-Next — у рабочего референса
+        # каждый Next несёт СВЕЖИЙ, нарастающий invoke_id, не повторяет
+        # исходный.
+        invoke_id += 1
+        request_next = dlms.build_get_request_next(block.block_number + 1, invoke_id=invoke_id)
         _send_i_frame(
             transport, server_addr, client_addr, send_seq=send_seq, recv_seq=send_seq,
             information=dlms.wrap_llc_command(request_next),
@@ -831,7 +842,24 @@ def read_profile_capture_objects_via_established_link(
     логике накопления датаблоков + ``GET.request-Next``, что и чтение
     самого буфера в ``read_load_profile_via_established_link`` (но
     декодирует результат целиком одним значением, а не построчным
-    генератором — это разовая диагностика, не потоковое чтение)."""
+    генератором — это разовая диагностика, не потоковое чтение).
+
+    2026-09-12 (по просьбе пользователя — "покопай ver2.zip, он же
+    работает") — GET.request-Next использует НАРАСТАЮЩИЙ invoke_id
+    (``invoke_id + число_уже_отправленных_Next``), а НЕ тот же самый
+    invoke_id, что у исходного GET (как считалось раньше по т.н.
+    "стандартному" описанию DLMS — большинство源ников/форумов
+    описывают именно это). Живая проверка получила честный отказ
+    ``data-access-result=16`` ("No Long Get Or Read In Progress",
+    официальное имя кода — Gurux.DLMS.ErrorCodes) на второй датаблок —
+    то есть счётчик, получив Next с ПРЕЖНИМ invoke_id, решил, что у
+    него нет активной операции для продолжения. Побайтовый разбор
+    `TpDLMS.cs::organizeFrame_GetLoadProfile` (декомпилированный
+    `ver2.zip`) показал: `meter.incInvokeId()` вызывается БЕЗУСЛОВНО
+    перед КАЖДЫМ GET, включая GET-Request-Next (ветка `extend=true`),
+    а разбор ответа (`parseGetReqestValue`) сверяет invoke_id ответа
+    именно с этим НОВЫМ значением — то есть у рабочего референса
+    Next всегда несёт СВЕЖИЙ invoke_id, не повторяет исходный."""
     server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
     client_addr = DEFAULT_CLIENT_ADDRESS
 
@@ -842,10 +870,11 @@ def read_profile_capture_objects_via_established_link(
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))
 
     parsed_obis = dlms.parse_obis(obis)
+    invoke_id = 1
     request = dlms.build_get_request(
         parsed_obis, class_id=class_id,
         attribute_id=dlms.PROFILE_GENERIC_CAPTURE_OBJECTS_ATTRIBUTE,
-        invoke_id=1,
+        invoke_id=invoke_id,
     )
     _send_i_frame(
         transport, server_addr, client_addr, send_seq=1, recv_seq=1,
@@ -873,7 +902,8 @@ def read_profile_capture_objects_via_established_link(
             value, _consumed = datatypes.decode_value(bytes(buf), offset=0)
             return value
 
-        request_next = dlms.build_get_request_next(block.block_number + 1, invoke_id=1)
+        invoke_id += 1
+        request_next = dlms.build_get_request_next(block.block_number + 1, invoke_id=invoke_id)
         _send_i_frame(
             transport, server_addr, client_addr, send_seq=send_seq, recv_seq=send_seq,
             information=dlms.wrap_llc_command(request_next),
