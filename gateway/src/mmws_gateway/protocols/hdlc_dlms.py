@@ -18,7 +18,6 @@ import logging
 import time
 
 from dataclasses import dataclass
-from datetime import timedelta
 from typing import Iterator
 
 from ..addressing import HDLC_DLMS, physical_address
@@ -675,20 +674,25 @@ def read_load_profile_via_established_link(
     у которого SNRM/UA выполняется отдельно с повторами (счётчик не
     всегда отвечает на первый SNRM, см. callhome.py).
 
-    Реальный экспорт объектной модели счётчика (сервисная программа
-    завода, 2026-08-19, см. DECISIONS.md) показал, что захватываемые
-    колонки буфера НЕ включают объект Clock — строка не несёт метку
-    времени сама по себе. Поэтому перед чтением буфера отдельным
-    GET читается атрибут 4 (capture_period, секунды), а метка времени
-    каждой строки вычисляется как ``from_dt + номер_строки * period``.
+    2026-09-12 (реальные байтовые трассы 4 успешных сеансов
+    IECMeterManage.exe, предоставленные пользователем — см. DECISIONS.md)
+    ОПРОВЕРГЛИ более раннюю находку "буфер не включает Clock, метка времени
+    вычисляется как from_dt + номер_строки*period" (сервисная программа
+    завода, 2026-08-19): на самом деле КАЖДАЯ строка буфера несёт
+    СОБСТВЕННУЮ метку времени в первых 6 байтах (см. ``dlms.decode_load_
+    profile_row``) — отдельный GET атрибута 4 (capture_period) и вычисление
+    меток по номеру строки больше не нужны и удалены (рабочий референс
+    тоже не читает capture_period при чтении профиля — все 4 трассы это
+    подтвердили).
 
     Генератор: отдаёт КАЖДУЮ строку буфера сразу, как только она
     полностью собрана из накопленных байт (не дожидаясь всего ответа
     целиком) — обрыв соединения посреди передачи не теряет уже
     отданные вызывающему коду строки (ТЗ п.4.2.3 — докачка при обрыве,
     is_partial). Каждый элемент генератора — пара ``(timestamp, values)``,
-    где ``values`` — то, что вернул ``datatypes.decode_value`` для
-    захватываемых колонок одной строки буфера (список значений)."""
+    где ``values`` — список значений колонок одной строки буфера (см.
+    ``dlms.decode_load_profile_row`` — собственный BCD-формат этой модели
+    счётчика, не стандартный DLMS common-data-type array-of-structure)."""
     server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
     client_addr = DEFAULT_CLIENT_ADDRESS
 
@@ -714,43 +718,23 @@ def read_load_profile_via_established_link(
 
     parsed_obis = dlms.parse_obis(obis)
 
-    period_request = dlms.build_get_request(
-        parsed_obis, class_id=class_id,
-        attribute_id=dlms.PROFILE_GENERIC_CAPTURE_PERIOD_ATTRIBUTE,
-        invoke_id=1,
+    # selected_values — 2026-09-12 реальные байтовые трассы 4 успешных
+    # сеансов IECMeterManage.exe (предоставлены пользователем, см.
+    # DECISIONS.md) показали, что рабочий референс ВСЕГДА шлёт здесь
+    # пустой массив ("верни все колонки") — попытка подставить сюда
+    # реальный список capture_objects (найденный ранее через SSH) была
+    # ошибкой, отменена.
+    request = dlms.build_get_request_range(
+        parsed_obis, class_id=class_id, from_dt=from_dt, to_dt=to_dt, invoke_id=1,
     )
     _send_i_frame(
         transport, server_addr, client_addr, send_seq=1, recv_seq=1,
-        information=dlms.wrap_llc_command(period_request),
-    )
-    period_frame = _recv_i_frame(transport)
-    capture_period_seconds = dlms.parse_get_response(dlms.unwrap_llc(period_frame.information))
-    if not isinstance(capture_period_seconds, int) or capture_period_seconds <= 0:
-        raise GatewayError(
-            f"Некорректный capture_period профиля нагрузки: {capture_period_seconds!r}"
-        )
-
-    # invoke_id=2 (2026-09-11, тот же принцип, что и в
-    # _read_one_register_via_established_link) — не переиспользуем
-    # invoke_id=1 от предыдущего GET (capture_period) на этой же
-    # ассоциации.
-    request = dlms.build_get_request_range(
-        parsed_obis, class_id=class_id, from_dt=from_dt, to_dt=to_dt, invoke_id=2,
-    )
-    _send_i_frame(
-        transport, server_addr, client_addr, send_seq=2, recv_seq=2,
         information=dlms.wrap_llc_command(request),
     )
 
-    send_seq = 3
-    invoke_id = 2
+    send_seq = 2
+    invoke_id = 1
     buf = bytearray()
-    cursor = 0
-    total_count: int | None = None
-    decoded_count = 0
-
-    def _timestamp_for(index: int):
-        return from_dt + timedelta(seconds=capture_period_seconds * index)
 
     while True:
         response_frame = _recv_i_frame(transport)
@@ -759,10 +743,21 @@ def read_load_profile_via_established_link(
 
         if response_type == dlms.GET_RESPONSE_NORMAL:
             # Весь ответ уместился в одном PDU — блочная передача не
-            # понадобилась (короткий диапазон дат).
-            value = dlms.parse_get_response(payload)
-            for index, row in enumerate(value):
-                yield _timestamp_for(index), row
+            # понадобилась (короткий диапазон дат). ``parse_get_response``
+            # тут не годится — она декодирует значение как СТАНДАРТНЫЙ
+            # DLMS common-data-type, а буфер профиля нагрузки этой модели
+            # счётчика — собственный BCD-формат (см. dlms.decode_load_
+            # profile_row), поэтому нужны СЫРЫЕ байты после result-choice.
+            if len(payload) < 4 or payload[3] != dlms.RESULT_DATA:
+                raise GatewayError(
+                    f"Неожиданный GET.response-normal при чтении профиля нагрузки: {payload.hex()}"
+                )
+            buf.extend(payload[4:])
+            rows, buf_tail = dlms.split_load_profile_rows(bytes(buf))
+            for row in rows:
+                yield dlms.decode_load_profile_row(row)
+            if buf_tail:
+                yield dlms.decode_load_profile_row(buf_tail)
             return
 
         if response_type != dlms.GET_RESPONSE_WITH_DATABLOCK:
@@ -773,43 +768,26 @@ def read_load_profile_via_established_link(
         block = dlms.parse_get_response_datablock(payload)
         buf.extend(block.raw_data)
 
-        if total_count is None and len(buf) >= 2 and buf[0] == datatypes.TAG_ARRAY:
-            total_count = buf[1]
-            cursor = 2
-
-        if total_count is not None:
-            while decoded_count < total_count:
-                try:
-                    row, consumed = datatypes.decode_value(bytes(buf), offset=cursor)
-                except DlmsDataError:
-                    break  # строка ещё не собрана целиком — ждём следующий датаблок
-                yield _timestamp_for(decoded_count), row
-                cursor += consumed
-                decoded_count += 1
+        rows, remainder = dlms.split_load_profile_rows(bytes(buf))
+        for row in rows:
+            yield dlms.decode_load_profile_row(row)
+        buf = bytearray(remainder)
 
         if block.last_block:
-            if total_count is None or decoded_count < total_count:
-                raise GatewayError(
-                    "Буфер профиля нагрузки собран не полностью — данные оборвались "
-                    "раньше заявленного количества строк"
-                )
+            if buf:
+                yield dlms.decode_load_profile_row(bytes(buf))
             return
 
         # GET.request-Next продолжает УЖЕ начатую блочную передачу ответа
-        # на GET-диапазон — 2026-09-12 (по просьбе пользователя "покопай
-        # ver2.zip, он же работает"): раньше здесь переиспользовался
-        # invoke_id=2 от исходного GET-диапазона (по "стандартному"
-        # описанию DLMS — тот же invoke_id для всей длинной операции).
-        # Живая проверка через новую диагностику capture_objects (см.
-        # DECISIONS.md) получила честный отказ data-access-result=16
-        # ("No Long Get Or Read In Progress") именно на втором датаблоке
-        # с ПОВТОРЁННЫМ invoke_id. Побайтовый разбор `TpDLMS.cs::
-        # organizeFrame_GetLoadProfile` (декомпилированный `ver2.zip`)
-        # показал: `meter.incInvokeId()` вызывается БЕЗУСЛОВНО перед
-        # КАЖДЫМ GET, включая Get-Request-Next — у рабочего референса
-        # каждый Next несёт СВЕЖИЙ, нарастающий invoke_id, не повторяет
-        # исходный.
-        invoke_id += 1
+        # на GET-диапазон — переиспользует invoke_id ИСХОДНОГО GET-запроса
+        # для всей длинной операции (2026-09-12: реальные байтовые трассы
+        # 4 успешных сеансов IECMeterManage.exe, предоставленные
+        # пользователем, — ~130 кадров Get-Request-Next во всех 4 сеансах
+        # без единого исключения несут тот же invoke_id, что и исходный
+        # GET-Request-Normal, см. DECISIONS.md). Более раннее решение
+        # ("нарастающий invoke_id", основанное на разборе декомпилированного
+        # `ver2.zip`) было ошибочным выводом из декомпилированного
+        # исходника — отменено.
         request_next = dlms.build_get_request_next(block.block_number + 1, invoke_id=invoke_id)
         _send_i_frame(
             transport, server_addr, client_addr, send_seq=send_seq, recv_seq=send_seq,
@@ -844,22 +822,21 @@ def read_profile_capture_objects_via_established_link(
     декодирует результат целиком одним значением, а не построчным
     генератором — это разовая диагностика, не потоковое чтение).
 
-    2026-09-12 (по просьбе пользователя — "покопай ver2.zip, он же
-    работает") — GET.request-Next использует НАРАСТАЮЩИЙ invoke_id
-    (``invoke_id + число_уже_отправленных_Next``), а НЕ тот же самый
-    invoke_id, что у исходного GET (как считалось раньше по т.н.
-    "стандартному" описанию DLMS — большинство源ников/форумов
-    описывают именно это). Живая проверка получила честный отказ
-    ``data-access-result=16`` ("No Long Get Or Read In Progress",
-    официальное имя кода — Gurux.DLMS.ErrorCodes) на второй датаблок —
-    то есть счётчик, получив Next с ПРЕЖНИМ invoke_id, решил, что у
-    него нет активной операции для продолжения. Побайтовый разбор
-    `TpDLMS.cs::organizeFrame_GetLoadProfile` (декомпилированный
-    `ver2.zip`) показал: `meter.incInvokeId()` вызывается БЕЗУСЛОВНО
-    перед КАЖДЫМ GET, включая GET-Request-Next (ветка `extend=true`),
-    а разбор ответа (`parseGetReqestValue`) сверяет invoke_id ответа
-    именно с этим НОВЫМ значением — то есть у рабочего референса
-    Next всегда несёт СВЕЖИЙ invoke_id, не повторяет исходный."""
+    2026-09-11 (по просьбе пользователя — "покопай ver2.zip, он же
+    работает") одно время считалось, что GET.request-Next должен нести
+    нарастающий invoke_id — вывод из разбора декомпилированного
+    `TpDLMS.cs`, после единичного отказа ``data-access-result=16`` ("No
+    Long Get Or Read In Progress") на второй датаблок с повторённым
+    invoke_id.
+
+    2026-09-12 (реальные байтовые трассы 4 успешных сеансов
+    IECMeterManage.exe, предоставленные пользователем, см. DECISIONS.md)
+    ОПРОВЕРГЛИ этот вывод: ~130 кадров Get-Request-Next во всех 4 сеансах
+    без единого исключения несут ТОТ ЖЕ invoke_id, что и исходный
+    GET-Request-Normal. Тот единичный отказ был вызван чем-то другим (см.
+    отдельно найденную и исправленную ошибку в ``selected_values`` GET-
+    диапазона). Возвращено поведение "тот же invoke_id для всей
+    операции"."""
     server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
     client_addr = DEFAULT_CLIENT_ADDRESS
 
@@ -902,7 +879,6 @@ def read_profile_capture_objects_via_established_link(
             value, _consumed = datatypes.decode_value(bytes(buf), offset=0)
             return value
 
-        invoke_id += 1
         request_next = dlms.build_get_request_next(block.block_number + 1, invoke_id=invoke_id)
         _send_i_frame(
             transport, server_addr, client_addr, send_seq=send_seq, recv_seq=send_seq,

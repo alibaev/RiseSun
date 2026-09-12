@@ -120,12 +120,13 @@ def test_get_request_range_has_access_selection_present_flag():
     # access-parameters — структура из 4 элементов
     assert request[descriptor_end + 2] == datatypes.TAG_STRUCTURE
     assert request[descriptor_end + 3] == 4
-    # restricting_object — снова Clock-структура (2026-09-12, см.
-    # DECISIONS.md: NULL+date_time дал тот же отказ на живой проверке,
-    # что и раньше — единственная непроверенная комбинация: Clock-ссылка
-    # ВМЕСТЕ с новой кодировкой дат, т.к. RS_-патч трогает только даты).
+    # restricting_object — снова Clock-структура, теперь из 4 полей
+    # (class_id, logical_name, attribute_index, data_index=0) — 2026-09-12,
+    # реальные байтовые трассы 4 успешных сеансов IECMeterManage.exe
+    # (предоставлены пользователем, см. DECISIONS.md) подтвердили
+    # четырёхпольную структуру (раньше кодировали только 3 поля).
     assert request[descriptor_end + 4] == datatypes.TAG_STRUCTURE
-    assert request[descriptor_end + 5] == 3  # class_id, logical_name, attribute_index
+    assert request[descriptor_end + 5] == 4  # class_id, logical_name, attribute_index, data_index
     assert request[descriptor_end + 6] == datatypes.TAG_LONG_UNSIGNED
     assert request[descriptor_end + 7 : descriptor_end + 9] == (8).to_bytes(2, "big")  # class Clock
     restricting_end = descriptor_end + 9
@@ -134,15 +135,49 @@ def test_get_request_range_has_access_selection_present_flag():
     assert request[restricting_end + 2 : restricting_end + 8] == bytes([0, 0, 1, 0, 0, 0xFF])
     assert request[restricting_end + 8] == datatypes.TAG_INTEGER
     assert request[restricting_end + 9] == 2  # attribute_index (value)
+    assert request[restricting_end + 10] == datatypes.TAG_LONG_UNSIGNED
+    assert request[restricting_end + 11 : restricting_end + 13] == (0).to_bytes(2, "big")  # data_index
     # from_value сразу следующим элементом — тег date_time (2026-09-12,
     # см. DECISIONS.md: было octet-string(cosem-date-time) — найдено
     # побайтовым разбором GXDLMSReader.cs::RS_PostProcessingProfileGenericsDates,
     # легаси-программа патчит именно такой исходящий запрос от Gurux.DLMS,
     # заменяя "09 0C" на один байт 0x19).
-    from_pos = restricting_end + 10
+    from_pos = restricting_end + 13
     assert request[from_pos] == datatypes.TAG_DATE_TIME
     # date_time — БЕЗ отдельного байта длины (фиксированные 12 байт сразу).
     assert request[from_pos + 1 : from_pos + 3] == (2026).to_bytes(2, "big")
+
+
+def test_get_request_range_encodes_selected_values_when_given():
+    """2026-09-12 (SSH-доступ к 192.168.144.79, реальный список
+    capture_objects из DataReadScheme.ini рабочего IECMeterManage.exe —
+    см. DECISIONS.md и dlms.DTZY217_LOAD_PROFILE_CAPTURE_OBJECTS) —
+    selected_values больше не всегда пуст: если передан список
+    (class_id, obis, attribute_index, data_index), каждый элемент
+    кодируется 4-польной структурой."""
+    from datetime import datetime
+
+    obis = dlms.parse_obis("1.0.63.1.0.ff")
+    selected = [(3, bytes.fromhex("0101010800FF"), 2, 3)]
+    request = dlms.build_get_request_range(
+        obis, class_id=7, from_dt=datetime(2026, 8, 1), to_dt=datetime(2026, 8, 19),
+        invoke_id=9, selected_values=selected,
+    )
+    decoded, _consumed = datatypes.decode_value(request, offset=3 + 2 + 6 + 1 + 2)
+    # decoded — вся access-parameters структура из 4 элементов:
+    # [restricting_object, from, to, selected_values]
+    assert decoded[3] == [[3, bytes.fromhex("0101010800FF"), 2, 3]]
+
+
+def test_get_request_range_selected_values_empty_by_default():
+    from datetime import datetime
+
+    obis = dlms.parse_obis("1.0.63.1.0.ff")
+    request = dlms.build_get_request_range(
+        obis, class_id=7, from_dt=datetime(2026, 8, 1), to_dt=datetime(2026, 8, 19), invoke_id=9,
+    )
+    decoded, _consumed = datatypes.decode_value(request, offset=3 + 2 + 6 + 1 + 2)
+    assert decoded[3] == []
 
 
 def test_get_request_next_round_trip_shape():
@@ -167,6 +202,114 @@ def test_datablock_response_last_block_true():
     result = dlms.parse_get_response_datablock(response)
     assert result.last_block is True
     assert result.raw_data == b""
+
+
+def test_datablock_response_length_ber_encoding_short_data():
+    """2026-09-12 (реальные байтовые трассы, см. DECISIONS.md) — найденный
+    баг: длина датаблока раньше кодировалась/разбиралась ФИКСИРОВАННЫМИ
+    2 байтами всегда, что для датаблоков короче 128 байт съедало на 1
+    байт больше настоящей длины (реальная BER-кодировка для длин <128 —
+    ОДИН байт). Проверяем byte-for-byte."""
+    response = dlms.build_get_response_datablock(
+        0x10, last_block=False, block_number=1, raw_data=bytes(range(110))
+    )
+    # header: tag,choice,invoke,last,block_number(4),result_choice = 9 байт
+    assert response[9] == 110  # длина — ОДИН байт (110 < 128), без 0x81-префикса
+    assert response[10:110] == bytes(range(100))
+    result = dlms.parse_get_response_datablock(response)
+    assert result.raw_data == bytes(range(110))
+
+
+def test_datablock_response_length_ber_encoding_long_data():
+    """Датаблоки 128..255 байт — BER-кодировка ДЛИНЫ ровно 2 байта
+    (``0x81`` + сама длина), что случайно совпадало со старым (неверным)
+    допущением "всегда 2 байта" — поэтому баг был незаметен на типичных
+    «полных» датаблоках (см. test_datablock_response_length_ber_encoding_
+    short_data)."""
+    raw = bytes(range(178))
+    response = dlms.build_get_response_datablock(
+        0x11, last_block=False, block_number=1, raw_data=raw
+    )
+    assert response[9] == 0x81
+    assert response[10] == 178
+    result = dlms.parse_get_response_datablock(response)
+    assert result.raw_data == raw
+
+
+def test_datablock_response_matches_real_meter_capture():
+    """Регрессионный тест на реальных байтах (не эмуляция) — первый
+    датаблок ответа на GET атрибута 3 (capture_objects) счётчика
+    202001002481, захваченный tcpdump-ом с работающего IECMeterManage.exe
+    (файл logs.zip, предоставлен пользователем 2026-09-12, см.
+    DECISIONS.md). Раньше (баг с фиксированной 2-байтной длиной)
+    разбирался как 28161-байтный датаблок вместо настоящих 110 байт —
+    ``raw_data`` терял свой первый байт и сдвигался."""
+    apdu = bytes.fromhex(
+        "c402100000000001006e010b020412000309060101200700ff0f0212000302"
+        "0412000309060101340700ff0f02120003020412000309060101480700ff0f"
+        "021200030204120003090601011f0700ff0f0212000302041200030906010"
+        "1330700ff0f02120003020412000309060101470700ff0f02120003"
+    )
+    result = dlms.parse_get_response_datablock(apdu)
+    assert result.last_block is False
+    assert result.block_number == 1
+    assert len(result.raw_data) == 110
+    assert result.raw_data[0] == datatypes.TAG_ARRAY
+    assert result.raw_data[1] == 11  # count=11 захватываемых колонок
+
+
+def test_decode_load_profile_row_matches_real_meter_capture():
+    """Регрессионный тест на РЕАЛЬНЫХ байтах — первая строка буфера
+    профиля нагрузки счётчика 202001002481, захваченная с работающего
+    IECMeterManage.exe (файл logs.zip, предоставлен пользователем
+    2026-09-12, см. DECISIONS.md). Формат расшифрован побайтовым разбором
+    декомпилированного ``ReadLPDataForm_DLMS.cs::dateAnalysis``/
+    ``dataAnalysis`` (``ver2.zip``): маркер A0 A0, метка времени и поля
+    значений — BCD-цифры в ОБРАТНОМ порядке байт."""
+    row = bytes.fromhex(
+        "a0a0000000110926426555020042695502004295540200430700000043000000"
+        "004328000000343990003400000134999900812935020000000000811427020"
+        "000000000"
+    )
+    timestamp, values = dlms.decode_load_profile_row(row)
+    assert timestamp.isoformat() == "2026-09-11T00:00:00"
+    assert values == pytest.approx(
+        [255.65, 255.69, 254.95, 0.007, 0.0, 0.028, 0.9039, 1.0, 0.9999, 2352.9, 2271.4]
+    )
+
+
+def test_load_profile_row_encode_decode_round_trip():
+    from datetime import datetime
+
+    fields = [(255.65, 3, 2), (-12.3, 2, 1), (0.0, 1, 0)]
+    row = dlms.encode_load_profile_row(datetime(2026, 9, 11, 0, 30, 0), fields)
+    timestamp, values = dlms.decode_load_profile_row(row)
+    assert timestamp == datetime(2026, 9, 11, 0, 30, 0)
+    assert values == pytest.approx([255.65, -12.3, 0.0])
+
+
+def test_split_load_profile_rows_handles_marker_split_across_chunks():
+    """Маркер ``A0 A0`` может оказаться разрезан пополам между двумя
+    датаблоками — split_load_profile_rows должна просто не находить
+    вторую строку, пока оба байта маркера не окажутся в буфере (не
+    ронять исключение, не терять данные)."""
+    from datetime import datetime
+
+    row1 = dlms.encode_load_profile_row(datetime(2026, 9, 11, 0, 0, 0), [(1.0, 1, 0)])
+    row2 = dlms.encode_load_profile_row(datetime(2026, 9, 11, 0, 30, 0), [(2.0, 1, 0)])
+    whole = row1 + row2
+    split_point = len(row1) + 1  # разрезаем ПОСЛЕ первого байта маркера второй строки
+    part1, part2 = whole[:split_point], whole[split_point:]
+
+    rows, remainder = dlms.split_load_profile_rows(part1)
+    assert rows == []
+    assert remainder == part1  # вторая строка ещё не распознана — маркер не завершён
+
+    rows, remainder = dlms.split_load_profile_rows(part1 + part2)
+    assert len(rows) == 1
+    assert remainder == row2
+    assert dlms.decode_load_profile_row(rows[0]) == dlms.decode_load_profile_row(row1)
+    assert dlms.decode_load_profile_row(remainder) == dlms.decode_load_profile_row(row2)
 
 
 def test_disconnect_control_obis_hex_matches_standard_decimal_address():

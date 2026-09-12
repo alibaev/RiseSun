@@ -546,14 +546,15 @@ def test_read_via_call_home_fails_fast_on_unaddressable_serial():
 
 def _run_fake_meter_load_profile(
     conn: socket.socket, *, addr6: bytes, password: bytes,
-    load_profile_obis: bytes, rows: list, capture_period_seconds: int, block_size: int,
+    load_profile_obis: bytes, rows: list, block_size: int,
     class_ids_seen: list | None = None,
 ) -> None:
     """Тот же приём, что и ``_run_fake_meter``/``_serve_rest_of_session``
-    (2026-08-19) — воспроизводит SNRM->UA->AARQ->AARE, затем GET
-    capture_period (обычный GET, без access-selection) и GET с диапазоном
-    дат (``_serve_load_profile`` из эмулятора, форсирующего датаблочную
-    передачу)."""
+    (2026-08-19) — воспроизводит SNRM->UA->AARQ->AARE, затем сразу GET с
+    диапазоном дат (``_serve_load_profile`` из эмулятора, форсирующего
+    датаблочную передачу). 2026-09-12 — отдельного GET capture_period
+    больше нет (см. DECISIONS.md, реальные байтовые трассы 4 успешных
+    сеансов IECMeterManage.exe): метка времени встроена в каждую строку."""
     from mmws_gateway.emulators.hdlc_dlms_emulator import _read_frame, _serve_load_profile
     from mmws_gateway.protocols.hdlc import control_information_frame
 
@@ -574,25 +575,14 @@ def _run_fake_meter_load_profile(
     )
     conn.sendall(aare_frame.encode())
 
-    period_frame = HdlcFrame.decode(_read_frame(conn))
-    period_request = dlms.parse_get_request(dlms.unwrap_llc(period_frame.information))
-    assert period_request.obis == load_profile_obis
-    if class_ids_seen is not None:
-        class_ids_seen.append(period_request.class_id)
-    info = dlms.build_get_response_data(
-        period_request.invoke_id, datatypes.encode_double_long_unsigned(capture_period_seconds)
-    )
-    response_frame = HdlcFrame(
-        destination=period_frame.source, source=period_frame.destination,
-        control=control_information_frame(1, 2), information=dlms.wrap_llc_response(info),
-    )
-    conn.sendall(response_frame.encode())
-
     range_frame = HdlcFrame.decode(_read_frame(conn))
     payload = dlms.unwrap_llc(range_frame.information)
+    range_request = dlms.parse_get_request(payload)
+    assert range_request.obis == load_profile_obis
+    if class_ids_seen is not None:
+        class_ids_seen.append(range_request.class_id)
     _serve_load_profile(
         conn, range_frame, invoke_id=payload[2], rows=rows, block_size=block_size,
-        send_seq=2, recv_seq=3,
     )
 
 
@@ -605,10 +595,9 @@ def test_read_load_profile_via_call_home_streams_rows():
     password = b"12345678"
     obis = "1.1.63.1.0.ff"
     class_id = dlms.PROFILE_GENERIC_CLASS_ID
-    capture_period_seconds = 900
     from_dt = datetime(2026, 8, 1)
     to_dt = datetime(2026, 8, 19)
-    rows = [[datatypes.encode_double_long_unsigned(5000 + i)] for i in range(4)]
+    rows = [(from_dt + timedelta(minutes=i), [(float(5000 + i), 4, 0)]) for i in range(4)]
 
     pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10)
     pool.start()
@@ -618,8 +607,7 @@ def test_read_load_profile_via_call_home_streams_rows():
             target=_run_fake_meter_load_profile,
             kwargs=dict(
                 conn=client_conn, addr6=addr6, password=password,
-                load_profile_obis=dlms.parse_obis(obis), rows=rows,
-                capture_period_seconds=capture_period_seconds, block_size=6,
+                load_profile_obis=dlms.parse_obis(obis), rows=rows, block_size=6,
             ),
             daemon=True,
         )
@@ -639,7 +627,7 @@ def test_read_load_profile_via_call_home_streams_rows():
 
     assert len(decoded) == 4
     for i, (timestamp, values) in enumerate(decoded):
-        assert timestamp == from_dt + timedelta(seconds=capture_period_seconds * i)
+        assert timestamp == from_dt + timedelta(minutes=i)
         assert values == [5000 + i]
 
 
@@ -659,10 +647,9 @@ def test_read_load_profile_normalizes_class_id_zero_to_profile_generic():
     addr6 = bytes.fromhex("522300012020")
     password = b"12345678"
     obis = "1.1.63.1.0.ff"
-    capture_period_seconds = 900
     from_dt = datetime(2026, 8, 1)
     to_dt = datetime(2026, 8, 19)
-    rows = [[datatypes.encode_double_long_unsigned(5000 + i)] for i in range(2)]
+    rows = [(from_dt + timedelta(minutes=i), [(float(5000 + i), 4, 0)]) for i in range(2)]
     class_ids_seen: list = []
 
     pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10)
@@ -673,8 +660,7 @@ def test_read_load_profile_normalizes_class_id_zero_to_profile_generic():
             target=_run_fake_meter_load_profile,
             kwargs=dict(
                 conn=client_conn, addr6=addr6, password=password,
-                load_profile_obis=dlms.parse_obis(obis), rows=rows,
-                capture_period_seconds=capture_period_seconds, block_size=6,
+                load_profile_obis=dlms.parse_obis(obis), rows=rows, block_size=6,
                 class_ids_seen=class_ids_seen,
             ),
             daemon=True,

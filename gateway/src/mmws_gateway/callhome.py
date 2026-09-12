@@ -161,6 +161,15 @@ CAPTURE_OBJECTS_DIAGNOSTIC_SERIALS: set[str] = set()
 # счётчика, только для точечного эксперимента.
 CAPTURE_OBJECTS_DIAGNOSTIC_PASSWORDS: dict[str, str] = {}
 
+# 2026-09-12 — тот же принцип, для проверки самого GET диапазона (не
+# capture_objects) без гонки с job_worker.worker_loop — читает пароль из
+# CAPTURE_OBJECTS_DIAGNOSTIC_PASSWORDS (общий словарь). Эксперимент нашёл
+# и исправил реальные баги (selected_values, invoke_id, длина датаблока,
+# BCD-формат строк буфера — см. DECISIONS.md) — множество снова пусто,
+# обычный событийный путь (``_maybe_trigger_immediate_read``) теперь
+# должен читать профиль нагрузки без обхода.
+LOAD_PROFILE_RANGE_DIAGNOSTIC_SERIALS: set[str] = set()
+
 _DLT645_START = 0x68
 
 
@@ -596,6 +605,18 @@ class CallHomePool:
             self._run_capture_objects_diagnostic(pc)
             return
 
+        if pc.serial in LOAD_PROFILE_RANGE_DIAGNOSTIC_SERIALS:
+            # 2026-09-12 — тот же принцип, но тестирует сам GET диапазона
+            # (не capture_objects): реальный job read_load_profile через
+            # job_worker race'ится со старым FIFO-воркером (опрос раз в
+            # ~1с) почти на каждой попытке, что делает живую проверку
+            # реального selected_values-фикса (см. DECISIONS.md,
+            # DTZY217_LOAD_PROFILE_CAPTURE_OBJECTS) непрактичной через
+            # job'ы — читаем буфер НАПРЯМУЮ на каждом дозвоне, минуя
+            # очередь целиком.
+            self._run_load_profile_range_diagnostic(pc)
+            return
+
         # Событийное чтение сразу при подключении (2026-09-09, см.
         # DECISIONS.md и план ticklish-popping-bear.md) — единственный
         # момент, когда есть реальный шанс успеть SNRM/AARQ/GET до
@@ -758,6 +779,74 @@ class CallHomePool:
         except Exception:
             logger.exception(
                 "Диагностика capture_objects: неожиданная ошибка при обработке соединения #%d", pc.conn_no,
+            )
+
+    def _run_load_profile_range_diagnostic(self, pc: _PooledConnection) -> None:
+        """2026-09-12 (по просьбе пользователя — SSH-доступ к
+        192.168.144.79, реальный ``selected_values`` найден в
+        DataReadScheme.ini рабочего IECMeterManage.exe, см. DECISIONS.md
+        и ``dlms.DTZY217_LOAD_PROFILE_CAPTURE_OBJECTS``) — читает сам
+        буфер профиля (GET с диапазоном) НАПРЯМУЮ на каждом дозвоне,
+        минуя очередь job'ов целиком: обычный ``read_load_profile`` job
+        через ``job_worker`` слишком часто проигрывает гонку старому
+        FIFO-воркеру (опрос раз в ~1с) за право забрать job, оставляя
+        событийный путь (и тем самым — фикс) непроверенным раз за разом.
+        Диапазон дат — последние 3 часа от текущего момента (не важен
+        для проверки самого протокольного обмена)."""
+        try:
+            password = CAPTURE_OBJECTS_DIAGNOSTIC_PASSWORDS.get(pc.serial)
+            if not password:
+                logger.warning(
+                    "Диагностика профиля (диапазон): нет пароля в CAPTURE_OBJECTS_DIAGNOSTIC_PASSWORDS для %s",
+                    pc.serial,
+                )
+                return
+            password_bytes = password.encode("ascii")
+
+            with self._lock:
+                if self._pool.get(pc.conn_no) is not pc:
+                    return
+                del self._pool[pc.conn_no]
+
+            from datetime import datetime, timedelta
+
+            to_dt = datetime.now()
+            from_dt = to_dt - timedelta(hours=3)
+            try:
+                # association_timeout_ms увеличен со стандартных 45с до
+                # 150с (2026-09-12, живая проверка): с реальным
+                # selected_values (10 объектов) первые 3 попытки дали
+                # честный TIMEOUT (тишина) вместо прежнего быстрого
+                # data-access-result=250 — возможная причина: счётчику
+                # нужно больше времени на бОльший/сложнее запрос.
+                rows, error = read_load_profile_via_fresh_connection(
+                    pc, serial=pc.serial, password=password_bytes,
+                    obis="1.1.63.1.0.ff", class_id=7, from_dt=from_dt, to_dt=to_dt,
+                    association_timeout_ms=150000,
+                )
+                if error is None:
+                    logger.warning(
+                        "Диагностика профиля (диапазон, %s): УСПЕХ, %d строк: %r",
+                        pc.serial, len(rows), rows[:3],
+                    )
+                else:
+                    logger.warning(
+                        "Диагностика профиля (диапазон, %s): ошибка %s (%s), собрано строк: %d",
+                        pc.serial, error.code, error.message, len(rows),
+                    )
+            except Exception as exc:  # noqa: BLE001 — любой исход интересен для диагностики
+                logger.warning(
+                    "Диагностика профиля (диапазон, %s): исключение %s: %s",
+                    pc.serial, type(exc).__name__, exc,
+                )
+            finally:
+                try:
+                    pc.raw_sock.close()
+                except OSError:
+                    pass
+        except Exception:
+            logger.exception(
+                "Диагностика профиля (диапазон): неожиданная ошибка при обработке соединения #%d", pc.conn_no,
             )
 
     def _maybe_trigger_immediate_read(self, pc: _PooledConnection) -> None:

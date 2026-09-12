@@ -16,20 +16,21 @@ from mmws_gateway import grpc_server
 from mmws_gateway.emulators.common import ConnectionCounter, ErrorInjection, ThreadedEmulatorServer
 from mmws_gateway.emulators.hdlc_dlms_emulator import make_hdlc_dlms_handler
 from mmws_gateway.grpc_generated import gateway_pb2, gateway_pb2_grpc
-from mmws_gateway.protocols import datatypes, dlms
+from mmws_gateway.protocols import dlms
 
 SERIAL = "202006003607"
 PASSWORD = "12345678"
 LOAD_PROFILE_OBIS = "1.1.63.1.0.ff"  # см. test_load_profile.py — decimal 1-1:99.1.0.255 в hex-нотации
-CAPTURE_PERIOD_SECONDS = 900
 FROM_DT = datetime(2026, 8, 1)
 
 
-def _row(value: int) -> list[bytes]:
-    return [datatypes.encode_double_long_unsigned(value)]
+def _row(index: int, value: int) -> tuple[datetime, list[tuple[float, int, int]]]:
+    return FROM_DT + timedelta(minutes=index), [(float(value), 4, 0)]
 
 
-def _start_emulator(rows: list[list[bytes]], *, block_size: int) -> ThreadedEmulatorServer:
+def _start_emulator(
+    rows: list[tuple[datetime, list[tuple[float, int, int]]]], *, block_size: int
+) -> ThreadedEmulatorServer:
     counter = ConnectionCounter()
     handler = make_hdlc_dlms_handler(
         password=PASSWORD.encode("ascii"),
@@ -39,7 +40,6 @@ def _start_emulator(rows: list[list[bytes]], *, block_size: int) -> ThreadedEmul
         load_profile_obis=dlms.parse_obis(LOAD_PROFILE_OBIS),
         load_profile_rows=rows,
         load_profile_block_size=block_size,
-        load_profile_capture_period_seconds=CAPTURE_PERIOD_SECONDS,
     )
     return ThreadedEmulatorServer(handler)
 
@@ -58,7 +58,7 @@ def _free_port() -> int:
 
 
 def test_read_load_profile_streams_rows_over_grpc():
-    rows = [_row(3000 + h) for h in range(5)]
+    rows = [_row(h, 3000 + h) for h in range(5)]
     grpc_port = _free_port()
 
     with _start_emulator(rows, block_size=12) as emulator:  # маленький block_size — форсирует блочную передачу
@@ -85,7 +85,7 @@ def test_read_load_profile_streams_rows_over_grpc():
     assert len(responses) == 5
     for i, response in enumerate(responses):
         assert response.WhichOneof("result") == "row"
-        expected_ts = FROM_DT + timedelta(seconds=CAPTURE_PERIOD_SECONDS * i)
+        expected_ts = FROM_DT + timedelta(minutes=i)
         assert response.row.timestamp_iso == expected_ts.isoformat()
         (value,) = json.loads(response.row.values_json)
         assert value == 3000 + i

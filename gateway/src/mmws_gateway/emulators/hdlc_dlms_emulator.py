@@ -31,9 +31,8 @@ def make_hdlc_dlms_handler(
     counter: ConnectionCounter,
     data_values: dict[bytes, bytes] | None = None,
     load_profile_obis: bytes | None = None,
-    load_profile_rows: list[list[bytes]] | None = None,
+    load_profile_rows: list[tuple[object, list[tuple[float, int, int]]]] | None = None,
     load_profile_block_size: int = 40,
-    load_profile_capture_period_seconds: int = 900,
     register_scalers: dict[bytes, int] | None = None,
     register_units: dict[bytes, int] | None = None,
     action_state: dict[bytes, int] | None = None,
@@ -48,20 +47,20 @@ def make_hdlc_dlms_handler(
     словарь, переданный вызывающим тестом, чтобы проверить, что именно
     было записано.
 
-    ``load_profile_obis``/``load_profile_rows`` (Этап 3) — эмуляция
-    буфера профиля нагрузки: каждая строка ``load_profile_rows`` — уже
-    закодированный список колонок (см. ``datatypes.encode_*``, БЕЗ
-    колонки-метки времени — реальный буфер её не захватывает, см.
-    DECISIONS.md 2026-08-19), оборачивается в structure и отдаётся
-    ВСЕГДА через датаблоки (по ``load_profile_block_size`` байт на
-    датаблок — специально маленький по умолчанию, чтобы гарантированно
+    ``load_profile_obis``/``load_profile_rows`` (Этап 3, переработано
+    2026-09-12 — см. DECISIONS.md, реальные байтовые трассы 4 успешных
+    сеансов IECMeterManage.exe) — эмуляция буфера профиля нагрузки:
+    каждый элемент ``load_profile_rows`` — ``(timestamp, fields)``,
+    закодированные через ``dlms.encode_load_profile_row`` (собственный
+    BCD-формат этой модели счётчика — метка времени встроена в каждую
+    строку, отдельного GET атрибута 4/capture_period больше нет).
+    Отдаётся ВСЕГДА через датаблоки (по ``load_profile_block_size`` байт
+    на датаблок — специально маленький по умолчанию, чтобы гарантированно
     проверить склейку нескольких датаблоков в тестах), не через
     GET.response-Normal. Реальная фильтрация по диапазону дат не
     эмулируется — отдаются все строки целиком, диапазон в запросе не
     проверяется (эмулятор нужен для проверки МЕХАНИЗМА блочной
-    передачи, не бизнес-логики счётчика). Перед этим запросом Gateway
-    сначала читает атрибут 4 (capture_period) обычным GET без
-    access-selection — эмулятор отвечает ``load_profile_capture_period_seconds``.
+    передачи, не бизнес-логики счётчика).
 
     ``action_state`` (Этап 5) — если задан, каждый обработанный
     ACTION.request записывает в него ``{obis: method_id}``, чтобы тест
@@ -95,7 +94,6 @@ def make_hdlc_dlms_handler(
             load_profile_obis=load_profile_obis,
             load_profile_rows=load_profile_rows,
             load_profile_block_size=load_profile_block_size,
-            load_profile_capture_period_seconds=load_profile_capture_period_seconds,
             register_scalers=register_scalers,
             register_units=register_units,
             action_state=action_state,
@@ -114,9 +112,8 @@ def serve_hdlc_dlms_session(
     attempt: int,
     data_values: dict[bytes, bytes] | None = None,
     load_profile_obis: bytes | None = None,
-    load_profile_rows: list[list[bytes]] | None = None,
+    load_profile_rows: list[tuple[object, list[tuple[float, int, int]]]] | None = None,
     load_profile_block_size: int = 40,
-    load_profile_capture_period_seconds: int = 900,
     register_scalers: dict[bytes, int] | None = None,
     register_units: dict[bytes, int] | None = None,
     action_state: dict[bytes, int] | None = None,
@@ -166,37 +163,6 @@ def serve_hdlc_dlms_session(
             rows=load_profile_rows or [], block_size=load_profile_block_size,
         )
         return
-
-    if is_load_profile_obis and payload[11] == dlms.PROFILE_GENERIC_CAPTURE_PERIOD_ATTRIBUTE:
-        # Gateway читает capture_period ДО запроса диапазона (обычный
-        # GET без access-selection) — см. hdlc_dlms.read_load_profile.
-        info = dlms.build_get_response_data(
-            payload[2],
-            datatypes.encode_double_long_unsigned(load_profile_capture_period_seconds),
-        )
-        response_frame = HdlcFrame(
-            destination=req_frame.source,
-            source=req_frame.destination,
-            control=control_information_frame(1, 2),
-            information=dlms.wrap_llc_response(info),
-        )
-        conn.sendall(response_frame.encode())
-        req_frame = HdlcFrame.decode(_read_frame(conn))
-        payload = dlms.unwrap_llc(req_frame.information)
-        tag = payload[0] if payload else None
-        has_access_selection = len(payload) > 12 and payload[12] == 0x01
-        if (
-            load_profile_obis is not None
-            and tag == dlms.GET_REQUEST_TAG
-            and has_access_selection
-            and payload[5:11] == load_profile_obis
-        ):
-            _serve_load_profile(
-                conn, req_frame, invoke_id=payload[2],
-                rows=load_profile_rows or [], block_size=load_profile_block_size,
-                send_seq=2, recv_seq=3,
-            )
-            return
 
     if tag == dlms.ACTION_REQUEST_TAG:
         action_request = dlms.parse_action_request(payload)
@@ -335,7 +301,7 @@ def _serve_load_profile(
     req_frame: HdlcFrame,
     *,
     invoke_id: int,
-    rows: list[list[bytes]],
+    rows: list[tuple[object, list[tuple[float, int, int]]]],
     block_size: int,
     send_seq: int = 1,
     recv_seq: int = 2,
@@ -345,20 +311,21 @@ def _serve_load_profile(
     PDU) — намеренно упрощённая, но специально проверяющая механизм
     склейки нескольких датаблоков и GET.request-Next в
     ``hdlc_dlms.read_load_profile``. ``send_seq``/``recv_seq`` — с какого
-    номера кадра начинать (по умолчанию сразу после AARE — 1,2; если
-    перед этим уже был отдельный ответ на GET capture_period, вызывающий
-    код передаёт следующие по порядку номера)."""
-    array_bytes = datatypes.encode_array(
-        [datatypes.encode_structure(row) for row in rows]
-    )
+    номера кадра начинать (по умолчанию сразу после AARE — 1,2).
+
+    2026-09-12 — строки кодируются собственным BCD-форматом этой модели
+    счётчика (``dlms.encode_load_profile_row``, маркер ``A0 A0`` +
+    встроенная метка времени), не стандартным DLMS array-of-structure
+    (см. DECISIONS.md)."""
+    all_bytes = b"".join(dlms.encode_load_profile_row(ts, fields) for ts, fields in rows)
 
     offset = 0
     block_number = 0
     while True:
         block_number += 1
-        chunk = array_bytes[offset : offset + block_size]
+        chunk = all_bytes[offset : offset + block_size]
         offset += len(chunk)
-        last_block = offset >= len(array_bytes)
+        last_block = offset >= len(all_bytes)
 
         info = dlms.build_get_response_datablock(
             invoke_id, last_block=last_block, block_number=block_number, raw_data=chunk

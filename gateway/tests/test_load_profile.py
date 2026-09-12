@@ -1,8 +1,7 @@
 """Интеграционные тесты профиля нагрузки (Этап 3, ТЗ п.4.2.3) против
-программного эмулятора — SNRM/UA + AARQ/AARE + GET capture_period + GET
-с выборкой по датам, блочная передача (GET.response-with-datablock +
-GET.request-Next) и инкрементальная сборка строк в
-hdlc_dlms.read_load_profile.
+программного эмулятора — SNRM/UA + AARQ/AARE + GET с выборкой по датам,
+блочная передача (GET.response-with-datablock + GET.request-Next) и
+инкрементальная сборка строк в hdlc_dlms.read_load_profile.
 
 DLMS-адрес профиля нагрузки — decimal-нотация 1-1:99.1.0.255 (IEC
 62056-6-2, канал 1, class 7) — подтверждено экспортом реальной
@@ -10,10 +9,16 @@ DLMS-адрес профиля нагрузки — decimal-нотация 1-1:9
 2026-08-19, см. DECISIONS.md). В проекте OBIS-коды пишутся в
 HEX-нотации (см. правило конвертации decimal->hex по полям,
 DECISIONS.md, «Этап 2, итерация 3»), поэтому decimal C=99 -> "63",
-F=255 -> "ff": итоговая строка "1.1.63.1.0.ff". Буфер НЕ захватывает
-объект Clock — строки не несут метку времени сами по себе, Gateway
-вычисляет её из отдельно прочитанного capture_period (см.
-hdlc_dlms.read_load_profile)."""
+F=255 -> "ff": итоговая строка "1.1.63.1.0.ff".
+
+2026-09-12 (реальные байтовые трассы 4 успешных сеансов
+IECMeterManage.exe, предоставленные пользователем, см. DECISIONS.md) —
+буфер этой модели счётчика НЕ кодируется стандартным DLMS array-of-
+structure: каждая строка несёт СОБСТВЕННУЮ метку времени (см.
+``dlms.decode_load_profile_row`` — маркер ``A0 A0`` + BCD-поля). Более
+ранняя находка ("буфер не включает Clock, метка времени вычисляется из
+отдельного GET capture_period") была ошибочной — отдельного GET
+capture_period больше нет."""
 
 import socket
 
@@ -31,17 +36,18 @@ SERIAL = "202006003607"
 PASSWORD = b"12345678"
 LOAD_PROFILE_OBIS = "1.1.63.1.0.ff"
 LOAD_PROFILE_CLASS_ID = 7
-CAPTURE_PERIOD_SECONDS = 900
 FROM_DT = datetime(2026, 8, 1)
 TO_DT = datetime(2026, 8, 19)
 
 
-def _row(value: int) -> list[bytes]:
-    return [datatypes.encode_double_long_unsigned(value)]
+def _row(index: int, value: int) -> tuple[datetime, list[tuple[float, int, int]]]:
+    """Строка с единственной колонкой (4 байта, 0 знаков после запятой) —
+    метка времени встроена в саму строку (реальный формат, см. модуль)."""
+    return FROM_DT + timedelta(minutes=index), [(float(value), 4, 0)]
 
 
 def _start_server(
-    rows: list[list[bytes]], *, block_size: int, capture_period_seconds: int = CAPTURE_PERIOD_SECONDS
+    rows: list[tuple[datetime, list[tuple[float, int, int]]]], *, block_size: int
 ) -> ThreadedEmulatorServer:
     counter = ConnectionCounter()
     handler = make_hdlc_dlms_handler(
@@ -52,7 +58,6 @@ def _start_server(
         load_profile_obis=dlms.parse_obis(LOAD_PROFILE_OBIS),
         load_profile_rows=rows,
         load_profile_block_size=block_size,
-        load_profile_capture_period_seconds=capture_period_seconds,
     )
     return ThreadedEmulatorServer(handler)
 
@@ -79,25 +84,25 @@ def test_single_datablock_round_trip():
     равно проходят через код датаблочной ветки (эмулятор Этапа 3 не
     отдаёт GET.response-Normal для профиля нагрузки, см. docstring
     ``_serve_load_profile``)."""
-    rows = [_row(1000 + h) for h in range(3)]
+    rows = [_row(h, 1000 + h) for h in range(3)]
     with _start_server(rows, block_size=4096) as server:
         decoded = _read_all(server)
 
     assert len(decoded) == 3
     for i, (timestamp, values) in enumerate(decoded):
-        assert timestamp == FROM_DT + timedelta(seconds=CAPTURE_PERIOD_SECONDS * i)
+        assert timestamp == FROM_DT + timedelta(minutes=i)
         assert values == [1000 + i]
 
 
 def test_multi_datablock_round_trip_forces_block_transfer():
-    """Маленький block_size гарантированно рвёт закодированный массив
-    строк на несколько датаблоков — проверяет склейку через
-    GET.request-Next и инкрементальное декодирование строк по мере
-    накопления байт (см. hdlc_dlms.read_load_profile)."""
-    rows = [_row(2000 + h) for h in range(10)]
-    encoded_len = len(
-        datatypes.encode_array([datatypes.encode_structure(r) for r in rows])
-    )
+    """Маленький block_size гарантированно рвёт закодированные строки на
+    несколько датаблоков (в т.ч. посреди одной строки — маркер ``A0 A0``
+    может оказаться разрезан пополам между двумя датаблоками) —
+    проверяет склейку через GET.request-Next и инкрементальное
+    декодирование строк по мере накопления байт (см. hdlc_dlms.
+    read_load_profile)."""
+    rows = [_row(h, 2000 + h) for h in range(10)]
+    encoded_len = sum(len(dlms.encode_load_profile_row(ts, fields)) for ts, fields in rows)
     block_size = 6  # заведомо меньше одной строки — несколько датаблоков на строку
     assert encoded_len > block_size * 3  # сверяем, что тест действительно форсирует блочную передачу
 
@@ -106,7 +111,7 @@ def test_multi_datablock_round_trip_forces_block_transfer():
 
     assert len(decoded) == 10
     for i, (timestamp, values) in enumerate(decoded):
-        assert timestamp == FROM_DT + timedelta(seconds=CAPTURE_PERIOD_SECONDS * i)
+        assert timestamp == FROM_DT + timedelta(minutes=i)
         assert values == [2000 + i]
 
 
@@ -229,26 +234,26 @@ def test_read_profile_capture_objects_follows_datablock_transfer():
             )
 
     assert decoded == [[3, bytes([1, 1, 1, 8, 0, 0xFF]), 2, 0]]
-    # 2026-09-12 (по просьбе пользователя "покопай ver2.zip, он же
-    # работает") — GET.request-Next несёт НАРАСТАЮЩИЙ invoke_id, а не
-    # тот же самый, что у исходного GET (см. DECISIONS.md: побайтовый
-    # разбор TpDLMS.cs::organizeFrame_GetLoadProfile показал, что
-    # meter.incInvokeId() вызывается перед КАЖДЫМ GET, включая Next).
-    assert captured["next_invoke_id"] == captured["original_invoke_id"] + 1
+    # 2026-09-12 (реальные байтовые трассы 4 успешных сеансов
+    # IECMeterManage.exe, предоставленные пользователем, см. DECISIONS.md)
+    # ОПРОВЕРГЛИ более раннюю находку "invoke_id нарастает у Next" —
+    # ~130 кадров Get-Request-Next во всех 4 трассах несут ТОТ ЖЕ
+    # invoke_id, что и исходный GET.
+    assert captured["next_invoke_id"] == captured["original_invoke_id"]
 
 
-def test_read_load_profile_get_request_next_uses_incrementing_invoke_id():
-    """2026-09-12 (по просьбе пользователя "покопай ver2.zip, он же
-    работает") — тот же фикс, что и для capture_objects, но для
-    основного чтения буфера (``read_load_profile_via_established_link``).
-    Ручной сервер (общий эмулятор ``_serve_load_profile`` не годится —
-    он не проверяет и не отдаёт invoke_id из входящего Next), полный
-    сценарий: capture_period (invoke_id=1) -> GET-диапазон (invoke_id=2)
-    -> датаблок 1 -> Next (ожидаем invoke_id=3, было бы 2 до фикса) ->
-    датаблок 2."""
-    rows = [_row(3000), _row(3001)]
-    array_bytes = datatypes.encode_array([datatypes.encode_structure(r) for r in rows])
-    mid = len(array_bytes) // 2
+def test_read_load_profile_get_request_next_reuses_invoke_id():
+    """2026-09-12 (реальные байтовые трассы 4 успешных сеансов
+    IECMeterManage.exe, предоставленные пользователем, см. DECISIONS.md)
+    — тот же фикс, что и для capture_objects, но для основного чтения
+    буфера (``read_load_profile_via_established_link``). Ручной сервер
+    (общий эмулятор ``_serve_load_profile`` не годится — он не проверяет
+    и не отдаёт invoke_id из входящего Next), сценарий: GET-диапазон
+    (invoke_id=1) -> датаблок 1 -> Next (ожидаем ТОТ ЖЕ invoke_id=1) ->
+    датаблок 2. Отдельного GET capture_period больше нет (см. модуль)."""
+    rows = [_row(0, 3000), _row(1, 3001)]
+    all_bytes = b"".join(dlms.encode_load_profile_row(ts, fields) for ts, fields in rows)
+    mid = len(all_bytes) // 2
     captured: dict = {}
 
     def handler(conn: socket.socket) -> None:
@@ -264,28 +269,17 @@ def test_read_load_profile_get_request_next_uses_incrementing_invoke_id():
         )
         conn.sendall(aare_frame.encode())
 
-        period_frame = HdlcFrame.decode(_read_frame(conn))
-        period_payload = dlms.unwrap_llc(period_frame.information)
-        period_info = dlms.build_get_response_data(
-            period_payload[2], datatypes.encode_double_long_unsigned(CAPTURE_PERIOD_SECONDS),
-        )
-        period_response = HdlcFrame(
-            destination=period_frame.source, source=period_frame.destination,
-            control=control_information_frame(1, 2), information=dlms.wrap_llc_response(period_info),
-        )
-        conn.sendall(period_response.encode())
-
         range_frame = HdlcFrame.decode(_read_frame(conn))
         range_payload = dlms.unwrap_llc(range_frame.information)
         range_invoke_id = range_payload[2]
         captured["range_invoke_id"] = range_invoke_id
 
         block1 = dlms.build_get_response_datablock(
-            range_invoke_id, last_block=False, block_number=1, raw_data=array_bytes[:mid],
+            range_invoke_id, last_block=False, block_number=1, raw_data=all_bytes[:mid],
         )
         frame1 = HdlcFrame(
             destination=range_frame.source, source=range_frame.destination,
-            control=control_information_frame(2, 3), information=dlms.wrap_llc_response(block1),
+            control=control_information_frame(1, 2), information=dlms.wrap_llc_response(block1),
         )
         conn.sendall(frame1.encode())
 
@@ -294,11 +288,11 @@ def test_read_load_profile_get_request_next_uses_incrementing_invoke_id():
         captured["next_invoke_id"] = next_payload[2]
 
         block2 = dlms.build_get_response_datablock(
-            range_invoke_id, last_block=True, block_number=2, raw_data=array_bytes[mid:],
+            range_invoke_id, last_block=True, block_number=2, raw_data=all_bytes[mid:],
         )
         frame2 = HdlcFrame(
             destination=next_frame.source, source=next_frame.destination,
-            control=control_information_frame(3, 4), information=dlms.wrap_llc_response(block2),
+            control=control_information_frame(2, 3), information=dlms.wrap_llc_response(block2),
         )
         conn.sendall(frame2.encode())
 
@@ -314,4 +308,4 @@ def test_read_load_profile_get_request_next_uses_incrementing_invoke_id():
             )
 
     assert len(decoded) == 2
-    assert captured["next_invoke_id"] == captured["range_invoke_id"] + 1
+    assert captured["next_invoke_id"] == captured["range_invoke_id"]

@@ -158,13 +158,11 @@ PROFILE_GENERIC_CLASS_ID = 7  # буфер профиля нагрузки (Эт
 PROFILE_GENERIC_CAPTURE_PERIOD_ATTRIBUTE = 4
 # Атрибут 3 (capture_objects) — список фактически захватываемых колонок
 # буфера (каждый элемент: class_id, logical_name, attribute_index,
-# data_index) — 2026-09-12, диагностика причины data-access-error=250 на
-# GET с access-selection=range-descriptor (см. DECISIONS.md): побайтовый
-# разбор декомпилированного TpDLMS.cs::organizeFrame_GetLoadProfile
-# показал, что рабочий референс указывает в selected_values ОДИН
-# конкретный объект-колонку, а не пустой список ("верни всё") — узнать
-# реальные колонки вместо угадывания можно этим же атрибутом, обычным
-# GET без access-selection (как и capture_period).
+# data_index). Диагностический GET без access-selection (как и
+# capture_period) — реальные трассы 2026-09-12 показали, что рабочий
+# референс читает этот атрибут отдельно для СПРАВКИ, но НЕ подставляет
+# результат в selected_values GET-диапазона (см. DECISIONS.md и
+# ``build_get_request_range``).
 PROFILE_GENERIC_CAPTURE_OBJECTS_ATTRIBUTE = 3
 
 
@@ -556,6 +554,17 @@ DATABLOCK_RESULT_RAW_DATA = 0x00
 DATABLOCK_RESULT_DATA_ACCESS_ERROR = 0x01
 
 
+# 2026-09-12 (по просьбе пользователя — SSH-доступ к рабочему
+# 2026-09-12 — раньше здесь был захардкожен список capture_objects,
+# найденный через SSH в DataReadScheme.ini референсной системы, и
+# подставлялся в ``selected_values`` GET-диапазона. Реальные байтовые
+# трассы 4 успешных сеансов IECMeterManage.exe (предоставлены
+# пользователем, см. DECISIONS.md) показали: рабочий референс шлёт
+# ``selected_values`` ПУСТЫМ всегда — список удалён, использовать его
+# для этой цели было ошибкой (см. ``build_get_request_range`` и
+# ``hdlc_dlms.read_load_profile_via_established_link``).
+
+
 def build_get_request_range(
     obis: bytes,
     *,
@@ -564,6 +573,7 @@ def build_get_request_range(
     to_dt,
     invoke_id: int = 1,
     attribute_id: int = REGISTER_VALUE_ATTRIBUTE,
+    selected_values: list[tuple[int, bytes, int, int]] | None = None,
 ) -> bytes:
     """GET.request-Normal с access-selection=range-descriptor — просит
     у счётчика только записи буфера профиля нагрузки за ``[from_dt,
@@ -580,18 +590,25 @@ def build_get_request_range(
     прямое свидетельство, что прошивка счётчика не разбирает дату,
     завёрнутую в octet-string.
 
-    ``restricting_object`` (2026-09-12, тот же повод) — снова структура-
-    ссылка на объект Clock (класс 8, OBIS 0.0.1.0.0.255, атрибут 2), а
-    НЕ ``NULL-DATA`` (см. запись 2026-09-10 в DECISIONS.md — тогда её
-    заменили на NULL, но тот эксперимент использовал СТАРУЮ кодировку
-    дат через octet-string; живая проверка 2026-09-12 показала, что
-    ``NULL + date_time`` даёт ТОТ ЖЕ САМЫЙ data-access-result=250, что
-    и раньше — то есть настоящая причина отказа, возможно, вообще не в
-    ``restricting_object``, а сочетание "Clock-ссылка + правильная
-    кодировка дат" — единственная комбинация, которую наша реализация
-    ещё не пробовала (легаси ``RS_``-патч меняет ТОЛЬКО кодировку дат,
-    оставляя Gurux.DLMS's Clock-ссылку по умолчанию нетронутой) — пока
-    не проверена."""
+    ``restricting_object`` (2026-09-12, тот же повод) — структура-ссылка
+    на объект Clock (класс 8, OBIS 0.0.1.0.0.255, атрибут 2, data_index
+    0), а НЕ ``NULL-DATA`` (см. запись 2026-09-10 в DECISIONS.md — тогда
+    её заменили на NULL, но тот эксперимент использовал СТАРУЮ кодировку
+    дат через octet-string). 2026-09-12 (реальные байтовые трассы 4
+    сеансов IECMeterManage.exe, предоставленные пользователем, см.
+    DECISIONS.md) подтвердили ЧЕТЫРЁХпольную структуру (раньше кодировали
+    только 3 поля, без ``data_index``) — ``[class_id, obis, attribute_id,
+    data_index=0]``.
+
+    ``selected_values`` (2026-09-12) — список ``(class_id, obis,
+    attribute_index, data_index)``, каждый кодируется как структура из 4
+    элементов; ``None``/пустой список (умолчание) — "верни все колонки".
+    Те же реальные трассы 2026-09-12 показали: рабочий референс ВСЕГДА
+    посылает здесь пустой массив, даже когда он же отдельным GET атрибута
+    3 (capture_objects) уже знает список колонок — параметр оставлен для
+    общности API, но использовать его для профиля нагрузки DTZY217 не
+    нужно (см. отмену в ``hdlc_dlms.read_load_profile_via_established_
+    link`` и DECISIONS.md)."""
     if len(obis) != 6:
         raise GatewayError("OBIS для GET.request должен быть ровно 6 байт")
     descriptor = class_id.to_bytes(2, "big") + obis + bytes([attribute_id])
@@ -600,12 +617,21 @@ def build_get_request_range(
         datatypes.encode_long_unsigned(CLOCK_CLASS_ID),
         datatypes.encode_octet_string(CLOCK_OBIS),
         datatypes.encode_integer(2),
+        datatypes.encode_long_unsigned(0),
     ])
     from_value = datatypes.encode_date_time(from_dt)
     to_value = datatypes.encode_date_time(to_dt)
-    selected_values = datatypes.encode_array([])
+    selected_values_encoded = datatypes.encode_array([
+        datatypes.encode_structure([
+            datatypes.encode_long_unsigned(sel_class_id),
+            datatypes.encode_octet_string(sel_obis),
+            datatypes.encode_integer(sel_attribute_index),
+            datatypes.encode_long_unsigned(sel_data_index),
+        ])
+        for sel_class_id, sel_obis, sel_attribute_index, sel_data_index in (selected_values or [])
+    ])
     access_parameters = datatypes.encode_structure(
-        [restricting_object, from_value, to_value, selected_values]
+        [restricting_object, from_value, to_value, selected_values_encoded]
     )
     access_selection = bytes([0x01, RANGE_DESCRIPTOR_SELECTOR]) + access_parameters
 
@@ -622,21 +648,56 @@ def build_get_request_next(block_number: int, *, invoke_id: int = 1) -> bytes:
     return bytes([GET_REQUEST_TAG, GET_REQUEST_NEXT, invoke_id]) + block_number.to_bytes(4, "big")
 
 
+def _encode_ber_length(length: int) -> bytes:
+    """Длина в стандартной BER-кодировке DLMS: один байт (0..127) для
+    коротких значений, иначе байт ``0x80 | N`` (N — число следующих
+    байт длины) и сама длина, big-endian, в N байтах.
+
+    2026-09-12 (реальные байтовые трассы 4 успешных сеансов
+    IECMeterManage.exe, предоставленные пользователем, см. DECISIONS.md)
+    — раньше ``raw-data`` датаблока кодировалась/разбиралась ФИКСИРОВАННЫМИ
+    2 байтами длины всегда, что для датаблоков короче 128 байт (в т.ч.
+    для 1-го датаблока capture_objects, 110 байт) съедало на 1 байт
+    больше, чем счётчик реально передавал, — вся ``raw_data`` этого
+    датаблока смещалась на 1 байт и переставала разбираться. Датаблоки
+    ≥128 байт (128..255) случайно совпадали с этим допущением (BER для
+    них — ровно 2 байта: ``0x81`` + 1 байт длины), поэтому баг был
+    незаметен на типичных «полных» датаблоках."""
+    if length < 0x80:
+        return bytes([length])
+    if length <= 0xFF:
+        return bytes([0x81, length])
+    if length <= 0xFFFF:
+        return bytes([0x82]) + length.to_bytes(2, "big")
+    raise GatewayError("Датаблок длиннее 65535 байт не поддержан в Этапе 3")
+
+
+def _decode_ber_length(data: bytes, pos: int) -> tuple[int, int]:
+    """Обратная операция к ``_encode_ber_length`` — возвращает (длина,
+    позиция_после_поля_длины)."""
+    first = data[pos]
+    if first & 0x80 == 0:
+        return first, pos + 1
+    n = first & 0x7F
+    if n == 0 or pos + 1 + n > len(data):
+        raise GatewayError("Некорректное BER-поле длины датаблока")
+    length = int.from_bytes(data[pos + 1 : pos + 1 + n], "big")
+    return length, pos + 1 + n
+
+
 def build_get_response_datablock(
     invoke_id: int, *, last_block: bool, block_number: int, raw_data: bytes
 ) -> bytes:
     """Ответ-датаблок (используется эмулятором для проверки блочной
-    передачи). Длина ``raw_data`` — 2 байта (до 65535), а не общий 1-байтный
-    формат ``encode_octet_string`` — датаблок может быть заметно больше
-    127 байт."""
-    if len(raw_data) > 0xFFFF:
-        raise GatewayError("Датаблок длиннее 65535 байт не поддержан в Этапе 3")
+    передачи). Длина ``raw_data`` — стандартная BER-кодировка DLMS (см.
+    ``_encode_ber_length``), как у реальных счётчиков, а не фиксированные
+    2 байта, как было раньше."""
     return (
         bytes([GET_RESPONSE_TAG, GET_RESPONSE_WITH_DATABLOCK, invoke_id])
         + bytes([1 if last_block else 0])
         + block_number.to_bytes(4, "big")
         + bytes([DATABLOCK_RESULT_RAW_DATA])
-        + len(raw_data).to_bytes(2, "big")
+        + _encode_ber_length(len(raw_data))
         + raw_data
     )
 
@@ -657,9 +718,124 @@ def parse_get_response_datablock(data: bytes) -> DatablockResult:
     if result_choice == DATABLOCK_RESULT_DATA_ACCESS_ERROR:
         code = data[9] if len(data) > 9 else -1
         raise GatewayError(f"Счётчик вернул data-access-result={code} на датаблоке #{block_number}")
-    length = int.from_bytes(data[9:11], "big")
-    raw_data = data[11 : 11 + length]
+    length, data_start = _decode_ber_length(data, 9)
+    raw_data = data[data_start : data_start + length]
     return DatablockResult(last_block=last_block, block_number=block_number, raw_data=raw_data)
+
+
+# --- Буфер профиля нагрузки DTZY217 — собственный (не стандартный DLMS
+# common-data-type) построчный BCD-формат ---
+#
+# 2026-09-12 (реальные байтовые трассы 4 успешных сеансов
+# IECMeterManage.exe, предоставленные пользователем — счётчики
+# 202001002481/202004002987/202004003016/202004003111, см. DECISIONS.md)
+# — GET.response на атрибут 2 (buffer) объекта Profile Generic для этой
+# модели счётчика возвращает НЕ array-of-structure по стандартной
+# DLMS-кодировке common-data-types (``datatypes.decode_value``), а
+# собственный построчный формат, подтверждённый разбором декомпилированного
+# `TpDLMS.cs::organizeFrame_GetLoadProfile`/`parseSingleValue` и
+# `ReadLPDataForm_DLMS.cs::dateAnalysis`/`dataAnalysis` (`ver2.zip`) —
+# каждая строка:
+#   - маркер 0xA0 0xA0 (2 байта, разделитель строк — байты, которые не
+#     могут встретиться внутри BCD-данных, см. ниже);
+#   - метка времени: 6 байт, порядок байт ОБРАТНЫЙ (последний байт —
+#     первый), каждый байт — 2 BCD-цифры; с префиксом века "20" разбирается
+#     как yyyyMMddHHmmss;
+#   - далее поля захватываемых колонок (порядок — как в capture_objects,
+#     атрибут 3) до конца строки: один байт (старший ниббл — длина поля N
+#     в байтах, младший ниббл — количество знаков после запятой S), затем
+#     N байт значения в ОБРАТНОМ порядке байт, каждый байт — 2 BCD-цифры
+#     (ведущий ниббл "F" после разворота — отрицательное значение, а не
+#     цифра); значение = прочитанное как ДЕСЯТИЧНОЕ число / 10^S.
+# Проверено на реальных данных: значения выходят физически осмысленными
+# (напряжения ~255В, токи, cosφ 0.9-1.0, энергия — нарастающим итогом).
+LOAD_PROFILE_ROW_MARKER = b"\xa0\xa0"
+
+
+def split_load_profile_rows(buf: bytes) -> tuple[list[bytes], bytes]:
+    """Разбивает накопленный буфер профиля нагрузки на ЗАВЕРШЁННЫЕ строки
+    (по маркеру ``LOAD_PROFILE_ROW_MARKER``) и остаток, который ещё не
+    сложился в полную строку (нужно ждать следующий датаблок — либо, если
+    это последний датаблок, вызывающий код передаёт остаток сюда же ещё
+    раз с ``final=True`` по смыслу вызова — см. ``read_load_profile_via_
+    established_link``). Возвращает ``(строки, остаток)``; строка = все
+    байты МЕЖДУ соседними вхождениями маркера, включая начальный маркер."""
+    positions = []
+    start = 0
+    while True:
+        pos = buf.find(LOAD_PROFILE_ROW_MARKER, start)
+        if pos == -1:
+            break
+        positions.append(pos)
+        start = pos + 1
+    if len(positions) < 2:
+        return [], buf
+    rows = [buf[positions[i] : positions[i + 1]] for i in range(len(positions) - 1)]
+    return rows, buf[positions[-1] :]
+
+
+def _decode_bcd_reversed(raw: bytes) -> tuple[str, bool]:
+    digits = raw[::-1].hex()
+    negative = digits[:1].lower() == "f"
+    if negative:
+        digits = "0" + digits[1:]
+    return digits, negative
+
+
+def decode_load_profile_row(row: bytes) -> tuple[object, list[float]]:
+    """Разбирает ОДНУ строку буфера профиля нагрузки (с ведущим маркером
+    ``LOAD_PROFILE_ROW_MARKER``) в ``(datetime, [значения колонок])`` —
+    см. описание формата выше."""
+    from datetime import datetime
+
+    if len(row) < 8 or row[:2] != LOAD_PROFILE_ROW_MARKER:
+        raise GatewayError("Некорректная строка буфера профиля нагрузки (нет маркера A0 A0)")
+    digits, _ = _decode_bcd_reversed(row[2:8])
+    try:
+        timestamp = datetime.strptime("20" + digits, "%Y%m%d%H%M%S")
+    except ValueError as exc:
+        raise GatewayError(f"Некорректная метка времени строки буфера: {digits!r}") from exc
+    pos = 8
+    values: list[float] = []
+    while pos < len(row):
+        length_nibble = row[pos] >> 4
+        scale_nibble = row[pos] & 0x0F
+        pos += 1
+        if length_nibble == 0 or pos + length_nibble > len(row):
+            raise GatewayError("Строка буфера профиля нагрузки оборвана посреди поля значения")
+        digits, negative = _decode_bcd_reversed(row[pos : pos + length_nibble])
+        pos += length_nibble
+        value = int(digits) / (10**scale_nibble)
+        values.append(-value if negative else value)
+    return timestamp, values
+
+
+def encode_load_profile_row(timestamp, fields: list[tuple[float, int, int]]) -> bytes:
+    """Обратная операция к ``decode_load_profile_row`` — используется
+    тестовым эмулятором (реальный счётчик, естественно, ничего не
+    кодирует этой функцией). ``fields`` — список ``(значение, число_байт_
+    поля, число_знаков_после_запятой)`` в порядке колонок capture_objects."""
+
+    def _bcd_reversed(digit_str: str) -> bytes:
+        return bytes.fromhex(digit_str)[::-1]
+
+    date_digits = timestamp.strftime("%Y%m%d%H%M%S")
+    if date_digits[:2] != "20":
+        raise GatewayError("encode_load_profile_row поддерживает только XXI век")
+    out = bytearray(LOAD_PROFILE_ROW_MARKER)
+    out += _bcd_reversed(date_digits[2:])
+    for value, length, scale in fields:
+        negative = value < 0
+        scaled = round(abs(value) * (10**scale))
+        digit_str = str(scaled)
+        if len(digit_str) > length * 2:
+            raise GatewayError(f"Значение {value} не помещается в поле длиной {length} байт")
+        digit_str = digit_str.rjust(length * 2, "0")
+        if negative:
+            digit_str = "F" + digit_str[1:]
+        out.append((length << 4) | scale)
+        out += _bcd_reversed(digit_str)
+    return bytes(out)
 
 
 # --- ACTION-сервис (Этап 5, ТЗ п.4.2.10) — удалённое отключение/
