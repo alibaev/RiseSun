@@ -311,19 +311,24 @@ def test_read_load_profile_get_request_next_reuses_invoke_id():
     assert captured["next_invoke_id"] == captured["range_invoke_id"]
 
 
-def test_read_load_profile_retries_next_with_incremented_invoke_id_on_no_long_get():
+def test_read_load_profile_switches_to_incrementing_invoke_id_on_no_long_get():
     """2026-09-12 (см. DECISIONS.md, "может надо отправить хардбит?" —
-    живая проверка сразу после этого эксперимента) — часть парка (как
+    живая проверка сразу после этого эксперимента, плюс первоисточник
+    Gurux.DLMS.Net::GXDLMS.cs — GetInvokeIDPriority/ReceiverReady,
+    настоящий переключатель AutoIncreaseInvokeID) — часть парка (как
     минимум партии 2018 и 2023 годов) отвечает честным отказом
     data-access-result=16 ("No Long Get Or Read In Progress") на
     константный invoke_id у Next, хотя партия 2020 года (см. тест выше)
-    на тот же константный invoke_id отвечает штатно. Разные прошивки —
-    разная конвенция. Сценарий: датаблок 1 -> Next(invoke_id=1) ->
-    отказ 16 -> ОДИН повтор Next(invoke_id=2) -> датаблок 2 (успех),
-    без потери уже собранных строк первого датаблока."""
-    rows = [_row(0, 3000), _row(1, 3001)]
+    на тот же константный invoke_id отвечает штатно. У настоящего
+    Gurux.DLMS.Net это не разовое восстановление, а режим на ВСЮ
+    операцию — при AutoIncreaseInvokeID=true инкремент происходит на
+    КАЖДОМ Next, а не только после отказа. Сценарий (3 датаблока):
+    датаблок 1 -> Next(invoke_id=1) -> отказ 16 -> повтор
+    Next(invoke_id=2) -> датаблок 2 (успех) -> Next ДОЛЖЕН сразу прийти
+    с invoke_id=3 (без нового отказа) -> датаблок 3 (последний)."""
+    rows = [_row(0, 3000), _row(1, 3001), _row(2, 3002)]
     all_bytes = b"".join(dlms.encode_load_profile_row(ts, fields) for ts, fields in rows)
-    mid = len(all_bytes) // 2
+    third = len(all_bytes) // 3
     captured: dict = {}
 
     def handler(conn: socket.socket) -> None:
@@ -344,7 +349,7 @@ def test_read_load_profile_retries_next_with_incremented_invoke_id_on_no_long_ge
         range_invoke_id = range_payload[2]
 
         block1 = dlms.build_get_response_datablock(
-            range_invoke_id, last_block=False, block_number=1, raw_data=all_bytes[:mid],
+            range_invoke_id, last_block=False, block_number=1, raw_data=all_bytes[:third],
         )
         frame1 = HdlcFrame(
             destination=range_frame.source, source=range_frame.destination,
@@ -371,13 +376,28 @@ def test_read_load_profile_retries_next_with_incremented_invoke_id_on_no_long_ge
         captured["retry_next_invoke_id"] = retry_payload[2]
 
         block2 = dlms.build_get_response_datablock(
-            retry_payload[2], last_block=True, block_number=2, raw_data=all_bytes[mid:],
+            retry_payload[2], last_block=False, block_number=2, raw_data=all_bytes[third : 2 * third],
         )
         frame2 = HdlcFrame(
             destination=retry_frame.source, source=retry_frame.destination,
             control=control_information_frame(3, 4), information=dlms.wrap_llc_response(block2),
         )
         conn.sendall(frame2.encode())
+
+        # Третий Next ДОЛЖЕН прийти уже с invoke_id+1 сразу, без ещё
+        # одного отказа 16 — режим должен был переключиться насовсем.
+        next2_frame = HdlcFrame.decode(_read_frame(conn))
+        next2_payload = dlms.unwrap_llc(next2_frame.information)
+        captured["second_next_invoke_id"] = next2_payload[2]
+
+        block3 = dlms.build_get_response_datablock(
+            next2_payload[2], last_block=True, block_number=3, raw_data=all_bytes[2 * third :],
+        )
+        frame3 = HdlcFrame(
+            destination=next2_frame.source, source=next2_frame.destination,
+            control=control_information_frame(4, 5), information=dlms.wrap_llc_response(block3),
+        )
+        conn.sendall(frame3.encode())
 
     with ThreadedEmulatorServer(handler) as server:
         config = TransportConfig(host=server.host, port=server.port, timeout_ms=1000, max_retries=1)
@@ -390,7 +410,105 @@ def test_read_load_profile_retries_next_with_incremented_invoke_id_on_no_long_ge
                 )
             )
 
-    assert len(decoded) == 2
+    assert len(decoded) == 3
     assert decoded[0][1] == [3000]
     assert decoded[1][1] == [3001]
+    assert decoded[2][1] == [3002]
     assert captured["retry_next_invoke_id"] == captured["first_next_invoke_id"] + 1
+    assert captured["second_next_invoke_id"] == captured["retry_next_invoke_id"] + 1
+
+
+def test_incrementing_invoke_id_wraps_at_4_bits_on_long_profile():
+    """2026-09-12 (см. DECISIONS.md, официальный исходник Gurux.DLMS.Net
+    — ``GXDLMSSettings.InvokeID`` строго 4-битное поле, сеттер бросает
+    исключение при значении больше 0xF, а ``GetInvokeIDPriority`` растит
+    его как ``(id + 1) & 0xF``) — в режиме "нарастающий" (после отказа
+    16) на длинном профиле (много датаблоков, что для суточного профиля
+    с 30-минутным интервалом — обычное дело) invoke_id обязан
+    ПЕРЕНОСИТЬСЯ через 0xF, а не расти неограниченно. 18 однострочных
+    датаблоков — с избытком хватает, чтобы пройти через перенос."""
+    n_rows = 18
+    rows = [_row(i, 3000 + i) for i in range(n_rows)]
+    row_bytes = [dlms.encode_load_profile_row(ts, fields) for ts, fields in rows]
+    captured_invoke_ids: list = []
+
+    def handler(conn: socket.socket) -> None:
+        snrm_frame = HdlcFrame.decode(_read_frame(conn))
+        ua = HdlcFrame(destination=snrm_frame.source, source=snrm_frame.destination, control=CONTROL_UA)
+        conn.sendall(ua.encode())
+
+        aarq_frame = HdlcFrame.decode(_read_frame(conn))
+        aare = dlms.build_aare(accepted=True)
+        aare_frame = HdlcFrame(
+            destination=aarq_frame.source, source=aarq_frame.destination,
+            control=control_information_frame(0, 1), information=dlms.wrap_llc_response(aare),
+        )
+        conn.sendall(aare_frame.encode())
+
+        range_frame = HdlcFrame.decode(_read_frame(conn))
+        range_payload = dlms.unwrap_llc(range_frame.information)
+
+        send_seq = 1
+        # Первый датаблок (не последний) — как исходный ответ на GET-диапазон.
+        block = dlms.build_get_response_datablock(
+            range_payload[2], last_block=False, block_number=1, raw_data=row_bytes[0],
+        )
+        frame = HdlcFrame(
+            destination=range_frame.source, source=range_frame.destination,
+            control=control_information_frame(send_seq, send_seq + 1), information=dlms.wrap_llc_response(block),
+        )
+        conn.sendall(frame.encode())
+        send_seq += 1
+
+        first = True
+        for i in range(1, n_rows):
+            next_frame = HdlcFrame.decode(_read_frame(conn))
+            next_payload = dlms.unwrap_llc(next_frame.information)
+            if first:
+                first = False
+                # Отказ 16 ровно один раз, на самый первый Next —
+                # переводит остаток передачи в "нарастающий" режим.
+                error_info = bytes(
+                    [dlms.GET_RESPONSE_TAG, dlms.GET_RESPONSE_WITH_DATABLOCK, next_payload[2], 0]
+                ) + (1).to_bytes(4, "big") + bytes([dlms.DATABLOCK_RESULT_DATA_ACCESS_ERROR, 16])
+                error_frame = HdlcFrame(
+                    destination=next_frame.source, source=next_frame.destination,
+                    control=control_information_frame(send_seq, send_seq + 1),
+                    information=dlms.wrap_llc_response(error_info),
+                )
+                conn.sendall(error_frame.encode())
+                send_seq += 1
+                next_frame = HdlcFrame.decode(_read_frame(conn))
+                next_payload = dlms.unwrap_llc(next_frame.information)
+            captured_invoke_ids.append(next_payload[2])
+            block = dlms.build_get_response_datablock(
+                next_payload[2], last_block=(i == n_rows - 1), block_number=i + 1, raw_data=row_bytes[i],
+            )
+            frame = HdlcFrame(
+                destination=next_frame.source, source=next_frame.destination,
+                control=control_information_frame(send_seq, send_seq + 1), information=dlms.wrap_llc_response(block),
+            )
+            conn.sendall(frame.encode())
+            send_seq += 1
+
+    with ThreadedEmulatorServer(handler) as server:
+        config = TransportConfig(host=server.host, port=server.port, timeout_ms=1000, max_retries=1)
+        with TcpTransport(config) as transport:
+            decoded = list(
+                hdlc_dlms.read_load_profile(
+                    transport, serial=SERIAL, password=PASSWORD,
+                    obis=LOAD_PROFILE_OBIS, class_id=LOAD_PROFILE_CLASS_ID,
+                    from_dt=FROM_DT, to_dt=TO_DT,
+                )
+            )
+
+    assert len(decoded) == n_rows
+    assert all(0 <= invoke_id <= 0xF for invoke_id in captured_invoke_ids)
+    # Начиная с invoke_id=1 (исходный GET-диапазона) и инкрементируя с
+    # переносом через 0xF, ожидаем ровно эту последовательность.
+    expected = []
+    invoke_id = 1
+    for _ in captured_invoke_ids:
+        invoke_id = (invoke_id + 1) & 0xF
+        expected.append(invoke_id)
+    assert captured_invoke_ids == expected

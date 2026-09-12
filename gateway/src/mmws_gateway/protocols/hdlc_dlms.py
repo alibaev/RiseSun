@@ -762,13 +762,20 @@ def read_load_profile_via_established_link(
     # 201811000016, ранее 202308004356) отвечает честным отказом
     # ``data-access-result=16`` ("No Long Get Or Read In Progress") на
     # ВТОРОМ датаблоке, хотя партия 2020 года (логи 4 успешных сеансов)
-    # на тот же константный invoke_id отвечает штатно. Гипотеза: разные
-    # прошивки/партии счётчиков ведут себя по-разному, единой конвенции
-    # для всего парка нет. Не отбрасываем уже собранные датаблоки и не
-    # начинаем сессию заново — просто ОДИН РАЗ повторяем именно этот
-    # Next с invoke_id+1 (старая, ранее отменённая гипотеза) ПЕРЕД тем,
-    # как сдаться; если и это не поможет — отказ, как и раньше.
-    retried_invoke_id_for_block = False
+    # на тот же константный invoke_id отвечает штатно.
+    #
+    # Подтверждено первоисточником (2026-09-12, официальный открытый
+    # исходник Gurux.DLMS.Net, GXDLMS.cs::GetInvokeIDPriority/
+    # ReceiverReady — см. DECISIONS.md): это не два случайных диалекта,
+    # а ШТАТНЫЙ переключатель настоящей библиотеки, ``AutoIncreaseInvokeID``
+    # — при включении инкремент происходит НА КАЖДОМ исходящем PDU без
+    # исключения, включая КАЖДЫЙ Get-Request-Next всей передачи, а не
+    # только как разовое восстановление после отказа. Поэтому: обнаружив
+    # отказ 16 один раз, дальше УЖЕ не пробуем константный invoke_id
+    # снова — переключаемся в "нарастающий" режим на весь остаток этой
+    # передачи (иначе на КАЖДОМ следующем датаблоке тратили бы лишний
+    # обмен на заведомо обречённую константную попытку).
+    use_incrementing_invoke_id = False
 
     while True:
         response_frame = _recv_i_frame(transport)
@@ -807,9 +814,9 @@ def read_load_profile_via_established_link(
                 and payload[8] == dlms.DATABLOCK_RESULT_DATA_ACCESS_ERROR
                 and payload[9] == 16
             )
-            if is_no_long_get_in_progress and not retried_invoke_id_for_block:
-                retried_invoke_id_for_block = True
-                invoke_id += 1
+            if is_no_long_get_in_progress and not use_incrementing_invoke_id:
+                use_incrementing_invoke_id = True
+                invoke_id = (invoke_id + 1) & 0xF
                 request_next = dlms.build_get_request_next(pending_block_number, invoke_id=invoke_id)
                 _send_i_frame(
                     transport, server_addr, client_addr, send_seq=send_seq, recv_seq=send_seq,
@@ -818,7 +825,6 @@ def read_load_profile_via_established_link(
                 send_seq += 1
                 continue
             raise
-        retried_invoke_id_for_block = False
         buf.extend(block.raw_data)
 
         rows, remainder = dlms.split_load_profile_rows(bytes(buf))
@@ -838,8 +844,17 @@ def read_load_profile_via_established_link(
         # предоставленные пользователем, — ~130 кадров Get-Request-Next
         # во всех 4 сеансах без единого исключения несут тот же
         # invoke_id, что и исходный GET-Request-Normal, см. DECISIONS.md).
-        # Если счётчик всё же откажет с data-access-result=16 — см.
-        # обработку выше, разово повторяем с invoke_id+1.
+        # Но если счётчик хоть раз откажет с data-access-result=16 (см.
+        # обработку выше) — режим переключается на нарастающий (аналог
+        # Gurux.DLMS.Net AutoIncreaseInvokeID=true) на весь остаток этой
+        # передачи, инкрементируя ЗАРАНЕЕ, а не только после очередного
+        # отказа. Маска ``& 0xF`` — invoke-id-and-priority строго 4-битное
+        # поле (см. DECISIONS.md, официальный исходник Gurux.DLMS.Net,
+        # GXDLMSSettings.InvokeID: сеттер бросает исключение при значении
+        # больше 0xF) — без переноса на длинных профилях (20-30+
+        # датаблоков) значение вышло бы за спецификацию.
+        if use_incrementing_invoke_id:
+            invoke_id = (invoke_id + 1) & 0xF
         pending_block_number = block.block_number + 1
         request_next = dlms.build_get_request_next(pending_block_number, invoke_id=invoke_id)
         _send_i_frame(
