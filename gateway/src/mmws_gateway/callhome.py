@@ -90,14 +90,29 @@ DEFAULT_MAX_PER_SERIAL = 10
 # ошибочно связывался с новой попыткой. Пауза сведена к минимуму, а
 # таймаут на попытку увеличен настолько, чтобы реальный ответ успевал
 # прийти В РАМКАХ ТОЙ ЖЕ попытки, которая его вызвала.
+#
+# 2026-09-12 (разбор байтовых дампов "получено N сырых байт... на этапе
+# AARQ/AARE/GET", см. DECISIONS.md) — 9000мс всё равно оказался НЕДОСТАТОЧНЫМ
+# запасом над задокументированными выше 7-10с: на большинстве соединений
+# счётчик отвечает ОДНИМ UA (SNRM реально принят), а следом идёт очередь
+# из 1-18 кадров DM (Disconnect Mode) — по количеству похоже на то, что
+# счётчик получил и БОЛЬШЕ ОДНОГО повторного SNRM уже ПОСЛЕ того, как
+# сам согласился на линк, и реагирует на каждый лишний сбросом связи.
+# Таймаут увеличен с запасом выше документированного потолка задержки,
+# число попыток уменьшено пропорционально (иначе общий бюджет ожидания
+# SNRM начинает конкурировать с DEFAULT_IMMEDIATE_READ_MAX_WAIT_S).
 DEFAULT_RETRY_INTERVAL_S = 0.5
 DEFAULT_IDENTIFY_TIMEOUT_S = 5.0
-DEFAULT_PER_ATTEMPT_TIMEOUT_MS = 9000
+DEFAULT_PER_ATTEMPT_TIMEOUT_MS = 15000
 # Сколько раз подряд повторить ВЕСЬ обмен (SNRM+AARQ+GET) на ОДНОМ и том
-# же held-соединении, прежде чем сдаться на нём и перейти к следующему —
-# большое значение, чтобы не переключаться на другое соединение раньше
-# времени: см. комментарий выше про частые короткие попытки.
-DEFAULT_MAX_ATTEMPTS_PER_CONNECTION = 20
+# же held-соединении, прежде чем сдаться на нём и перейти к следующему.
+# 2026-09-12 — было 20 (компенсировало недостаточный per-attempt таймаут,
+# см. комментарий выше), теперь при увеличенном таймауте столько попыток
+# не нужно и вредно (каждая лишняя попытка после того, как счётчик уже
+# один раз промолчал полные 15с, — это либо ещё одна лишняя SNRM поверх
+# уже принятой линии, либо реально мёртвое соединение, для которого
+# больше попыток ничего не меняют).
+DEFAULT_MAX_ATTEMPTS_PER_CONNECTION = 5
 # Подтверждено на практике 2026-08-18: held-соединение, простоявшее в
 # пуле опознанным дольше примерно минуты без единой попытки чтения,
 # оказывается уже полностью нежизнеспособным (не отвечает вообще ни на
@@ -108,8 +123,9 @@ DEFAULT_MAX_CLAIM_AGE_S = 30.0
 # Подтверждено побайтовым разбором tcpdump-захвата 2026-08-18: AARQ
 # доходит до счётчика и подтверждается на уровне TCP (ACK) уже в первую
 # секунду — то есть проблема НЕ в доставке запроса. После этого счётчик
-# может молчать намного дольше, чем ~9с (наш прежний общий таймаут на
-# попытку), прежде чем прислать AARE. Раз доставка уже подтверждена
+# может молчать намного дольше, чем таймаут одной попытки SNRM (см.
+# DEFAULT_PER_ATTEMPT_TIMEOUT_MS выше), прежде чем прислать AARE. Раз
+# доставка уже подтверждена
 # TCP-подтверждением, повторно слать SNRM тут бессмысленно (проверено:
 # счётчик и так уже принял и обработал AARQ) — лучше просто терпеливо
 # подождать ответ дольше именно на этом шаге, не начиная сессию заново.
@@ -738,6 +754,7 @@ class CallHomePool:
                             "Диагностика capture_objects: попытка %d SNRM на соединении #%d — %s, повтор",
                             attempt, pc.conn_no, exc.code,
                         )
+                        _drain_stale_bytes(pc.raw_sock)
                     except (ConnectionError, OSError) as exc:
                         logger.warning(
                             "Диагностика capture_objects: обрыв соединения #%d при SNRM (%s)",
@@ -1136,6 +1153,30 @@ class CallHomePool:
             return dict(self._seen_serials)
 
 
+def _drain_stale_bytes(sock: socket.socket) -> None:
+    """Перед повтором SNRM — вычитывает и отбрасывает любые байты, уже
+    осевшие в приёмном буфере ОС на этом сокете (2026-09-12, см.
+    DECISIONS.md, "UA, затем очередь DM" — разбор реальных байтовых
+    дампов показал, что счётчик нередко успевает ответить на ПРЕДЫДУЩУЮ
+    попытку SNRM уже ПОСЛЕ того, как её таймаут истёк, и этот поздний
+    ответ, оставшись непрочитанным, по ошибке читается как ответ на
+    СЛЕДУЮЩУЮ попытку). Неблокирующее чтение "досуха" — не ждёт новых
+    байт, только сбрасывает то, что уже пришло."""
+    original_timeout = sock.gettimeout()
+    try:
+        sock.setblocking(False)
+        while True:
+            try:
+                if not sock.recv(4096):
+                    break
+            except (BlockingIOError, InterruptedError):
+                break
+    except OSError:
+        pass
+    finally:
+        sock.settimeout(original_timeout)
+
+
 def read_via_call_home(
     pool: CallHomePool,
     *,
@@ -1209,6 +1250,7 @@ def read_via_call_home(
                     "Call-home: попытка %d SNRM на соединении #%d — %s, повтор",
                     attempt, pc.conn_no, exc.code,
                 )
+                _drain_stale_bytes(pc.raw_sock)
             except (ConnectionError, OSError) as exc:
                 last_error = GatewayError(f"Обрыв соединения #{pc.conn_no}: {exc}")
                 break  # это соединение мертво, пробуем следующее held-соединение (если появится)
@@ -1359,6 +1401,7 @@ def read_batch_via_fresh_connection(
                 "Immediate-read: попытка %d SNRM на соединении #%d — %s, повтор",
                 attempt, pc.conn_no, exc.code,
             )
+            _drain_stale_bytes(pc.raw_sock)
         except (ConnectionError, OSError) as exc:
             raise GatewayError(f"Обрыв соединения #{pc.conn_no}: {exc}") from exc
         time.sleep(retry_interval_s)
@@ -1442,6 +1485,7 @@ def read_load_profile_via_fresh_connection(
                 "Immediate-read (профиль): попытка %d SNRM на соединении #%d — %s, повтор",
                 attempt, pc.conn_no, exc.code,
             )
+            _drain_stale_bytes(pc.raw_sock)
         except (ConnectionError, OSError) as exc:
             raise GatewayError(f"Обрыв соединения #{pc.conn_no}: {exc}") from exc
         time.sleep(retry_interval_s)
@@ -1546,6 +1590,7 @@ def read_load_profile_via_call_home(
                     "Call-home (профиль нагрузки): попытка %d SNRM на соединении #%d — %s, повтор",
                     attempt, pc.conn_no, exc.code,
                 )
+                _drain_stale_bytes(pc.raw_sock)
             except (ConnectionError, OSError) as exc:
                 last_error = GatewayError(f"Обрыв соединения #{pc.conn_no}: {exc}")
                 break

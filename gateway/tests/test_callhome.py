@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from mmws_gateway.callhome import (
     CallHomePool,
     DlT645FilteringSocket,
+    _drain_stale_bytes,
     _json_safe_value,
     read_load_profile_via_call_home,
     read_via_call_home,
@@ -211,6 +212,30 @@ def test_read_frame_from_transport_filters_dlt645_noise_between_frames():
         assert got1.control == 0x93
         assert got2.control == 0x53
     finally:
+        client_sock.close()
+
+
+def test_drain_stale_bytes_discards_pending_data_without_blocking():
+    """2026-09-12 (см. DECISIONS.md, "UA, затем очередь DM") — перед
+    повтором SNRM нужно сбросить всё, что уже осело в приёмном буфере
+    (поздний ответ на ПРЕДЫДУЩУЮ попытку), иначе следующая попытка
+    ошибочно примет его за ответ на себя. ``_drain_stale_bytes`` не
+    должна блокироваться, если данных нет, и должна восстановить
+    исходный таймаут сокета."""
+    server_sock, client_sock = socket.socketpair()
+    try:
+        server_sock.sendall(b"stale response bytes")
+        time.sleep(0.05)  # дать данным реально дойти до приёмного буфера
+        client_sock.settimeout(3.0)
+
+        _drain_stale_bytes(client_sock)
+
+        assert client_sock.gettimeout() == 3.0
+        with pytest.raises(socket.timeout):
+            client_sock.settimeout(0.1)
+            client_sock.recv(4096)  # буфер должен быть пуст — новых байт нет
+    finally:
+        server_sock.close()
         client_sock.close()
 
 
