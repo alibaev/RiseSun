@@ -309,3 +309,88 @@ def test_read_load_profile_get_request_next_reuses_invoke_id():
 
     assert len(decoded) == 2
     assert captured["next_invoke_id"] == captured["range_invoke_id"]
+
+
+def test_read_load_profile_retries_next_with_incremented_invoke_id_on_no_long_get():
+    """2026-09-12 (см. DECISIONS.md, "может надо отправить хардбит?" —
+    живая проверка сразу после этого эксперимента) — часть парка (как
+    минимум партии 2018 и 2023 годов) отвечает честным отказом
+    data-access-result=16 ("No Long Get Or Read In Progress") на
+    константный invoke_id у Next, хотя партия 2020 года (см. тест выше)
+    на тот же константный invoke_id отвечает штатно. Разные прошивки —
+    разная конвенция. Сценарий: датаблок 1 -> Next(invoke_id=1) ->
+    отказ 16 -> ОДИН повтор Next(invoke_id=2) -> датаблок 2 (успех),
+    без потери уже собранных строк первого датаблока."""
+    rows = [_row(0, 3000), _row(1, 3001)]
+    all_bytes = b"".join(dlms.encode_load_profile_row(ts, fields) for ts, fields in rows)
+    mid = len(all_bytes) // 2
+    captured: dict = {}
+
+    def handler(conn: socket.socket) -> None:
+        snrm_frame = HdlcFrame.decode(_read_frame(conn))
+        ua = HdlcFrame(destination=snrm_frame.source, source=snrm_frame.destination, control=CONTROL_UA)
+        conn.sendall(ua.encode())
+
+        aarq_frame = HdlcFrame.decode(_read_frame(conn))
+        aare = dlms.build_aare(accepted=True)
+        aare_frame = HdlcFrame(
+            destination=aarq_frame.source, source=aarq_frame.destination,
+            control=control_information_frame(0, 1), information=dlms.wrap_llc_response(aare),
+        )
+        conn.sendall(aare_frame.encode())
+
+        range_frame = HdlcFrame.decode(_read_frame(conn))
+        range_payload = dlms.unwrap_llc(range_frame.information)
+        range_invoke_id = range_payload[2]
+
+        block1 = dlms.build_get_response_datablock(
+            range_invoke_id, last_block=False, block_number=1, raw_data=all_bytes[:mid],
+        )
+        frame1 = HdlcFrame(
+            destination=range_frame.source, source=range_frame.destination,
+            control=control_information_frame(1, 2), information=dlms.wrap_llc_response(block1),
+        )
+        conn.sendall(frame1.encode())
+
+        next_frame = HdlcFrame.decode(_read_frame(conn))
+        next_payload = dlms.unwrap_llc(next_frame.information)
+        captured["first_next_invoke_id"] = next_payload[2]
+
+        # Отказ "No Long Get Or Read In Progress" (code 16) на первый Next.
+        error_info = bytes(
+            [dlms.GET_RESPONSE_TAG, dlms.GET_RESPONSE_WITH_DATABLOCK, next_payload[2], 0]
+        ) + (1).to_bytes(4, "big") + bytes([dlms.DATABLOCK_RESULT_DATA_ACCESS_ERROR, 16])
+        error_frame = HdlcFrame(
+            destination=next_frame.source, source=next_frame.destination,
+            control=control_information_frame(2, 3), information=dlms.wrap_llc_response(error_info),
+        )
+        conn.sendall(error_frame.encode())
+
+        retry_frame = HdlcFrame.decode(_read_frame(conn))
+        retry_payload = dlms.unwrap_llc(retry_frame.information)
+        captured["retry_next_invoke_id"] = retry_payload[2]
+
+        block2 = dlms.build_get_response_datablock(
+            retry_payload[2], last_block=True, block_number=2, raw_data=all_bytes[mid:],
+        )
+        frame2 = HdlcFrame(
+            destination=retry_frame.source, source=retry_frame.destination,
+            control=control_information_frame(3, 4), information=dlms.wrap_llc_response(block2),
+        )
+        conn.sendall(frame2.encode())
+
+    with ThreadedEmulatorServer(handler) as server:
+        config = TransportConfig(host=server.host, port=server.port, timeout_ms=1000, max_retries=1)
+        with TcpTransport(config) as transport:
+            decoded = list(
+                hdlc_dlms.read_load_profile(
+                    transport, serial=SERIAL, password=PASSWORD,
+                    obis=LOAD_PROFILE_OBIS, class_id=LOAD_PROFILE_CLASS_ID,
+                    from_dt=FROM_DT, to_dt=TO_DT,
+                )
+            )
+
+    assert len(decoded) == 2
+    assert decoded[0][1] == [3000]
+    assert decoded[1][1] == [3001]
+    assert captured["retry_next_invoke_id"] == captured["first_next_invoke_id"] + 1

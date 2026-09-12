@@ -754,6 +754,21 @@ def read_load_profile_via_established_link(
     send_seq = 2
     invoke_id = 1
     buf = bytearray()
+    # 2026-09-12 (см. DECISIONS.md, "может надо отправить хардбит?" —
+    # живая проверка на нескольких счётчиках сразу после этого
+    # эксперимента) — на КОНСТАНТНЫЙ invoke_id (см. комментарий ниже,
+    # подтверждённый реальными трассами 4 сеансов IECMeterManage.exe)
+    # часть парка (как минимум партии 2018 и 2023 годов — 201811000033,
+    # 201811000016, ранее 202308004356) отвечает честным отказом
+    # ``data-access-result=16`` ("No Long Get Or Read In Progress") на
+    # ВТОРОМ датаблоке, хотя партия 2020 года (логи 4 успешных сеансов)
+    # на тот же константный invoke_id отвечает штатно. Гипотеза: разные
+    # прошивки/партии счётчиков ведут себя по-разному, единой конвенции
+    # для всего парка нет. Не отбрасываем уже собранные датаблоки и не
+    # начинаем сессию заново — просто ОДИН РАЗ повторяем именно этот
+    # Next с invoke_id+1 (старая, ранее отменённая гипотеза) ПЕРЕД тем,
+    # как сдаться; если и это не поможет — отказ, как и раньше.
+    retried_invoke_id_for_block = False
 
     while True:
         response_frame = _recv_i_frame(transport)
@@ -784,7 +799,26 @@ def read_load_profile_via_established_link(
                 f"Неожиданный тип GET.response при чтении профиля нагрузки: {payload[:2].hex()}"
             )
 
-        block = dlms.parse_get_response_datablock(payload)
+        try:
+            block = dlms.parse_get_response_datablock(payload)
+        except GatewayError:
+            is_no_long_get_in_progress = (
+                len(payload) > 9
+                and payload[8] == dlms.DATABLOCK_RESULT_DATA_ACCESS_ERROR
+                and payload[9] == 16
+            )
+            if is_no_long_get_in_progress and not retried_invoke_id_for_block:
+                retried_invoke_id_for_block = True
+                invoke_id += 1
+                request_next = dlms.build_get_request_next(pending_block_number, invoke_id=invoke_id)
+                _send_i_frame(
+                    transport, server_addr, client_addr, send_seq=send_seq, recv_seq=send_seq,
+                    information=dlms.wrap_llc_command(request_next),
+                )
+                send_seq += 1
+                continue
+            raise
+        retried_invoke_id_for_block = False
         buf.extend(block.raw_data)
 
         rows, remainder = dlms.split_load_profile_rows(bytes(buf))
@@ -798,16 +832,16 @@ def read_load_profile_via_established_link(
             return
 
         # GET.request-Next продолжает УЖЕ начатую блочную передачу ответа
-        # на GET-диапазон — переиспользует invoke_id ИСХОДНОГО GET-запроса
-        # для всей длинной операции (2026-09-12: реальные байтовые трассы
-        # 4 успешных сеансов IECMeterManage.exe, предоставленные
-        # пользователем, — ~130 кадров Get-Request-Next во всех 4 сеансах
-        # без единого исключения несут тот же invoke_id, что и исходный
-        # GET-Request-Normal, см. DECISIONS.md). Более раннее решение
-        # ("нарастающий invoke_id", основанное на разборе декомпилированного
-        # `ver2.zip`) было ошибочным выводом из декомпилированного
-        # исходника — отменено.
-        request_next = dlms.build_get_request_next(block.block_number + 1, invoke_id=invoke_id)
+        # на GET-диапазон — по умолчанию переиспользует invoke_id
+        # ИСХОДНОГО GET-запроса для всей длинной операции (2026-09-12:
+        # реальные байтовые трассы 4 успешных сеансов IECMeterManage.exe,
+        # предоставленные пользователем, — ~130 кадров Get-Request-Next
+        # во всех 4 сеансах без единого исключения несут тот же
+        # invoke_id, что и исходный GET-Request-Normal, см. DECISIONS.md).
+        # Если счётчик всё же откажет с data-access-result=16 — см.
+        # обработку выше, разово повторяем с invoke_id+1.
+        pending_block_number = block.block_number + 1
+        request_next = dlms.build_get_request_next(pending_block_number, invoke_id=invoke_id)
         _send_i_frame(
             transport, server_addr, client_addr, send_seq=send_seq, recv_seq=send_seq,
             information=dlms.wrap_llc_command(request_next),
