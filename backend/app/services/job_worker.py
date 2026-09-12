@@ -79,6 +79,14 @@ async def _claim_next_job(db: AsyncSession) -> Job | None:
     )
     job = result.scalar_one_or_none()
     if job is None:
+        # 2026-09-12 (см. DECISIONS.md, тот же баг найден и в
+        # claim_due_jobs_for_meter) — SELECT ... FOR UPDATE открывает
+        # транзакцию, даже когда очередь пуста (частый случай — 8
+        # воркеров опрашивают раз в секунду каждый). Без commit/rollback
+        # здесь транзакция висела "idle in transaction" до закрытия
+        # сессии воркера — с 8 воркерами это исчерпывало пул соединений
+        # быстрее всего остального.
+        await db.commit()
         return None
     job.status = JobStatus.RUNNING
     job.started_at = datetime.now(timezone.utc)
@@ -115,10 +123,18 @@ async def claim_due_jobs_for_meter(
     for job in jobs:
         job.status = JobStatus.RUNNING
         job.started_at = now
-    if jobs:
-        await db.commit()
-        for job in jobs:
-            await db.refresh(job)
+    # 2026-09-12 (см. DECISIONS.md) — commit() раньше вызывался только
+    # когда jobs непусто. SELECT ... FOR UPDATE открывает транзакцию
+    # ДАЖЕ когда строк не найдено (самый частый случай — у подавляющего
+    # большинства звонящих счётчиков в этот момент нет due job'ов), и без
+    # commit/rollback эта транзакция висела "idle in transaction" до
+    # закрытия сессии в конце запроса. При всплеске звонков (перезапуск
+    # Backend'а, см. db.py про "перезапуск + рост парка") это исчерпывало
+    # весь пул соединений за минуты, останавливая ВСЮ работу с БД
+    # (не только claim-jobs). commit() теперь безусловный.
+    await db.commit()
+    for job in jobs:
+        await db.refresh(job)
     return list(jobs)
 
 

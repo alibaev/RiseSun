@@ -32,6 +32,7 @@ from app.services.job_worker import (
     claim_due_jobs_for_meter,
     reap_stale_running_jobs,
     requeue_stale_running_jobs,
+    _claim_next_job,
     _run_disconnect,
     _run_read_current,
     _run_read_load_profile,
@@ -693,6 +694,42 @@ async def test_claim_due_jobs_for_meter_respects_limit(db_session):
 
     claimed = await claim_due_jobs_for_meter(db_session, meter_id=meter.id, job_types=["read_current"], limit=2)
     assert len(claimed) == 2
+
+
+@pytest.mark.asyncio
+async def test_claim_due_jobs_for_meter_commits_even_when_nothing_found(db_session):
+    """2026-09-12 (см. DECISIONS.md) — найденный на живом флоте баг:
+    ``SELECT ... FOR UPDATE`` открывает транзакцию, даже когда строк не
+    найдено (самый частый случай — у подавляющего большинства звонящих
+    call-home счётчиков в этот момент нет due job'ов). Без commit/rollback
+    сразу после запроса эта транзакция висела "idle in transaction" до
+    закрытия сессии — при всплеске звонков после рестарта Backend'а это
+    исчерпывало весь пул соединений за минуты (см. db.py), останавливая
+    ВСЮ работу с БД, не только claim-jobs."""
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202006003607",
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.commit()
+
+    claimed = await claim_due_jobs_for_meter(db_session, meter_id=meter.id, job_types=["read_current"], limit=2)
+
+    assert claimed == []
+    assert db_session.in_transaction() is False
+
+
+@pytest.mark.asyncio
+async def test_claim_next_job_commits_even_when_queue_empty(db_session):
+    """Тот же баг, что и у ``claim_due_jobs_for_meter`` выше, но в старом
+    FIFO-пути — с 8 воркерами, опрашивающими раз в секунду каждый, при
+    опустевшей очереди это исчерпывало пул ещё быстрее."""
+    job = await _claim_next_job(db_session)
+
+    assert job is None
+    assert db_session.in_transaction() is False
 
 
 @pytest.mark.asyncio
