@@ -100,6 +100,14 @@ button.secondary:hover:not(:disabled) {
   filter: none;
 }
 
+/* Безвозвратное удаление (пользователь, счётчик с некорректными
+   данными) — отдельным цветом от обычных/secondary кнопок, чтобы
+   визуально не путать с обратимыми действиями (блокировка и т.п.). */
+button.danger {
+  background: #c0392b;
+  color: #ffffff;
+}
+
 input,
 select {
   padding: 9px 12px;
@@ -474,6 +482,40 @@ select:focus {
   font-size: 13.5px;
   color: var(--muted);
   font-weight: 600;
+}
+
+/* "Глазок" на поле пароля при входе (2026-09-13, по прямому указанию
+   пользователя) — переключает type="password"/"text" у input, кнопка
+   абсолютно спозиционирована поверх правого края поля. */
+.password-field {
+  position: relative;
+  display: flex;
+}
+
+.password-field input {
+  width: 100%;
+  padding-right: 36px;
+}
+
+.password-toggle {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.password-toggle:hover {
+  color: var(--ink);
 }
 
 /* ---------- filters ---------- */

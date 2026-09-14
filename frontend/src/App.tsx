@@ -5,16 +5,24 @@ import { Layout } from "./components/Layout";
 import { LoginPage } from "./pages/LoginPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { MetersListPage } from "./pages/MetersListPage";
+import {
+  MeterPollPage,
+  MeterPollGroupPage,
+  ProfilePollPage,
+  ProfilePollGroupPage,
+} from "./pages/MeterOperationsPage";
 import { ResPage } from "./pages/ResPage";
 import { MeterDetailPage } from "./pages/MeterDetailPage";
 import { ObisCatalogPage } from "./pages/ObisCatalogPage";
 import { ParameterSchemesPage } from "./pages/ParameterSchemesPage";
 import { PollProfilesPage } from "./pages/PollProfilesPage";
 import { ScheduledJobsPage } from "./pages/ScheduledJobsPage";
+import { EudbExportPage } from "./pages/EudbExportPage";
 import { AuditLogPage } from "./pages/AuditLogPage";
 import { UsersPage } from "./pages/UsersPage";
 import { BillingKeysPage } from "./pages/BillingKeysPage";
 import { GatewaysPage } from "./pages/GatewaysPage";
+import { AboutPage } from "./pages/AboutPage";
 import { ComingSoonPage } from "./pages/ComingSoonPage";
 
 export function App() {
@@ -26,16 +34,22 @@ export function App() {
           <Route element={<Layout />}>
             <Route path="/" element={<DashboardPage />} />
             <Route path="/meters" element={<MetersListPage />} />
+            <Route path="/meter-operations/poll" element={<MeterPollPage />} />
+            <Route path="/meter-operations/profile" element={<ProfilePollPage />} />
+            <Route path="/meter-operations/poll-group" element={<MeterPollGroupPage />} />
+            <Route path="/meter-operations/profile-group" element={<ProfilePollGroupPage />} />
             <Route path="/res" element={<ResPage />} />
             <Route path="/meters/:id" element={<MeterDetailPage />} />
             <Route path="/schemes" element={<ParameterSchemesPage />} />
             <Route path="/obis-catalog" element={<ObisCatalogPage />} />
             <Route path="/poll-profiles" element={<PollProfilesPage />} />
             <Route path="/scheduled-jobs" element={<ScheduledJobsPage />} />
+            <Route path="/eudb-export" element={<EudbExportPage />} />
             <Route path="/audit-log" element={<AuditLogPage />} />
             <Route path="/users" element={<UsersPage />} />
             <Route path="/billing-keys" element={<BillingKeysPage />} />
             <Route path="/gateways" element={<GatewaysPage />} />
+            <Route path="/about" element={<AboutPage />} />
             <Route path="/soon" element={<ComingSoonPage />} />
           </Route>
         </Route>

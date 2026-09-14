@@ -36,6 +36,7 @@ def make_hdlc_dlms_handler(
     register_scalers: dict[bytes, int] | None = None,
     register_units: dict[bytes, int] | None = None,
     action_state: dict[bytes, int] | None = None,
+    action_parameters_state: dict[bytes, bytes | None] | None = None,
     action_force_result: int | None = None,
 ):
     """Возвращает обработчик TCP-подключения для ``ThreadedEmulatorServer``.
@@ -97,6 +98,7 @@ def make_hdlc_dlms_handler(
             register_scalers=register_scalers,
             register_units=register_units,
             action_state=action_state,
+            action_parameters_state=action_parameters_state,
             action_force_result=action_force_result,
         )
 
@@ -117,6 +119,7 @@ def serve_hdlc_dlms_session(
     register_scalers: dict[bytes, int] | None = None,
     register_units: dict[bytes, int] | None = None,
     action_state: dict[bytes, int] | None = None,
+    action_parameters_state: dict[bytes, bytes | None] | None = None,
     action_force_result: int | None = None,
 ) -> None:
     """Обслуживает установление HDLC-соединения, AARQ/AARE и один GET либо SET
@@ -168,6 +171,8 @@ def serve_hdlc_dlms_session(
         action_request = dlms.parse_action_request(payload)
         if action_state is not None:
             action_state[action_request.obis] = action_request.method_id
+        if action_parameters_state is not None:
+            action_parameters_state[action_request.obis] = action_request.parameters
         result = dlms.ACTION_RESULT_SUCCESS if action_force_result is None else action_force_result
         info = dlms.build_action_response(action_request.invoke_id, result=result)
     elif tag == dlms.SET_REQUEST_TAG:

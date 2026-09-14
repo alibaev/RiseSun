@@ -27,6 +27,7 @@ from .api import (
     billing,
     billing_api_keys,
     dashboard,
+    eudb_export,
     gateway_internal,
     gateways,
     jobs,
@@ -41,8 +42,14 @@ from .api import (
 from .config import settings
 from .db import SessionLocal
 from .services.billing_errors import BillingApiError
+from .services.eudb_export import eudb_export_loop
 from .services.heartbeat import heartbeat_loop
-from .services.job_worker import reap_stale_running_jobs, stale_job_reaper_loop, worker_loop
+from .services.job_worker import (
+    reap_stale_running_jobs,
+    stale_job_reaper_loop,
+    stale_queued_reaper_loop,
+    worker_loop,
+)
 from .services.meter_discovery import meter_discovery_loop
 from .services.offline_detector import offline_detector_loop
 from .services.scheduler import scheduler_loop
@@ -85,6 +92,14 @@ async def lifespan(app: FastAPI):
     # очередь job'ы, которые Gateway забрал (claim-jobs), но так и не
     # смог отчитать (сбой сети/процесса посреди ассоциации).
     stale_job_reaper_task = asyncio.create_task(stale_job_reaper_loop(stop_event))
+    # "С наступлением новых суток, очередь заданий обнуляется"
+    # (2026-09-13, по прямому указанию пользователя) — см.
+    # job_worker.expire_stale_queued_jobs_for_new_day/DECISIONS.md.
+    stale_queued_reaper_task = asyncio.create_task(stale_queued_reaper_loop(stop_event))
+    # Ежедневный экспорт профиля нагрузки (Profile1) во внешнюю БД ЕЭБД
+    # (2026-09-14, по прямому указанию пользователя) — см.
+    # services/eudb_export.py.
+    eudb_export_task = asyncio.create_task(eudb_export_loop(stop_event))
     try:
         yield
     finally:
@@ -95,6 +110,8 @@ async def lifespan(app: FastAPI):
         await offline_detector_task
         await meter_discovery_task
         await stale_job_reaper_task
+        await stale_queued_reaper_task
+        await eudb_export_task
 
 
 app = FastAPI(title="MMWS Backend API", version="0.1.0-etap1", lifespan=lifespan)
@@ -166,6 +183,7 @@ app.include_router(billing.router)
 app.include_router(billing_api_keys.router)
 app.include_router(dashboard.router)
 app.include_router(gateway_internal.router)
+app.include_router(eudb_export.router)
 
 
 @app.get("/health")

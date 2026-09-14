@@ -1,5 +1,13 @@
 """ТЗ п.4.2.6/4.2.11 — расписания автоматического опроса счётчиков:
-CRUD, вычисляемое время следующего запуска, журнал выполнения запусков."""
+CRUD, вычисляемое время следующего запуска, журнал выполнения запусков.
+
+Доступ (2026-09-12, по прямому указанию пользователя — "доступ к
+расписанию только Суперадминистратор и Администратор") — ВЕСЬ роутер,
+включая чтение (список/один/журнал запусков), требует
+``Permission.MANAGE_SCHEDULED_JOBS`` (Admin/Super-admin), а не
+``VIEW_METERS`` (которым обладают все роли, включая Наблюдателя) — до
+этой правки любая роль могла ПРОСМАТРИВАТЬ расписания, хоть и не могла
+их менять."""
 
 from __future__ import annotations
 
@@ -44,7 +52,7 @@ async def _validate_meter_ids(db: AsyncSession, meter_ids: list[int]) -> None:
 @router.get("", response_model=list[ScheduledJobOut])
 async def list_scheduled_jobs(
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(require_permission(Permission.VIEW_METERS)),
+    user: User = Depends(require_permission(Permission.MANAGE_SCHEDULED_JOBS)),
 ) -> list[ScheduledJobOut]:
     result = await db.execute(select(ScheduledJob).order_by(ScheduledJob.name))
     return [_to_out(j) for j in result.scalars().all()]
@@ -54,7 +62,7 @@ async def list_scheduled_jobs(
 async def get_scheduled_job(
     scheduled_job_id: int,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(require_permission(Permission.VIEW_METERS)),
+    user: User = Depends(require_permission(Permission.MANAGE_SCHEDULED_JOBS)),
 ) -> ScheduledJobOut:
     scheduled_job = await db.get(ScheduledJob, scheduled_job_id)
     if scheduled_job is None:
@@ -138,7 +146,7 @@ async def list_scheduled_job_runs(
     scheduled_job_id: int,
     limit: int = 50,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(require_permission(Permission.VIEW_METERS)),
+    user: User = Depends(require_permission(Permission.MANAGE_SCHEDULED_JOBS)),
 ) -> list[ScheduledJobRun]:
     result = await db.execute(
         select(ScheduledJobRun)
@@ -154,7 +162,7 @@ async def list_scheduled_job_run_jobs(
     scheduled_job_id: int,
     run_id: int,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(require_permission(Permission.VIEW_METERS)),
+    user: User = Depends(require_permission(Permission.MANAGE_SCHEDULED_JOBS)),
 ) -> list[Job]:
     """Итог по каждому счётчику конкретного запуска (ТЗ п.4.2.11 —
     «журнал выполнения каждого запуска»)."""

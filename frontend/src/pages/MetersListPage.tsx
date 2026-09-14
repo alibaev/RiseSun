@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api/client";
 import { canManageMeters, useAuth } from "../auth/AuthContext";
+import { ConfirmModal } from "../components/ConfirmModal";
 import { exportToExcel } from "../lib/exportExcel";
 import { formatValue } from "../lib/format";
 import type { Meter, ProtocolProfile } from "../api/types";
@@ -54,6 +55,7 @@ export function MetersListPage() {
   // ip_address по каждой строке независимо, до нажатия "Сохранить".
   const [invalidEdits, setInvalidEdits] = useState<Record<number, { serial_number: string; ip_address: string }>>({});
   const [savingInvalidId, setSavingInvalidId] = useState<number | null>(null);
+  const [pendingDeleteMeter, setPendingDeleteMeter] = useState<Meter | null>(null);
 
   function buildParams(): URLSearchParams {
     const params = new URLSearchParams();
@@ -126,6 +128,23 @@ export function MetersListPage() {
       })
       .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось сохранить изменения"))
       .finally(() => setSavingInvalidId(null));
+  }
+
+  // По просьбе пользователя (2026-09-14) — удаление записи из
+  // "Некорректные данные" целиком, а не только правка серийника/IP: у
+  // этих счётчиков обычно ещё нет показаний/задач (обнаружены, но не
+  // активированы), поэтому DELETE .../{meter_id} (см. meters.py) в
+  // норме проходит без конфликта; если история всё же есть — backend
+  // вернёт понятную 409-ошибку вместо тихого/каскадного удаления.
+  function handleConfirmDeleteMeter() {
+    if (!pendingDeleteMeter) return;
+    const meter = pendingDeleteMeter;
+    setPendingDeleteMeter(null);
+    setError(null);
+    api
+      .del(`/api/meters/${meter.id}`)
+      .then(load)
+      .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось удалить счётчик"));
   }
 
   function handleSetLowConsumption(m: Meter, value: boolean) {
@@ -328,7 +347,10 @@ export function MetersListPage() {
                         <button onClick={() => handleSaveInvalid(m)} disabled={savingInvalidId === m.id}>
                           Сохранить
                         </button>{" "}
-                        <button onClick={() => openActivate(m)}>Активировать</button>
+                        <button onClick={() => openActivate(m)}>Активировать</button>{" "}
+                        <button className="danger" onClick={() => setPendingDeleteMeter(m)}>
+                          Удалить
+                        </button>
                       </td>
                     )}
                   </tr>
@@ -337,6 +359,16 @@ export function MetersListPage() {
             </tbody>
           </table>
         </section>
+      )}
+
+      {pendingDeleteMeter && (
+        <ConfirmModal
+          title="Удалить счётчик"
+          message={`Запись «${pendingDeleteMeter.serial_number}» будет удалена безвозвратно. Если по счётчику уже есть показания, задачи или журналы — удаление не пройдёт, деактивируйте вместо удаления. Подтвердите операцию.`}
+          confirmLabel="Удалить"
+          onConfirm={handleConfirmDeleteMeter}
+          onCancel={() => setPendingDeleteMeter(null)}
+        />
       )}
 
       {meters !== null && (

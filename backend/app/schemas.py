@@ -13,6 +13,7 @@ from .models import (
     BillingApiKeyStatus,
     DisconnectBatchItemStatus,
     DisconnectBatchStatus,
+    EudbExportRunStatus,
     GatewayStatus,
     JobStatus,
     MeterStatus,
@@ -380,9 +381,15 @@ class DueJobOut(BaseModel):
 
 class ClaimDueJobsRequest(BaseModel):
     # read_load_profile добавлен 2026-09-11 (см. DECISIONS.md — перенос
-    # профиля нагрузки на событийный путь); Gateway это поле вообще не
-    # передаёт, всегда используется этот дефолт.
-    job_types: list[str] = ["read_current", "read_rated_current", "read_load_profile"]
+    # профиля нагрузки на событийный путь); disconnect/reconnect/
+    # read_relay_state добавлены 2026-09-12 (см. DECISIONS.md — команды
+    # управления реле должны выполняться немедленно через call-home, с
+    # приоритетом над рядовым чтением, см. job_worker.PRIORITY_JOB_TYPES).
+    # Gateway это поле вообще не передаёт, всегда используется этот дефолт.
+    job_types: list[str] = [
+        "read_current", "read_rated_current", "read_load_profile",
+        "disconnect", "reconnect", "read_relay_state",
+    ]
     max_jobs: int | None = Field(default=None, description="По умолчанию — settings.gateway_internal_claim_batch_max")
     peer_ip: str | None = Field(
         default=None,
@@ -416,6 +423,17 @@ class DueLoadProfileJobOut(BaseModel):
     to_iso: str
 
 
+class DueControlJobOut(BaseModel):
+    """Команда управления реле (Этап 5, 2026-09-12 — перенос
+    disconnect/reconnect на событийный путь call-home, см. DECISIONS.md).
+    Отдельная форма от DueJobOut — это ACTION, а не GET, значения
+    obis/class_id не нужны (см. dlms.DISCONNECT_CONTROL_OBIS/
+    DISCONNECT_CONTROL_CLASS_ID, известны Gateway'ю заранее)."""
+
+    job_id: int
+    job_type: str = Field(description='"disconnect" либо "reconnect"')
+
+
 class ClaimDueJobsResponse(BaseModel):
     meter_found: bool
     meter_id: int | None = None
@@ -423,11 +441,12 @@ class ClaimDueJobsResponse(BaseModel):
     password: str | None = Field(default=None, description="Расшифрованный пароль доступа (LLS), ASCII")
     jobs: list[DueJobOut] = []
     load_profile_jobs: list[DueLoadProfileJobOut] = []
+    control_jobs: list[DueControlJobOut] = []
 
 
 class JobResultIn(BaseModel):
     job_id: int
-    obis: str
+    obis: str | None = None
     ok: bool
     value: object | None = None
     error_code: str | None = None
@@ -535,6 +554,30 @@ class ScheduledJobRunOut(BaseModel):
     meters_failed: int
     started_at: datetime
     finished_at: datetime | None
+
+
+class EudbExportItemOut(BaseModel):
+    id: int
+    meter_id: int
+    meter_serial: str
+    ok: bool
+    rows_exported: int
+    error_message: str | None
+    created_at: datetime
+
+
+class EudbExportRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    status: EudbExportRunStatus
+    meters_total: int
+    meters_succeeded: int
+    meters_failed: int
+    triggered_manually: bool
+    started_at: datetime
+    finished_at: datetime | None
+    error_message: str | None
 
 
 class NotificationOut(BaseModel):

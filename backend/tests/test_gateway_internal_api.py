@@ -19,6 +19,9 @@ from app.models import (
     MeterReading,
     MeterStatus,
     ProtocolProfile,
+    ScheduledJob,
+    ScheduledJobRun,
+    ScheduledJobRunStatus,
     User,
     UserRole,
 )
@@ -87,7 +90,7 @@ async def test_claim_jobs_disabled_globally_returns_not_found(client, db_session
     assert resp.status_code == 200
     assert resp.json() == {
         "meter_found": False, "meter_id": None, "protocol_profile": None, "password": None,
-        "jobs": [], "load_profile_jobs": [],
+        "jobs": [], "load_profile_jobs": [], "control_jobs": [],
     }
 
 
@@ -371,6 +374,135 @@ async def test_claim_jobs_returns_load_profile_jobs(client, db_session):
     result = await db_session.execute(select(Job).where(Job.meter_id == meter.id))
     job = result.scalars().one()
     assert job.status == JobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_claim_jobs_control_command_takes_priority_over_routine_read(client, db_session):
+    """2026-09-12 (по просьбе пользователя — "все такие команды/запросы
+    (отключение/подключение, запрос состояния реле) должны выполняться
+    немедленно, не ждать очереди. если есть очередь, то только из этих
+    команд") — disconnect/reconnect/read_relay_state обгоняют рядовое
+    чтение и отдаются ОТДЕЛЬНО (обычные jobs пусты, пока есть control_jobs)."""
+    meter = await _seed_meter(db_session)
+    db_session.add(Job(job_type="read_current", meter_id=meter.id, payload={"obis": "1.1.1.8.0.ff"}))
+    db_session.add(Job(job_type="disconnect", meter_id=meter.id, payload={"source": "web"}))
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/internal/gateway/meters/{meter.serial_number}/claim-jobs", json={}, headers=_HEADERS
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["jobs"] == []
+    assert body["load_profile_jobs"] == []
+    assert len(body["control_jobs"]) == 1
+    assert body["control_jobs"][0]["job_type"] == "disconnect"
+
+    jobs = (await db_session.execute(select(Job).where(Job.meter_id == meter.id))).scalars().all()
+    statuses = {j.job_type: j.status for j in jobs}
+    assert statuses["disconnect"] == JobStatus.RUNNING
+    assert statuses["read_current"] == JobStatus.QUEUED  # не тронут — ждёт следующего дозвона
+
+
+@pytest.mark.asyncio
+async def test_claim_jobs_returns_read_relay_state_as_ordinary_get(client, db_session):
+    """read_relay_state — концептуально обычное чтение (GET), просто
+    другой OBIS/class_id — batch'уется с read_current, если само по
+    себе (без disconnect/reconnect в очереди одновременно)."""
+    meter = await _seed_meter(db_session)
+    db_session.add(Job(job_type="read_relay_state", meter_id=meter.id, payload={}))
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/internal/gateway/meters/{meter.serial_number}/claim-jobs", json={}, headers=_HEADERS
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["jobs"]) == 1
+    assert body["jobs"][0]["obis"] == "0.0.60.a.1.ff"
+    assert body["jobs"][0]["class_id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_jobs_operator_action_takes_priority_over_scheduled(client, db_session):
+    """2026-09-12 (по просьбе пользователя — "после этих задач [команд
+    управления], но впереди планового опроса, стоят действия оператора/
+    пользователя ... непосредственный диалог пользователя через
+    интерфейс") — job без scheduled_job_run_id (прямой запуск оператором)
+    обгоняет job, порождённый расписанием, при ограниченном max_jobs."""
+    meter = await _seed_meter(db_session)
+    scheduled_job = ScheduledJob(
+        name="Опрос", cron_expression="*/5 * * * *", job_type="read_current",
+        operation_params={}, meter_ids=[meter.id],
+    )
+    db_session.add(scheduled_job)
+    await db_session.flush()
+    run = ScheduledJobRun(scheduled_job_id=scheduled_job.id, status=ScheduledJobRunStatus.RUNNING, meters_total=1)
+    db_session.add(run)
+    await db_session.flush()
+
+    db_session.add(
+        Job(
+            job_type="read_current", meter_id=meter.id, payload={"obis": "1.1.1.8.0.ff"},
+            scheduled_job_run_id=run.id,
+        )
+    )
+    db_session.add(Job(job_type="read_current", meter_id=meter.id, payload={"obis": "1.1.32.7.0.ff"}))
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/internal/gateway/meters/{meter.serial_number}/claim-jobs",
+        json={"max_jobs": 1}, headers=_HEADERS,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["jobs"]) == 1
+    assert body["jobs"][0]["obis"] == "1.1.32.7.0.ff"  # операторский, не плановый
+
+
+@pytest.mark.asyncio
+async def test_job_results_disconnect_success_finalizes_job_and_audit(client, db_session):
+    meter = await _seed_meter(db_session)
+    job = Job(job_type="disconnect", meter_id=meter.id, status=JobStatus.RUNNING, payload={"source": "web"})
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.post(
+        "/api/internal/gateway/job-results",
+        json={"serial": meter.serial_number, "results": [{"job_id": job.id, "ok": True}]},
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"accepted": 1, "skipped": 0}
+
+    await db_session.refresh(job)
+    assert job.status == JobStatus.SUCCEEDED
+    assert job.result == {"operation": "disconnect", "ok": True}
+
+
+@pytest.mark.asyncio
+async def test_job_results_reconnect_failure_marks_job_failed(client, db_session):
+    meter = await _seed_meter(db_session)
+    job = Job(job_type="reconnect", meter_id=meter.id, status=JobStatus.RUNNING, payload={"source": "web"})
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.post(
+        "/api/internal/gateway/job-results",
+        json={
+            "serial": meter.serial_number,
+            "results": [{"job_id": job.id, "ok": False, "error_code": "GATEWAY_ERROR", "error_message": "боль"}],
+        },
+        headers=_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"accepted": 1, "skipped": 0}
+
+    await db_session.refresh(job)
+    assert job.status == JobStatus.FAILED
+    assert job.error == {"code": "GATEWAY_ERROR", "message": "боль"}
 
 
 @pytest.mark.asyncio

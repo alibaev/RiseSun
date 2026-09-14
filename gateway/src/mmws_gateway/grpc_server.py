@@ -246,6 +246,7 @@ def _do_disconnect(request: gateway_pb2.DisconnectMeterRequest, call_home_pool: 
                 transport, serial=request.serial, password=password,
                 obis=dlms.DISCONNECT_CONTROL_OBIS, method_id=method_id,
                 class_id=dlms.DISCONNECT_CONTROL_CLASS_ID,
+                parameters=dlms.DISCONNECT_ACTION_PARAMETERS,
             )
 
     run_with_retries(operation, max_retries=retries)

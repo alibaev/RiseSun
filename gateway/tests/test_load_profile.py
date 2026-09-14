@@ -121,6 +121,30 @@ def test_empty_load_profile_returns_no_rows():
     assert decoded == []
 
 
+def test_rows_outside_requested_range_are_discarded():
+    """2026-09-12 (пользователь заметил лишние строки 06:00/06:30 при
+    запросе 00:00-02:00 в парковом тесте) — небольшая часть реальных
+    счётчиков игнорирует restricting_object диапазона GET и присылает
+    строки со СВОИМИ метками времени вне запрошенного окна (см.
+    DECISIONS.md). Раз счётчик не гарантирует диапазон — гарантируем
+    его сами и отбрасываем такие строки, а не полагаемся только на
+    счётчик (та же политика недоверия недостоверным данным, что и для
+    прочих подозрительных показаний)."""
+    rows = [
+        (FROM_DT - timedelta(days=1), [(999.0, 4, 0)]),  # раньше запрошенного окна
+        _row(0, 1000),  # в диапазоне
+        _row(5, 1001),  # в диапазоне
+        (TO_DT + timedelta(days=1), [(999.0, 4, 0)]),  # позже запрошенного окна
+    ]
+    with _start_server(rows, block_size=4096) as server:
+        decoded = _read_all(server)
+
+    assert len(decoded) == 2
+    assert {v[0] for _, v in decoded} == {1000, 1001}
+    for timestamp, _ in decoded:
+        assert FROM_DT <= timestamp <= TO_DT
+
+
 def test_read_profile_capture_objects_decodes_column_list():
     """2026-09-12 — диагностика причины data-access-error=250 на GET с
     диапазоном (см. DECISIONS.md, "покопай почему"): атрибут 3

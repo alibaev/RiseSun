@@ -16,6 +16,7 @@ from app.models import (
     Gateway,
     GatewayStatus,
     Job,
+    LoadProfileData,
     Meter,
     MeterReading,
     ProtocolProfile,
@@ -165,6 +166,65 @@ async def test_readings_returns_stored_meter_readings(client, db_session):
     assert body["total"] == 1
     assert body["items"][0]["meter_serial"] == meter.serial_number
     assert body["items"][0]["value"] == 15234.7
+
+
+@pytest.mark.asyncio
+async def test_profile_returns_stored_rows(client, db_session):
+    admin_token = await _seed_admin_and_login(client, db_session)
+    api_key = await _create_billing_key(client, admin_token)
+
+    root = (await db_session.execute(select(User))).scalars().first()
+    gateway = Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    db_session.add(gateway)
+    await db_session.flush()
+    meter = await _seed_meter(db_session, gateway.id)
+    db_session.add(
+        LoadProfileData(
+            meter_id=meter.id, obis_code="1.1.63.1.0.ff",
+            timestamp=datetime(2026, 8, 5, tzinfo=timezone.utc), values_json=[225.76, 0.1],
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/v1/billing/profile?date_from=2026-08-01T00:00:00%2B00:00&date_to=2026-08-10T00:00:00%2B00:00",
+        headers=_auth(api_key),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 1
+    assert body["items"][0]["meter_serial"] == meter.serial_number
+    assert body["items"][0]["values"] == [225.76, 0.1]
+
+
+@pytest.mark.asyncio
+async def test_profile_returns_empty_items_when_no_data(client, db_session):
+    """Нет данных за период — просто пустой список ("нет данных"), без
+    подмены на ближайшие доступные записи."""
+    admin_token = await _seed_admin_and_login(client, db_session)
+    api_key = await _create_billing_key(client, admin_token)
+
+    resp = await client.get(
+        "/api/v1/billing/profile?date_from=2026-08-01T00:00:00%2B00:00&date_to=2026-08-10T00:00:00%2B00:00",
+        headers=_auth(api_key),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 0
+    assert body["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_profile_invalid_date_range_returns_unified_400(client, db_session):
+    admin_token = await _seed_admin_and_login(client, db_session)
+    api_key = await _create_billing_key(client, admin_token)
+
+    resp = await client.get(
+        "/api/v1/billing/profile?date_from=2026-08-05T00:00:00%2B00:00&date_to=2026-08-01T00:00:00%2B00:00",
+        headers=_auth(api_key),
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "INVALID_DATE_RANGE"
 
 
 @pytest.mark.asyncio

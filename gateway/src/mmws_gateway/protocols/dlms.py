@@ -868,6 +868,30 @@ DISCONNECT_CONTROL_CLASS_ID = 70
 DISCONNECT_CONTROL_OBIS = "0.0.60.3.a.ff"
 METHOD_REMOTE_DISCONNECT = 1
 METHOD_REMOTE_RECONNECT = 2
+METHOD_RELEASE = 3
+
+# 2026-09-12 (декомпилированный референс IECMeterManage, ResetCommand_DLMS.cs
+# — см. DECISIONS.md) — реальный клиент ВСЕГДА шлёт этот 2-байтовый
+# параметр с ACTION на Cmd_Relay, независимо от метода (disconnect/
+# reconnect/release): {0x0F, 0x00} — DLMS common-data-type "structure"
+# (тег 0x0F) с нулём элементов, то есть "пустая структура". Наш код
+# раньше не передавал параметров вовсе (presence-flag "отсутствует") —
+# вероятная причина отказа data-access-result=250 на реальных счётчиках
+# (class_id/OBIS сами по себе подтверждены тем же референсом — верны).
+DISCONNECT_ACTION_PARAMETERS = bytes([0x0F, 0x00])
+
+# 2026-09-12 (декомпилированный референс IECMeterManage из ver2.zip,
+# MeterStatus_DLMS.cs::btnRead_Click — см. DECISIONS.md) — 48-битное
+# слово статуса, обычный GET, class_id=1 (Data). Живой тест на 2
+# реальных 100А счётчиках (id 5, 7) подтвердил, что адрес читается и
+# отдаёт правдоподобное (не мусорное) значение. Реле — часть этого
+# слова (биты 40-45 по координатам меток на форме референса), но точная
+# распаковка битов ещё не подтверждена сменой реального состояния реле
+# — значение пока читается и сохраняется сырым (backend/services/
+# job_worker.RELAY_STATE_OBIS хранит ту же строку отдельной константой,
+# т.к. Backend не импортирует Gateway).
+RELAY_STATE_OBIS = "0.0.60.a.1.ff"
+RELAY_STATE_CLASS_ID = 1
 
 
 def build_action_request(

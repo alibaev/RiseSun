@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..auth.deps import require_permission
 from ..core.permissions import Permission
 from ..db import get_db
-from ..models import Job, JobStatus, Meter, MeterReading, TamperLog, User
+from ..models import Job, JobStatus, LoadProfileData, Meter, MeterReading, TamperLog, User
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
@@ -43,6 +43,25 @@ async def _read_percentage(db: AsyncSession, active_meter_ids: list[int], since:
     return round(100.0 * distinct_read / len(active_meter_ids), 1)
 
 
+async def _load_profile_percentage(db: AsyncSession, active_meter_ids: list[int], since: datetime) -> float:
+    """Аналог ``_read_percentage``, но по LoadProfileData.recorded_at —
+    доля активных счётчиков, от которых мы реально ПОЛУЧИЛИ и сохранили
+    хотя бы одну строку профиля нагрузки начиная с ``since``. Используем
+    recorded_at (момент сохранения у нас), а не timestamp самой строки
+    (момент замера на счётчике) — иначе тестовое чтение старого окна
+    задним числом не будет засчитано как «опрос сегодня»."""
+    if not active_meter_ids:
+        return 0.0
+    distinct = (
+        await db.execute(
+            select(func.count(func.distinct(LoadProfileData.meter_id))).where(
+                LoadProfileData.meter_id.in_(active_meter_ids), LoadProfileData.recorded_at >= since,
+            )
+        )
+    ).scalar_one()
+    return round(100.0 * distinct / len(active_meter_ids), 1)
+
+
 @router.get("")
 async def get_dashboard(
     db: AsyncSession = Depends(get_db),
@@ -57,6 +76,29 @@ async def get_dashboard(
     jobs_active = (
         await db.execute(
             select(func.count()).select_from(Job).where(Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]))
+        )
+    ).scalar_one()
+
+    # Опрос профиля нагрузки (Profile 1) — отдельная сводка, чтобы не
+    # спрашивать отчёт вручную: сколько задач ещё в очереди/выполняется,
+    # сколько завершилось неудачно за сутки, и с какой доли активных
+    # счётчиков реально получены и сохранены строки профиля.
+    load_profile_jobs_active = (
+        await db.execute(
+            select(func.count())
+            .select_from(Job)
+            .where(Job.job_type == "read_load_profile", Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]))
+        )
+    ).scalar_one()
+    load_profile_jobs_failed_24h = (
+        await db.execute(
+            select(func.count())
+            .select_from(Job)
+            .where(
+                Job.job_type == "read_load_profile",
+                Job.status == JobStatus.FAILED,
+                Job.finished_at >= day_ago,
+            )
         )
     ).scalar_one()
 
@@ -81,8 +123,10 @@ async def get_dashboard(
     readings_by_hour = [{"hour": hour, "count": count} for hour, count in sorted(buckets.items())]
 
     active_meter_ids = [m.id for m in meters]
-    read_percentage_today = await _read_percentage(db, active_meter_ids, _bishkek_day_start_utc(now))
+    day_start_bishkek = _bishkek_day_start_utc(now)
+    read_percentage_today = await _read_percentage(db, active_meter_ids, day_start_bishkek)
     read_percentage_3d = await _read_percentage(db, active_meter_ids, now - timedelta(days=3))
+    load_profile_percentage_today = await _load_profile_percentage(db, active_meter_ids, day_start_bishkek)
 
     return {
         "meters_total": len(meters),
@@ -93,4 +137,7 @@ async def get_dashboard(
         "jobs_active": jobs_active,
         "tamper_events_24h": tamper_events_24h,
         "readings_by_hour": readings_by_hour,
+        "load_profile_percentage_today": load_profile_percentage_today,
+        "load_profile_jobs_active": load_profile_jobs_active,
+        "load_profile_jobs_failed_24h": load_profile_jobs_failed_24h,
     }

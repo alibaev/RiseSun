@@ -87,5 +87,28 @@ class Settings(BaseSettings):
     # выполняет.
     stale_running_job_reap_after_s: float = 300.0
 
+    # 2026-09-14, по прямому указанию пользователя — ежедневный экспорт
+    # профиля нагрузки (Profile1) во внешнюю БД ЕЭБД (Единая база данных
+    # энергосбыта, отдельный сервер/схема — НЕ наш Postgres). Пусто по
+    # умолчанию — экспорт неактивен, пока явно не настроен через .env
+    # (см. services/eudb_export.py). Отдельные host/port вместо готовой
+    # DSN-строки — единообразно с MMWS_DATABASE_URL нельзя, т.к. пароль
+    # ЕЭБД может содержать символы, требующие url-квотирования, а
+    # asyncpg.connect() принимает их раздельными kwargs без этой возни.
+    eudb_host: str = ""
+    eudb_port: int = 5432
+    eudb_database: str = ""
+    eudb_user: str = ""
+    eudb_password: str = ""
+    # UUID справочника производителей ЕЭБД для Risesun (cd.ctl_meter_
+    # models.ref_producer) — используется в SELECT поиска mtr_guid по
+    # серийнику, см. eudb_export.py.
+    eudb_risesun_producer_guid: str = "972ccc41-0489-47cc-8056-f4bf1c2ede65"
+    # Локальное время (Asia/Bishkek — тот же пояс, что и у показаний
+    # счётчиков), в которое ежедневно запускается экспорт — по просьбе
+    # пользователя "в конце суток, 23:50".
+    eudb_export_hour_bishkek: int = 23
+    eudb_export_minute_bishkek: int = 50
+
 
 settings = Settings()

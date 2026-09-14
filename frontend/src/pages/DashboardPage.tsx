@@ -10,6 +10,9 @@ interface DashboardData {
   jobs_active: number;
   tamper_events_24h: number;
   readings_by_hour: { hour: string; count: number }[];
+  load_profile_percentage_today: number;
+  load_profile_jobs_active: number;
+  load_profile_jobs_failed_24h: number;
 }
 
 // ТЗ п.4.2.11 — стартовый экран со сводной статистикой.
@@ -88,6 +91,24 @@ export function DashboardPage() {
               <div className="stat-label">Tamper-событий за 24ч</div>
             </div>
           </div>
+
+          <section className="card">
+            <h2>Опрос профиля нагрузки (Profile 1)</h2>
+            <div className="dashboard-stats">
+              <div className="card stat-card">
+                <div className="stat-value">{data.load_profile_percentage_today}%</div>
+                <div className="stat-label">Получен профиль сегодня</div>
+              </div>
+              <div className="card stat-card">
+                <div className="stat-value">{data.load_profile_jobs_active}</div>
+                <div className="stat-label">В очереди / выполняется</div>
+              </div>
+              <div className="card stat-card">
+                <div className="stat-value">{data.load_profile_jobs_failed_24h}</div>
+                <div className="stat-label">Неудачных за 24ч</div>
+              </div>
+            </div>
+          </section>
 
           <section className="card">
             <h2>Динамика опроса (показания за последние 24 часа, по часам)</h2>

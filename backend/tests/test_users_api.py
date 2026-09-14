@@ -99,3 +99,39 @@ async def test_update_unknown_user_returns_404(client, db_session):
         "/api/users/9999", json={"is_active": False}, headers={"Authorization": f"Bearer {token}"}
     )
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_user_without_history_succeeds(client, db_session):
+    await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    target = await _seed_user(db_session, username="op", password="pass1234", role=UserRole.OPERATOR)
+    token = await _login(client, "root", "pass1234")
+
+    resp = await client.delete(f"/api/users/{target.id}", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 204
+
+    list_resp = await client.get("/api/users", headers={"Authorization": f"Bearer {token}"})
+    assert all(u["username"] != "op" for u in list_resp.json())
+
+
+@pytest.mark.asyncio
+async def test_delete_user_cannot_delete_self(client, db_session):
+    root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    token = await _login(client, "root", "pass1234")
+
+    resp = await client.delete(f"/api/users/{root.id}", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_delete_user_with_audit_history_returns_conflict(client, db_session):
+    await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    target = await _seed_user(db_session, username="op", password="pass1234", role=UserRole.OPERATOR)
+    root_token = await _login(client, "root", "pass1234")
+    # Логин самой цели создаёт запись в audit_log (action="login",
+    # user_id=target.id) — ровно та история, из-за которой удаление
+    # должно быть заблокировано FK, а не пройти каскадно/молча.
+    await _login(client, "op", "pass1234")
+
+    resp = await client.delete(f"/api/users/{target.id}", headers={"Authorization": f"Bearer {root_token}"})
+    assert resp.status_code == 409

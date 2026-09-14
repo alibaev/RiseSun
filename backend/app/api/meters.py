@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
@@ -401,6 +402,29 @@ async def trigger_read_rated_current(
     return job
 
 
+@router.post("/{meter_id}/read-relay-state", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
+async def trigger_read_relay_state(
+    meter_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.WRITE_PARAMETER)),
+) -> Job:
+    """Ручной запрос состояния реле (Этап 5, 2026-09-12 — см. DECISIONS.md,
+    "Disconnect Control: найден и исправлен пропущенный параметр ACTION").
+    OBIS/class_id фиксированы (job_worker.RELAY_STATE_OBIS, class_id=1),
+    не параметризуются — тот же принцип, что и у read_rated_current.
+    Требует WRITE_PARAMETER (не TRIGGER_READ), т.к. эта операция —
+    часть меню "Работа с счётчиками" (2026-09-12, по прямому указанию
+    пользователя: доступ к его функциям делится на просмотр/полный по
+    тем же ролям, что и WRITE_PARAMETER — Инженер/Админ/Супер-админ)."""
+    await _get_active_meter_or_error(db, meter_id)
+
+    job = Job(job_type="read_relay_state", meter_id=meter_id, payload={}, created_by_id=user.id)
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
 @router.post("/{meter_id}/write-datetime", response_model=JobOut, status_code=status.HTTP_202_ACCEPTED)
 async def trigger_write_datetime(
     meter_id: int,
@@ -558,6 +582,24 @@ async def trigger_read_load_profile(
     return job
 
 
+_METER_LOCAL_TZ = ZoneInfo("Asia/Bishkek")
+
+
+def _parse_meter_local_iso(value: str) -> datetime:
+    """from_iso/to_iso с фронтенда — границы дня в местном времени
+    оператора (Asia/Bishkek, см. <input type="date"> в MeterDetailPage),
+    наивные (без пояса). LoadProfileData.timestamp хранится в истинном
+    UTC (после фикса 2026-09-12, см. DECISIONS.md), поэтому перед
+    сравнением наивную границу нужно явно локализовать как Бишкек —
+    иначе сравнение по факту шло бы в UTC и не находило бы строки,
+    относящиеся к первой половине местных суток (они физически лежат в
+    UTC ещё во ВЧЕРАШНЕМ календарном дне)."""
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_METER_LOCAL_TZ)
+    return parsed
+
+
 @router.get("/{meter_id}/load-profile", response_model=list[LoadProfileRowOut])
 async def list_load_profile(
     meter_id: int,
@@ -569,9 +611,9 @@ async def list_load_profile(
 ) -> list[LoadProfileData]:
     query = select(LoadProfileData).where(LoadProfileData.meter_id == meter_id)
     if from_iso:
-        query = query.where(LoadProfileData.timestamp >= datetime.fromisoformat(from_iso))
+        query = query.where(LoadProfileData.timestamp >= _parse_meter_local_iso(from_iso))
     if to_iso:
-        query = query.where(LoadProfileData.timestamp <= datetime.fromisoformat(to_iso))
+        query = query.where(LoadProfileData.timestamp <= _parse_meter_local_iso(to_iso))
     result = await db.execute(query.order_by(LoadProfileData.timestamp).limit(limit))
     return list(result.scalars().all())
 

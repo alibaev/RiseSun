@@ -56,6 +56,15 @@ class DueLoadProfileJob:
 
 
 @dataclass
+class DueControlJob:
+    # 2026-09-12 (см. DECISIONS.md) — команда управления реле
+    # (disconnect/reconnect) через call-home, с приоритетом над рядовым
+    # чтением. ``job_type`` — "disconnect" либо "reconnect".
+    job_id: int
+    job_type: str
+
+
+@dataclass
 class ClaimDueJobsResult:
     meter_found: bool
     meter_id: int | None = None
@@ -63,13 +72,14 @@ class ClaimDueJobsResult:
     password: str | None = None
     jobs: list[DueJob] = field(default_factory=list)
     load_profile_jobs: list[DueLoadProfileJob] = field(default_factory=list)
+    control_jobs: list[DueControlJob] = field(default_factory=list)
 
 
 @dataclass
 class JobResultReport:
     job_id: int
-    obis: str
     ok: bool
+    obis: str | None = None
     value: object | None = None
     error_code: str | None = None
     error_message: str | None = None
@@ -128,7 +138,9 @@ def claim_due_jobs(
     body = _post_json(f"/api/internal/gateway/meters/{serial}/claim-jobs", payload, timeout_s=timeout_s)
     if body is None:
         return None
-    if not body.get("meter_found") or not (body.get("jobs") or body.get("load_profile_jobs")):
+    if not body.get("meter_found") or not (
+        body.get("jobs") or body.get("load_profile_jobs") or body.get("control_jobs")
+    ):
         return None
     jobs = [
         DueJob(job_id=j["job_id"], job_type=j["job_type"], obis=j["obis"], class_id=j["class_id"])
@@ -141,6 +153,10 @@ def claim_due_jobs(
         )
         for j in body.get("load_profile_jobs") or []
     ]
+    control_jobs = [
+        DueControlJob(job_id=j["job_id"], job_type=j["job_type"])
+        for j in body.get("control_jobs") or []
+    ]
     return ClaimDueJobsResult(
         meter_found=True,
         meter_id=body.get("meter_id"),
@@ -148,6 +164,7 @@ def claim_due_jobs(
         password=body.get("password"),
         jobs=jobs,
         load_profile_jobs=load_profile_jobs,
+        control_jobs=control_jobs,
     )
 
 

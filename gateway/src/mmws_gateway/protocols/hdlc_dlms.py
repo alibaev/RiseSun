@@ -443,6 +443,7 @@ def execute_action(
     obis: str,
     method_id: int,
     class_id: int,
+    parameters: bytes | None = None,
 ) -> None:
     """Удалённое отключение/подключение счётчика (Этап 5, ТЗ п.4.2.10) —
     SNRM/UA + AARQ/AARE + ACTION. Ничего не возвращает, бросает
@@ -450,6 +451,7 @@ def execute_action(
     establish_link(transport, serial=serial)
     execute_action_via_established_link(
         transport, serial=serial, password=password, obis=obis, method_id=method_id, class_id=class_id,
+        parameters=parameters,
     )
 
 
@@ -461,6 +463,7 @@ def execute_action_via_established_link(
     obis: str,
     method_id: int,
     class_id: int,
+    parameters: bytes | None = None,
 ) -> None:
     """AARQ/AARE + ACTION поверх УЖЕ установленной (SNRM/UA пройден) HDLC-связи."""
     server_addr = server_hdlc_address(physical_address(serial, HDLC_DLMS))
@@ -472,7 +475,7 @@ def execute_action_via_established_link(
     )
     dlms.parse_aare(dlms.unwrap_llc(aare_frame.information))
 
-    request = dlms.build_action_request(dlms.parse_obis(obis), method_id, class_id=class_id)
+    request = dlms.build_action_request(dlms.parse_obis(obis), method_id, class_id=class_id, parameters=parameters)
     _send_i_frame(
         transport, server_addr, client_addr, send_seq=1, recv_seq=1,
         information=dlms.wrap_llc_command(request),
@@ -777,6 +780,29 @@ def read_load_profile_via_established_link(
     # обмен на заведомо обречённую константную попытку).
     use_incrementing_invoke_id = False
 
+    def _decode_row_if_in_range(row: bytes):
+        """2026-09-12 (пользователь заметил лишние строки за 06:00-06:30
+        при запросе 00:00-02:00) — небольшая часть счётчиков (единицы из
+        тысяч в парковом тесте) игнорирует restricting_object диапазона
+        и отдаёт строки СО СВОИМИ метками времени вне запрошенного окна
+        (похоже на рассинхронизацию часов конкретного прибора, не на
+        нашу сторону — подавляющее большинство парка получает ровно
+        запрошенный диапазон тем же самым кодом). Раз счётчик не
+        гарантирует диапазон, гарантируем его сами: отбрасываем строки
+        вне [from_dt, to_dt] здесь, а не полагаемся только на счётчика —
+        та же политика, что и для прочих недостоверных показаний (см.
+        DECISIONS.md, политика по невалидным данным) — не сохранять
+        подозрительное как есть."""
+        decoded = dlms.decode_load_profile_row(row)
+        timestamp = decoded[0]
+        if not (from_dt <= timestamp <= to_dt):
+            logger.warning(
+                "Профиль нагрузки %s: строка с меткой %s вне запрошенного диапазона [%s, %s] — отброшена",
+                serial, timestamp, from_dt, to_dt,
+            )
+            return None
+        return decoded
+
     while True:
         response_frame = _recv_i_frame(transport)
         payload = dlms.unwrap_llc(response_frame.information)
@@ -796,9 +822,13 @@ def read_load_profile_via_established_link(
             buf.extend(payload[4:])
             rows, buf_tail = dlms.split_load_profile_rows(bytes(buf))
             for row in rows:
-                yield dlms.decode_load_profile_row(row)
+                decoded = _decode_row_if_in_range(row)
+                if decoded is not None:
+                    yield decoded
             if buf_tail:
-                yield dlms.decode_load_profile_row(buf_tail)
+                decoded = _decode_row_if_in_range(buf_tail)
+                if decoded is not None:
+                    yield decoded
             return
 
         if response_type != dlms.GET_RESPONSE_WITH_DATABLOCK:
@@ -829,12 +859,16 @@ def read_load_profile_via_established_link(
 
         rows, remainder = dlms.split_load_profile_rows(bytes(buf))
         for row in rows:
-            yield dlms.decode_load_profile_row(row)
+            decoded = _decode_row_if_in_range(row)
+            if decoded is not None:
+                yield decoded
         buf = bytearray(remainder)
 
         if block.last_block:
             if buf:
-                yield dlms.decode_load_profile_row(bytes(buf))
+                decoded = _decode_row_if_in_range(bytes(buf))
+                if decoded is not None:
+                    yield decoded
             return
 
         # GET.request-Next продолжает УЖЕ начатую блочную передачу ответа

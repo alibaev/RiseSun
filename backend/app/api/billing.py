@@ -22,6 +22,7 @@ from ..models import (
     DisconnectBatchOperation,
     DisconnectBatchStatus,
     Job,
+    LoadProfileData,
     Meter,
     MeterReading,
 )
@@ -109,6 +110,64 @@ async def get_readings(
                 "read_at": reading.read_at.isoformat(),
             }
             for reading, serial in rows
+        ],
+    }
+
+
+@router.get("/profile")
+async def get_profile(
+    date_from: str,
+    date_to: str,
+    meter_ids: str | None = None,
+    region: str | None = None,
+    page: int = 1,
+    page_size: int = _DEFAULT_PAGE_SIZE,
+    db: AsyncSession = Depends(get_db),
+    api_key: BillingApiKey = Depends(require_billing_api_key),
+) -> dict:
+    """API.docx п.4.1а — профиль нагрузки, тот же контракт, что и у
+    GET /readings (п.4.1), только источник данных — LoadProfileData.
+    Биллинг сам решает, что ему нужно — показания или профиль (два
+    отдельных метода); если данных за период нет — просто пустой
+    ``items`` (та же семантика "нет данных", что и у /readings), без
+    какой-либо замены на ближайшие доступные записи."""
+    page, page_size = _paginate(page, page_size)
+    from_dt = _parse_iso(date_from, field="date_from")
+    to_dt = _parse_iso(date_to, field="date_to")
+    if from_dt >= to_dt:
+        raise BillingApiError(400, "INVALID_DATE_RANGE", "date_from must be earlier than date_to")
+    if to_dt - from_dt > timedelta(days=_MAX_DATE_RANGE_DAYS):
+        raise BillingApiError(
+            400, "INVALID_DATE_RANGE", f"Диапазон дат не должен превышать {_MAX_DATE_RANGE_DAYS} суток"
+        )
+
+    query = (
+        select(LoadProfileData, Meter.serial_number)
+        .join(Meter, LoadProfileData.meter_id == Meter.id)
+        .where(LoadProfileData.timestamp >= from_dt, LoadProfileData.timestamp <= to_dt)
+    )
+    if meter_ids:
+        query = query.where(Meter.serial_number.in_([s.strip() for s in meter_ids.split(",") if s.strip()]))
+    if region:
+        query = query.where(Meter.location == region)
+
+    total = len((await db.execute(query)).all())
+    rows = (
+        await db.execute(query.order_by(LoadProfileData.timestamp).offset((page - 1) * page_size).limit(page_size))
+    ).all()
+
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "items": [
+            {
+                "meter_serial": serial,
+                "obis_code": row.obis_code,
+                "values": row.values_json,
+                "timestamp": row.timestamp.isoformat(),
+            }
+            for row, serial in rows
         ],
     }
 

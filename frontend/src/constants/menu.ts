@@ -24,6 +24,23 @@ function stub(label: string): MenuLeaf {
 
 export const MENU: MenuCategory[] = [
   {
+    // 2026-09-12, по прямому указанию пользователя — новый пункт меню
+    // "Работа с счётчиками", выше "Архива". Не путать со справочником
+    // счётчиков ("Архив → Счётчики" — карточка ОДНОГО счётчика,
+    // параметры/история). Изначально была одна общая страница
+    // "Групповые операции" — 2026-09-13 пользователь указал, что так
+    // неудобно, и попросил разбить на 4 отдельных пункта: показания/
+    // напряжение/ампер/реле+откл-подкл отдельно от запроса профиля
+    // нагрузки, и один счётчик отдельно от группы.
+    label: "Работа с счётчиками",
+    items: [
+      { label: "Опрос счётчика", to: "/meter-operations/poll", implemented: true },
+      { label: "Опрос профиля", to: "/meter-operations/profile", implemented: true },
+      { label: "Опрос группы счётчиков", to: "/meter-operations/poll-group", implemented: true },
+      { label: "Опрос профиля группой", to: "/meter-operations/profile-group", implemented: true },
+    ],
+  },
+  {
     label: "Архив",
     items: [
       stub("Энергосеть (иерархия)"),
@@ -54,6 +71,7 @@ export const MENU: MenuCategory[] = [
       stub("Опрос по GPRS"),
       { label: "Профили опроса", to: "/poll-profiles", implemented: true },
       { label: "Расписания опроса", to: "/scheduled-jobs", implemented: true },
+      { label: "Экспорт профиля в ЕЭБД", to: "/eudb-export", implemented: true },
       stub("Задачи параметров (Param Task Setting)"),
       stub("Анализ сети счётчиков"),
     ],
@@ -91,6 +109,7 @@ export const MENU: MenuCategory[] = [
       stub("Подписки"),
       { label: "API-ключи биллинга", to: "/billing-keys", implemented: true },
       { label: "Gateway", to: "/gateways", implemented: true },
+      { label: "О программе", to: "/about", implemented: true },
     ],
   },
 ];

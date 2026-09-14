@@ -13,8 +13,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import case, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -67,17 +68,58 @@ _VER2_EMULATION_EXPERIMENT_EXCLUDED_METER_IDS: set[int] = set()
 
 
 async def _claim_next_job(db: AsyncSession) -> Job | None:
-    result = await db.execute(
+    # 2026-09-12 (по просьбе пользователя — "запрос пользователя встал
+    # в очередь, а не должен") — этот GLOBAL FIFO (не привязанный к
+    # конкретному счётчику, в отличие от claim_due_jobs_for_meter) ДО
+    # этой правки был чистым ``ORDER BY created_at`` без какого-либо
+    # понятия приоритета вообще: свежая команда управления или
+    # операторский запрос вставали в ОБЩИЙ хвост очереди наравне со
+    # старыми плановыми job'ами (а в этой сессии их могли быть тысячи
+    # после массового парковых тестов) — тот же класс проблемы, что уже
+    # решён для claim_due_jobs_for_meter (события звонка счётчика), но
+    # не перенесённый сюда, в резервный путь ЭТОГО ЖЕ воркера. Теперь
+    # тот же двухуровневый приоритет: сначала PRIORITY_JOB_TYPES (см.
+    # выше), затем среди остального — не-плановые (scheduled_job_run_id
+    # IS NULL, т.е. прямое действие оператора через интерфейс) впереди
+    # плановых.
+    # disconnect/reconnect для call-home счётчиков НЕ работают через этот
+    # старый gRPC-путь (см. _CALL_HOME_INCOMPATIBLE_JOB_TYPES ниже) — не
+    # даём этому FIFO вообще претендовать на такие job'ы, ни в
+    # приоритетной, ни в общей выборке, иначе они мгновенно проваливаются
+    # с "не реализовано" вместо ожидания события звонка (см. DECISIONS.md,
+    # 2026-09-14).
+    _not_broken_call_home_control = or_(
+        Job.job_type.not_in(_CALL_HOME_INCOMPATIBLE_JOB_TYPES),
+        Meter.is_call_home.is_(False),
+    )
+    priority_result = await db.execute(
         select(Job)
+        .join(Meter, Meter.id == Job.meter_id)
         .where(
             Job.status == JobStatus.QUEUED,
+            Job.job_type.in_(PRIORITY_JOB_TYPES),
             Job.meter_id.not_in(_VER2_EMULATION_EXPERIMENT_EXCLUDED_METER_IDS),
+            _not_broken_call_home_control,
         )
         .order_by(Job.created_at)
         .limit(1)
-        .with_for_update(skip_locked=True)
+        .with_for_update(skip_locked=True, of=Job)
     )
-    job = result.scalar_one_or_none()
+    job = priority_result.scalar_one_or_none()
+    if job is None:
+        result = await db.execute(
+            select(Job)
+            .join(Meter, Meter.id == Job.meter_id)
+            .where(
+                Job.status == JobStatus.QUEUED,
+                Job.meter_id.not_in(_VER2_EMULATION_EXPERIMENT_EXCLUDED_METER_IDS),
+                _not_broken_call_home_control,
+            )
+            .order_by(case((Job.scheduled_job_run_id.is_(None), 0), else_=1), Job.created_at)
+            .limit(1)
+            .with_for_update(skip_locked=True, of=Job)
+        )
+        job = result.scalar_one_or_none()
     if job is None:
         # 2026-09-12 (см. DECISIONS.md, тот же баг найден и в
         # claim_due_jobs_for_meter) — SELECT ... FOR UPDATE открывает
@@ -93,6 +135,34 @@ async def _claim_next_job(db: AsyncSession) -> Job | None:
     await db.commit()
     await db.refresh(job)
     return job
+
+
+# 2026-09-12 (по просьбе пользователя — "все такие команды/запросы
+# (отключение/подключение, запрос состояния реле) должны выполняться
+# немедленно, не ждать очереди. если есть очередь, то только из этих
+# команд") — эти job_type всегда обгоняют рядовое чтение (read_current/
+# read_load_profile) при звонке счётчика: если хоть одна из них уже
+# в очереди для звонящего счётчика, отдаём ТОЛЬКО их (см. ниже) — не
+# смешиваем управляющую команду с рядовым чтением параметров в одном
+# заходе, чтобы задержка/отказ рядового чтения никак не влиял на
+# скорость реакции команды управления.
+PRIORITY_JOB_TYPES = {"disconnect", "reconnect", "read_relay_state"}
+
+# Реальный баг, найден 2026-09-14 на живом call-home счётчике
+# 201909002049: job "reconnect" был поставлен пользователем через
+# интерфейс, но этот GLOBAL FIFO (``_claim_next_job``) забрал его раньше
+# событийного пути и передал в СТАРЫЙ gRPC-путь (``_run_disconnect_
+# operation`` -> ``gateway_client.disconnect_meter`` -> grpc_server.py
+# ``_do_disconnect``), который для call-home счётчиков просто бросает
+# ``GatewayError("...пока не реализовано")`` без какой-либо попытки
+# дождаться звонка — job мгновенно проваливался, хотя рабочий путь
+# (событийный, ``claim_due_jobs_for_meter`` -> ``callhome.py::
+# _run_control_jobs``, см. DECISIONS.md "Disconnect Control...") к этому
+# моменту уже существовал и прекрасно справляется, просто не успел
+# первым. ``read_relay_state`` сюда не входит — это обычное чтение,
+# старый путь и для call-home работает корректно (через
+# ``read_via_call_home`` с реальным ожиданием звонка).
+_CALL_HOME_INCOMPATIBLE_JOB_TYPES = {"disconnect", "reconnect"}
 
 
 async def claim_due_jobs_for_meter(
@@ -111,10 +181,37 @@ async def claim_due_jobs_for_meter(
     почти одновременные call-home попытки того же серийника, см.
     docstring ``callhome.py`` про частые переподключения), совпадающие
     job'ы просто не попадут в выборку второго вызова (уже не QUEUED)."""
+    priority_types = [t for t in job_types if t in PRIORITY_JOB_TYPES]
+    if priority_types:
+        priority_result = await db.execute(
+            select(Job)
+            .where(Job.meter_id == meter_id, Job.job_type.in_(priority_types), Job.status == JobStatus.QUEUED)
+            .order_by(Job.created_at)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        priority_jobs = priority_result.scalars().all()
+        if priority_jobs:
+            now = datetime.now(timezone.utc)
+            for job in priority_jobs:
+                job.status = JobStatus.RUNNING
+                job.started_at = now
+            await db.commit()
+            for job in priority_jobs:
+                await db.refresh(job)
+            return list(priority_jobs)
+
+    # 2026-09-12 (по просьбе пользователя — "после этих задач [команд
+    # управления], но впереди планового опроса, стоят действия
+    # оператора/пользователя") — второй уровень приоритета: job без
+    # scheduled_job_run_id (ручной запуск оператором — кнопка на
+    # карточке счётчика/API) обгоняет job, порождённый расписанием
+    # (scheduled_job_run_id задан), при прочих равных упорядочено по
+    # времени постановки внутри каждого уровня.
     result = await db.execute(
         select(Job)
         .where(Job.meter_id == meter_id, Job.job_type.in_(job_types), Job.status == JobStatus.QUEUED)
-        .order_by(Job.created_at)
+        .order_by(case((Job.scheduled_job_run_id.is_(None), 0), else_=1), Job.created_at)
         .limit(limit)
         .with_for_update(skip_locked=True)
     )
@@ -223,6 +320,16 @@ async def finalize_read_current_job(db: AsyncSession, job: Job, meter: Meter, ou
 # статичный паспортный параметр).
 RATED_CURRENT_OBIS = "1.1.0.6.3.ff"
 
+# 2026-09-12 (декомпилированный референс IECMeterManage из ver2.zip,
+# MeterStatus_DLMS.cs::btnRead_Click — см. DECISIONS.md) — 48-битное
+# слово статуса, обычный GET, class_id=1 (Data). Реле — лишь часть
+# этого слова (биты 40-45 по координатам меток на форме референса).
+# Значение читается и сохраняется здесь сырым (hex-строка) — распаковка
+# битов в "включено"/"отключено" (подтверждена пользователем на
+# реальном счётчике, см. DECISIONS.md) сделана на Frontend
+# (MeterOperationsPage.tsx::decodeRelayState), не здесь.
+RELAY_STATE_OBIS = "0.0.60.a.1.ff"
+
 # Допустимые номиналы тока для этого парка счётчиков — по прямому указанию
 # пользователя (2026-09-11): "Ампер может быть - 5, 7.5, 100, другие значения
 # ошибочные, нужен повторный запрос". Значение вне этого множества трактуется
@@ -264,6 +371,38 @@ async def _run_read_rated_current(db: AsyncSession, job: Job) -> None:
         call_timeout_s=160.0 if meter.is_call_home else 60.0,
     )
     await finalize_read_rated_current_job(db, job, meter, outcome)
+
+
+async def _run_read_relay_state(db: AsyncSession, job: Job) -> None:
+    """2026-09-12 (см. DECISIONS.md) — старый FIFO-путь для
+    read_relay_state: подстраховка на случай, если событийный путь
+    (claim-jobs при звонке) не успел забрать job первым (тот же принцип,
+    что и у read_current/read_rated_current — обе задачи имеют
+    обработчик и там, и там, а не только в событийном пути)."""
+    meter = await db.get(Meter, job.meter_id)
+    if meter is None:
+        job.status = JobStatus.FAILED
+        job.error = {"code": "METER_NOT_FOUND", "message": f"Счётчик id={job.meter_id} не найден"}
+        job.finished_at = datetime.now(timezone.utc)
+        await db.commit()
+        return
+
+    gateway = meter.gateway
+    password = decrypt_secret(meter.password_encrypted).decode("ascii")
+
+    outcome = await read_register(
+        grpc_target=gateway.grpc_target if gateway else settings.gateway_grpc_target,
+        profile=meter.protocol_profile.value,
+        host=meter.ip_address or "",
+        port=meter.port or 0,
+        call_home=meter.is_call_home,
+        serial=meter.serial_number,
+        password=password,
+        obis=RELAY_STATE_OBIS,
+        class_id=1,
+        call_timeout_s=160.0 if meter.is_call_home else 60.0,
+    )
+    await finalize_read_current_job(db, job, meter, outcome, obis=RELAY_STATE_OBIS)
 
 
 async def finalize_read_rated_current_job(db: AsyncSession, job: Job, meter: Meter, outcome) -> None:
@@ -489,14 +628,23 @@ async def _run_write_parameter(db: AsyncSession, job: Job) -> None:
 
 _LOAD_PROFILE_COMMIT_BATCH = 20
 
+# Часы буфера профиля нагрузки — собственные часы счётчика, выставленные
+# на местное время (Asia/Bishkek), а не UTC (стандартная практика для
+# тарифных приборов учёта). Gateway отдаёт эту метку как naive ISO-строку
+# (см. dlms.decode_load_profile_row/grpc_server.py) без указания пояса —
+# без явной локализации она ошибочно попадала бы в БД как UTC (сдвиг на
+# 6 часов от истинного момента, что и увидел пользователь во фронтенде:
+# "06:00:00" вместо "00:00:00", 2026-09-12).
+_METER_LOCAL_TZ = ZoneInfo("Asia/Bishkek")
+
 
 async def _insert_load_profile_row(db: AsyncSession, *, meter_id: int, obis: str, job_id: int, timestamp_iso: str, values: object) -> None:
+    timestamp = datetime.fromisoformat(timestamp_iso)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=_METER_LOCAL_TZ)
     stmt = (
         pg_insert(LoadProfileData)
-        .values(
-            meter_id=meter_id, obis_code=obis, timestamp=datetime.fromisoformat(timestamp_iso),
-            values_json=values, job_id=job_id,
-        )
+        .values(meter_id=meter_id, obis_code=obis, timestamp=timestamp, values_json=values, job_id=job_id)
         .on_conflict_do_nothing(constraint="uq_load_profile_row")
     )
     await db.execute(stmt)
@@ -637,10 +785,27 @@ async def _run_disconnect_operation(db: AsyncSession, job: Job, *, operation: st
         call_timeout_s=160.0 if meter.is_call_home else 60.0,
     )
 
-    job.status = JobStatus.SUCCEEDED if outcome.ok else JobStatus.FAILED
-    job.result = {"operation": operation, "ok": outcome.ok}
-    if not outcome.ok:
-        job.error = {"code": outcome.error_code, "message": outcome.error_message}
+    await finalize_disconnect_job(
+        db, job, meter, operation=operation, ok=outcome.ok,
+        error_code=outcome.error_code, error_message=outcome.error_message,
+    )
+
+
+async def finalize_disconnect_job(
+    db: AsyncSession, job: Job, meter: Meter, *, operation: str, ok: bool,
+    error_code: str | None, error_message: str | None,
+) -> None:
+    """Общая финализация disconnect/reconnect — вынесена из
+    ``_run_disconnect_operation`` (2026-09-12, см. DECISIONS.md), чтобы
+    ОДНА и та же логика (статус job'ы + audit) использовалась и старым
+    путём (этот воркер, через gRPC DisconnectMeter — для счётчиков с
+    прямым IP), и новым событийным (``POST /api/internal/gateway/
+    job-results`` — для call-home счётчиков, у которых старый gRPC-путь
+    прямо отказывается работать, см. DECISIONS.md)."""
+    job.status = JobStatus.SUCCEEDED if ok else JobStatus.FAILED
+    job.result = {"operation": operation, "ok": ok}
+    if not ok:
+        job.error = {"code": error_code, "message": error_message}
     job.finished_at = datetime.now(timezone.utc)
 
     await record_audit(
@@ -649,12 +814,12 @@ async def _run_disconnect_operation(db: AsyncSession, job: Job, *, operation: st
         action=f"meter.{operation}",
         object_type="meter",
         object_id=str(meter.id),
-        result="success" if outcome.ok else "failure",
+        result="success" if ok else "failure",
         source=job.payload.get("source", "web"),
         details={
             "serial": meter.serial_number,
             "batch_id": job.payload.get("batch_id"),
-            "error": None if outcome.ok else outcome.error_message,
+            "error": None if ok else error_message,
         },
     )
     await db.commit()
@@ -676,6 +841,7 @@ _JOB_HANDLERS = {
     "disconnect": _run_disconnect,
     "reconnect": _run_reconnect,
     "read_rated_current": _run_read_rated_current,
+    "read_relay_state": _run_read_relay_state,
 }
 
 
@@ -832,6 +998,81 @@ async def stale_job_reaper_loop(stop_event: asyncio.Event) -> None:
         except asyncio.TimeoutError:
             pass
     logger.info("Реаниматор зависших RUNNING-задач остановлен")
+
+
+# 2026-09-13 (по просьбе пользователя — "с наступлением новых суток,
+# очередь заданий обнуляется") — только РЯДОВОЙ плановый опрос, не
+# команды управления (disconnect/reconnect/read_relay_state — см.
+# PRIORITY_JOB_TYPES): это разовые, явные действия оператора, они
+# обязаны доводиться до конца независимо от смены суток, не "сгорать"
+# сами по себе. Без этого сброса QUEUED-задача, оставшаяся с ВЧЕРА
+# (счётчик так и не позвонил), блокировала бы создание СВЕЖЕЙ на
+# сегодня — планировщик (``_outstanding_job_meter_ids``) считает такой
+# счётчик уже имеющим невыполненную задачу этого типа и пропускает его
+# на новых суток, пока эта задача сама не исполнится (а может не
+# исполниться никогда — тот же класс молчащих счётчиков, что и
+# AARQ-тишина).
+ROUTINE_JOB_TYPES = {"read_current", "read_load_profile", "read_rated_current"}
+
+
+def _bishkek_day_start_utc(now: datetime) -> datetime:
+    day_start_bishkek = now.astimezone(_METER_LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    return day_start_bishkek.astimezone(timezone.utc)
+
+
+async def expire_stale_queued_jobs_for_new_day(db: AsyncSession) -> int:
+    """Помечает FAILED все QUEUED job'ы планового опроса
+    (``ROUTINE_JOB_TYPES``), поставленные ДО начала текущих суток по
+    Бишкеку — "обнуление очереди" при смене суток. Не трогает RUNNING
+    (уже реально выполняется — пусть довыполнится или будет
+    реанимирован ``stale_job_reaper_loop`` отдельно) и не трогает
+    команды управления (см. модульный комментарий выше)."""
+    now = datetime.now(timezone.utc)
+    day_start_utc = _bishkek_day_start_utc(now)
+    result = await db.execute(
+        select(Job).where(
+            Job.status == JobStatus.QUEUED,
+            Job.job_type.in_(ROUTINE_JOB_TYPES),
+            Job.created_at < day_start_utc,
+        )
+    )
+    stale_jobs = result.scalars().all()
+    for job in stale_jobs:
+        job.status = JobStatus.FAILED
+        job.error = {
+            "code": "EXPIRED_DAY_ROLLOVER",
+            "message": "Задача осталась в очереди с прошлых суток — отменена при смене суток (Asia/Bishkek), "
+            "новый цикл планового опроса создаст свежую задачу для этого счётчика",
+        }
+        job.finished_at = now
+    if stale_jobs:
+        await db.commit()
+        for job in stale_jobs:
+            if job.scheduled_job_run_id is not None:
+                await _maybe_finalize_scheduled_job_run(db, job.scheduled_job_run_id)
+    return len(stale_jobs)
+
+
+async def stale_queued_reaper_loop(stop_event: asyncio.Event) -> None:
+    """Проверяется раз в 5 минут (смена суток не требует мгновенной
+    реакции, в отличие от ``stale_job_reaper_loop`` выше) — см.
+    ``expire_stale_queued_jobs_for_new_day``."""
+    logger.info("Сброс устаревших QUEUED-задач планового опроса при смене суток запущен")
+    while not stop_event.is_set():
+        async with SessionLocal() as db:
+            try:
+                expired = await expire_stale_queued_jobs_for_new_day(db)
+                if expired:
+                    logger.info(
+                        "Со сменой суток отменено %d устаревших QUEUED-задач планового опроса", expired
+                    )
+            except Exception:
+                logger.exception("Ошибка цикла сброса устаревших QUEUED-задач")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=300.0)
+        except asyncio.TimeoutError:
+            pass
+    logger.info("Сброс устаревших QUEUED-задач планового опроса остановлен")
 
 
 async def _process_one(db: AsyncSession) -> bool:

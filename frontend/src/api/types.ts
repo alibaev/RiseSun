@@ -173,6 +173,32 @@ export interface ScheduledJobRun {
   finished_at: string | null;
 }
 
+// Ежедневный экспорт профиля нагрузки (Profile1) во внешнюю БД ЕЭБД
+// (2026-09-14, по прямому указанию пользователя).
+export type EudbExportRunStatus = "running" | "succeeded" | "partial_failure" | "failed";
+
+export interface EudbExportRun {
+  id: number;
+  status: EudbExportRunStatus;
+  meters_total: number;
+  meters_succeeded: number;
+  meters_failed: number;
+  triggered_manually: boolean;
+  started_at: string;
+  finished_at: string | null;
+  error_message: string | null;
+}
+
+export interface EudbExportItem {
+  id: number;
+  meter_id: number;
+  meter_serial: string;
+  ok: boolean;
+  rows_exported: number;
+  error_message: string | null;
+  created_at: string;
+}
+
 // Этап 4 (ТЗ п.4.2.8) — уведомления.
 export type NotificationCategory = "meter_offline" | "tamper_event" | "scheduled_job_failed";
 

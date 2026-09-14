@@ -6,11 +6,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import hash_password
-from app.models import Gateway, GatewayStatus, User, UserRole
+from app.core.security import encrypt_secret, hash_password
+from app.models import Gateway, GatewayStatus, LoadProfileData, Meter, ProtocolProfile, User, UserRole
 
 
 async def _seed_user(db: AsyncSession, *, username: str, password: str, role: UserRole) -> User:
@@ -338,6 +340,44 @@ async def test_disconnect_reconnect_require_write_parameter_permission(client, d
 
 
 @pytest.mark.asyncio
+async def test_read_relay_state_requires_write_parameter_permission(client, db_session):
+    """2026-09-12 (см. DECISIONS.md, меню "Работа с счётчиками") —
+    ручной запрос состояния реле требует WRITE_PARAMETER (Инженер+),
+    как и disconnect/reconnect, не TRIGGER_READ (Оператор+)."""
+    root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
+    await _seed_user(db_session, username="eng", password="pass1234", role=UserRole.ENGINEER)
+    await _seed_user(db_session, username="op", password="pass1234", role=UserRole.OPERATOR)
+    db_session.add(
+        Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    )
+    await db_session.commit()
+
+    root_token = await _login(client, "root", "pass1234")
+    await client.post(
+        "/api/meters",
+        json={
+            "serial_number": "202006003607",
+            "ip_address": "127.0.0.1",
+            "port": 4059,
+            "protocol_profile": "hdlc_dlms",
+            "password": "12345678",
+            "gateway_id": 1,
+        },
+        headers={"Authorization": f"Bearer {root_token}"},
+    )
+
+    op_token = await _login(client, "op", "pass1234")
+    assert (
+        await client.post("/api/meters/1/read-relay-state", headers={"Authorization": f"Bearer {op_token}"})
+    ).status_code == 403
+
+    eng_token = await _login(client, "eng", "pass1234")
+    resp = await client.post("/api/meters/1/read-relay-state", headers={"Authorization": f"Bearer {eng_token}"})
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["job_type"] == "read_relay_state"
+
+
+@pytest.mark.asyncio
 async def test_job_endpoints_reject_installed_meter(client, db_session):
     """Этап 6 (обнаружение новых счётчиков): счётчик со статусом
     INSTALLED (обнаружен по call-home, ещё не активирован — нет пароля/
@@ -485,6 +525,46 @@ async def test_read_load_profile_trigger_and_list(client, db_session):
     )
     assert list_resp.status_code == 200
     assert list_resp.json() == []
+
+
+@pytest.mark.asyncio
+async def test_list_load_profile_naive_query_matches_bishkek_local_day(client, db_session):
+    """from_iso/to_iso с фронтенда — границы КАЛЕНДАРНОГО ДНЯ по местному
+    времени (Asia/Bishkek), наивные (см. <input type="date"> в
+    MeterDetailPage). LoadProfileData.timestamp хранится в истинном UTC
+    (см. DECISIONS.md, фикс 2026-09-12) — строка с местной меткой
+    "2026-09-12T00:00:00" физически лежит в БД как "2026-09-11T18:00:00Z"
+    (предыдущие календарные UTC-сутки). Наивное сравнение без локализации
+    эту строку бы не нашло — именно это пользователь заметил как
+    "профили перестали отображаться" сразу после фикса часового пояса."""
+    root = await _seed_user(db_session, username="root2", password="pass1234", role=UserRole.SUPER_ADMIN)
+    gateway = Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    db_session.add(gateway)
+    await db_session.flush()
+    meter = Meter(
+        serial_number="202006003609", ip_address="127.0.0.1", port=4059,
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    db_session.add(
+        LoadProfileData(
+            meter_id=meter.id, obis_code="1.1.63.1.0.ff",
+            # 00:00 Бишкек 2026-09-12 = 18:00 UTC 2026-09-11.
+            timestamp=datetime(2026, 9, 11, 18, 0, 0, tzinfo=timezone.utc),
+            values_json=[1],
+        )
+    )
+    await db_session.commit()
+
+    root_token = await _login(client, "root2", "pass1234")
+    resp = await client.get(
+        f"/api/meters/{meter.id}/load-profile?from_iso=2026-09-12T00:00:00&to_iso=2026-09-12T23:59:59",
+        headers={"Authorization": f"Bearer {root_token}"},
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()) == 1
 
 
 @pytest.mark.asyncio

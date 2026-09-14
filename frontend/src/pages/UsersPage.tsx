@@ -36,6 +36,7 @@ export function UsersPage() {
   const [resetTarget, setResetTarget] = useState<UserOut | null>(null);
   const [resetPassword, setResetPassword] = useState("");
   const [pendingBlock, setPendingBlock] = useState<UserOut | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<UserOut | null>(null);
 
   const load = useCallback(() => {
     setError(null);
@@ -84,6 +85,20 @@ export function UsersPage() {
       .put(`/api/users/${user.id}`, { is_active: !user.is_active })
       .then(() => load())
       .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось изменить статус пользователя"));
+  }
+
+  function handleConfirmDelete() {
+    if (!pendingDelete) return;
+    const target = pendingDelete;
+    setPendingDelete(null);
+    setError(null);
+    api
+      .del(`/api/users/${target.id}`)
+      .then(() => {
+        setNotice(`Пользователь «${target.username}» удалён.`);
+        load();
+      })
+      .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось удалить пользователя"));
   }
 
   function handleConfirmResetPassword() {
@@ -176,6 +191,9 @@ export function UsersPage() {
                   <button onClick={() => setResetTarget(u)}>Сбросить пароль</button>{" "}
                   <button className="secondary" onClick={() => setPendingBlock(u)}>
                     {u.is_active ? "Заблокировать" : "Разблокировать"}
+                  </button>{" "}
+                  <button className="danger" onClick={() => setPendingDelete(u)}>
+                    Удалить
                   </button>
                 </td>
               </tr>
@@ -208,6 +226,16 @@ export function UsersPage() {
           confirmLabel={pendingBlock.is_active ? "Заблокировать" : "Разблокировать"}
           onConfirm={handleConfirmToggleBlock}
           onCancel={() => setPendingBlock(null)}
+        />
+      )}
+
+      {pendingDelete && (
+        <ConfirmModal
+          title="Удалить пользователя"
+          message={`Учётная запись «${pendingDelete.username}» будет удалена безвозвратно. Если за пользователем уже есть история в журнале аудита, удаление не пройдёт — используйте блокировку вместо удаления. Подтвердите операцию.`}
+          confirmLabel="Удалить"
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setPendingDelete(null)}
         />
       )}
     </div>

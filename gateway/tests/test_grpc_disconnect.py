@@ -16,7 +16,9 @@ SERIAL = "202006003607"
 PASSWORD = "12345678"
 
 
-def _start_emulator(*, action_state=None, action_force_result=None) -> ThreadedEmulatorServer:
+def _start_emulator(
+    *, action_state=None, action_parameters_state=None, action_force_result=None
+) -> ThreadedEmulatorServer:
     counter = ConnectionCounter()
     handler = make_hdlc_dlms_handler(
         password=PASSWORD.encode("ascii"),
@@ -24,6 +26,7 @@ def _start_emulator(*, action_state=None, action_force_result=None) -> ThreadedE
         error_injection=ErrorInjection(),
         counter=counter,
         action_state=action_state,
+        action_parameters_state=action_parameters_state,
         action_force_result=action_force_result,
     )
     return ThreadedEmulatorServer(handler)
@@ -56,6 +59,34 @@ def test_disconnect_meter_success():
     assert response.WhichOneof("result") == "success"
     assert response.success.ok is True
     assert action_state[dlms.parse_obis(dlms.DISCONNECT_CONTROL_OBIS)] == dlms.METHOD_REMOTE_DISCONNECT
+
+
+def test_disconnect_meter_sends_empty_structure_parameter():
+    """2026-09-12 (декомпилированный референс IECMeterManage,
+    ResetCommand_DLMS.cs — см. DECISIONS.md) — реальный клиент ВСЕГДА
+    шлёт параметр {0x0F, 0x00} ("пустая структура") с ACTION на реле,
+    иначе счётчик отвечает отказом. Раньше наш код не слал параметров
+    вовсе — эта регрессия проверяет, что параметр действительно уходит
+    на провод, а не только что он объявлен константой."""
+    action_state: dict = {}
+    action_parameters_state: dict = {}
+    grpc_port = _free_port()
+    with _start_emulator(action_state=action_state, action_parameters_state=action_parameters_state) as emulator:
+        server, _ = grpc_server.serve(host="127.0.0.1", port=grpc_port, call_home_port=None)
+        try:
+            channel = grpc.insecure_channel(f"127.0.0.1:{grpc_port}")
+            stub = gateway_pb2_grpc.GatewayServiceStub(channel)
+            request = gateway_pb2.DisconnectMeterRequest(
+                profile="hdlc_dlms", host=emulator.host, port=emulator.port,
+                serial=SERIAL, password=PASSWORD, operation="disconnect", timeout_ms=1000,
+            )
+            response = stub.DisconnectMeter(request)
+        finally:
+            server.stop(None)
+
+    assert response.success.ok is True
+    obis = dlms.parse_obis(dlms.DISCONNECT_CONTROL_OBIS)
+    assert action_parameters_state[obis] == dlms.DISCONNECT_ACTION_PARAMETERS
 
 
 def test_reconnect_meter_success():

@@ -791,6 +791,152 @@ def test_maybe_trigger_immediate_read_with_jobs_removes_pc_and_reports_results(m
                 pass
 
 
+def test_maybe_trigger_immediate_read_control_job_success_reports_result(monkeypatch):
+    """2026-09-12 (по просьбе пользователя — disconnect/reconnect/
+    read_relay_state должны выполняться немедленно через call-home) —
+    control_jobs обрабатываются отдельной веткой (``_run_control_jobs``),
+    ``execute_control_via_fresh_connection`` замокан — тест на
+    оркестрацию (кто забирает pc, что уходит в отчёт), не на сам
+    DLMS-обмен (тот покрыт test_dlms.py/test_integration_hdlc_dlms.py/
+    test_grpc_disconnect.py)."""
+    from mmws_gateway import backend_client
+
+    claimed = backend_client.ClaimDueJobsResult(
+        meter_found=True, meter_id=1, protocol_profile="hdlc_dlms", password="12345678",
+        control_jobs=[backend_client.DueControlJob(job_id=42, job_type="disconnect")],
+    )
+    monkeypatch.setattr(backend_client, "claim_due_jobs", lambda serial, **kw: claimed)
+
+    reported: dict = {}
+
+    def fake_report(serial, results, **kw):
+        reported["serial"] = serial
+        reported["results"] = results
+        return True
+
+    monkeypatch.setattr(backend_client, "report_job_results", fake_report)
+
+    called_with: dict = {}
+
+    def fake_execute_control(pc, *, serial, password, method_id, **kw):
+        called_with["serial"] = serial
+        called_with["method_id"] = method_id
+        return None  # успех
+
+    monkeypatch.setattr("mmws_gateway.callhome.execute_control_via_fresh_connection", fake_execute_control)
+
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10)
+    pool.start()
+    c1 = None
+    try:
+        addr6 = bytes.fromhex("522300012020")  # -> 202001002352
+        c1 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c1.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.3)
+
+        assert pool.pending_count() == 0
+        assert called_with["serial"] == "202001002352"
+        assert called_with["method_id"] == dlms.METHOD_REMOTE_DISCONNECT
+        assert reported["serial"] == "202001002352"
+        assert len(reported["results"]) == 1
+        assert reported["results"][0].job_id == 42
+        assert reported["results"][0].ok is True
+        assert reported["results"][0].error_code is None
+    finally:
+        pool.stop()
+        if c1 is not None:
+            try:
+                c1.close()
+            except OSError:
+                pass
+
+
+def test_maybe_trigger_immediate_read_control_job_failure_reports_error(monkeypatch):
+    from mmws_gateway import backend_client
+    from mmws_gateway.errors import GatewayError
+
+    claimed = backend_client.ClaimDueJobsResult(
+        meter_found=True, meter_id=1, protocol_profile="hdlc_dlms", password="12345678",
+        control_jobs=[backend_client.DueControlJob(job_id=43, job_type="reconnect")],
+    )
+    monkeypatch.setattr(backend_client, "claim_due_jobs", lambda serial, **kw: claimed)
+
+    reported: dict = {}
+
+    def fake_report(serial, results, **kw):
+        reported["serial"] = serial
+        reported["results"] = results
+        return True
+
+    monkeypatch.setattr(backend_client, "report_job_results", fake_report)
+    monkeypatch.setattr(
+        "mmws_gateway.callhome.execute_control_via_fresh_connection",
+        lambda pc, **kw: GatewayError("тестовый отказ"),
+    )
+
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10)
+    pool.start()
+    c1 = None
+    try:
+        addr6 = bytes.fromhex("522300012020")
+        c1 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c1.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.3)
+
+        assert reported["results"][0].job_id == 43
+        assert reported["results"][0].ok is False
+        assert reported["results"][0].error_code == "GATEWAY_ERROR"
+    finally:
+        pool.stop()
+        if c1 is not None:
+            try:
+                c1.close()
+            except OSError:
+                pass
+
+
+def test_maybe_trigger_immediate_read_control_job_skips_ordinary_jobs(monkeypatch):
+    """Backend гарантирует эксклюзивность (см. job_worker.PRIORITY_
+    JOB_TYPES), но эта ветка сама по себе не должна трогать claimed.jobs
+    даже если бы Backend их всё-таки прислал вместе — control_jobs,
+    если есть, обрабатываются и функция возвращается, не доходя до
+    read_batch_via_fresh_connection."""
+    from mmws_gateway import backend_client
+
+    claimed = backend_client.ClaimDueJobsResult(
+        meter_found=True, meter_id=1, protocol_profile="hdlc_dlms", password="12345678",
+        jobs=[backend_client.DueJob(job_id=7, job_type="read_current", obis="1.1.1.8.0.ff", class_id=0)],
+        control_jobs=[backend_client.DueControlJob(job_id=42, job_type="disconnect")],
+    )
+    monkeypatch.setattr(backend_client, "claim_due_jobs", lambda serial, **kw: claimed)
+    monkeypatch.setattr(backend_client, "report_job_results", lambda serial, results, **kw: True)
+    monkeypatch.setattr(
+        "mmws_gateway.callhome.execute_control_via_fresh_connection", lambda pc, **kw: None
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("read_batch_via_fresh_connection не должен вызываться, когда есть control_jobs")
+
+    monkeypatch.setattr("mmws_gateway.callhome.read_batch_via_fresh_connection", fail_if_called)
+
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=10)
+    pool.start()
+    c1 = None
+    try:
+        addr6 = bytes.fromhex("522300012020")
+        c1 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c1.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.3)
+        assert pool.pending_count() == 0
+    finally:
+        pool.stop()
+        if c1 is not None:
+            try:
+                c1.close()
+            except OSError:
+                pass
+
+
 def test_maybe_trigger_immediate_read_closes_sibling_same_serial_connections(monkeypatch):
     """По просьбе пользователя (2026-09-09): как только одно соединение
     счётчика стало активным, остальные held-соединения ЭТОГО ЖЕ

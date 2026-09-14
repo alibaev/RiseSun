@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
-import { canManageGateways, canManageSystem, useAuth } from "../auth/AuthContext";
+import { canManageAutomation, canManageGateways, canManageSystem, useAuth } from "../auth/AuthContext";
 import { NotificationBell } from "./NotificationBell";
 import { MENU } from "../constants/menu";
 
@@ -21,6 +21,12 @@ const RESTRICTED_PATHS: Record<string, (role: string | null) => boolean> = {
   "/users": canManageSystem,
   "/billing-keys": canManageSystem,
   "/gateways": canManageGateways,
+  // 2026-09-12, по прямому указанию пользователя — "доступ к
+  // расписанию только Суперадминистратор и Администратор" (тот же
+  // набор ролей, что и Permission.MANAGE_SCHEDULED_JOBS на Backend,
+  // который теперь требуется даже для чтения — см. api/scheduled_jobs.py).
+  "/scheduled-jobs": canManageAutomation,
+  "/eudb-export": canManageAutomation,
 };
 
 function isVisible(to: string, role: string | null): boolean {

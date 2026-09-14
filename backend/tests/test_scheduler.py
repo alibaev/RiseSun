@@ -114,6 +114,27 @@ async def test_resolve_payloads_read_load_profile_window(db_session):
 
 
 @pytest.mark.asyncio
+async def test_resolve_payloads_read_load_profile_since_midnight_bishkek(db_session):
+    """2026-09-12 (по просьбе пользователя — окно "показания 00:00-03:00,
+    профиль 03:00-09:00, дальше добивать параллельно") — since_midnight_
+    bishkek должен давать РАСТУЩЕЕ окно от начала текущих суток по
+    Бишкеку, а не скользящее window_hours назад от "сейчас" (иначе
+    повторная попытка ближе к концу окна 03:00-09:00 теряла бы полночь
+    из диапазона)."""
+    job = ScheduledJob(
+        name="x", cron_expression="* * * * *", job_type="read_load_profile",
+        operation_params={"since_midnight_bishkek": True}, meter_ids=[],
+    )
+    payloads = await _resolve_payloads(db_session, job)
+    assert len(payloads) == 1
+    from_dt = datetime.fromisoformat(payloads[0]["from_iso"])
+    to_dt = datetime.fromisoformat(payloads[0]["to_iso"])
+    assert from_dt.hour == 0 and from_dt.minute == 0 and from_dt.second == 0
+    assert from_dt.date() == to_dt.date()
+    assert to_dt > from_dt
+
+
+@pytest.mark.asyncio
 async def test_resolve_payloads_read_rated_current_is_empty(db_session):
     job = ScheduledJob(
         name="x", cron_expression="* * * * *", job_type="read_rated_current",

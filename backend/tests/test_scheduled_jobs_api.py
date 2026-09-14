@@ -109,7 +109,11 @@ async def test_create_get_update_delete_roundtrip(client, db_session):
 
 
 @pytest.mark.asyncio
-async def test_engineer_cannot_manage_but_can_view(client, db_session):
+async def test_engineer_cannot_manage_nor_view(client, db_session):
+    """2026-09-12 (по прямому указанию пользователя — "доступ к
+    расписанию только Суперадминистратор и Администратор") — до этой
+    правки инженер мог хотя бы просматривать расписания (VIEW_METERS),
+    теперь весь роутер требует MANAGE_SCHEDULED_JOBS."""
     root = await _seed_user(db_session, username="root", password="pass1234", role=UserRole.SUPER_ADMIN)
     meter_id = await _seed_gateway_and_meter(db_session, root.id)
     await _seed_user(db_session, username="eng", password="pass1234", role=UserRole.ENGINEER)
@@ -123,7 +127,7 @@ async def test_engineer_cannot_manage_but_can_view(client, db_session):
     assert create_resp.status_code == 403
 
     list_resp = await client.get("/api/scheduled-jobs", headers={"Authorization": f"Bearer {eng_token}"})
-    assert list_resp.status_code == 200
+    assert list_resp.status_code == 403
 
 
 @pytest.mark.asyncio

@@ -545,6 +545,59 @@ class ScheduledJobRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class EudbExportRunStatus(str, enum.Enum):
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    PARTIAL_FAILURE = "partial_failure"
+    FAILED = "failed"
+
+
+class EudbExportRun(Base):
+    """Журнал одного запуска ежедневного экспорта профиля нагрузки
+    (Profile1) во внешнюю БД ЕЭБД (2026-09-14, по прямому указанию
+    пользователя — см. services/eudb_export.py). Тот же принцип
+    журналирования, что и у ``ScheduledJobRun``, но отдельная таблица:
+    это не job планировщика (нет привязки к конкретному счётчику через
+    ``Job``, весь запуск — один процесс, читающий из ``load_profile_
+    data`` и пишущий в ЧУЖУЮ БД, не через обычный gateway/job_worker
+    путь)."""
+
+    __tablename__ = "eudb_export_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    status: Mapped[EudbExportRunStatus] = mapped_column(
+        Enum(EudbExportRunStatus, name="eudb_export_run_status"),
+        nullable=False,
+        default=EudbExportRunStatus.RUNNING,
+    )
+    meters_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    meters_succeeded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    meters_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # "Только запросу" — было ли это по расписанию (23:50) или по кнопке
+    # "Запустить сейчас" в интерфейсе.
+    triggered_manually: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class EudbExportItem(Base):
+    """Результат экспорта ОДНОГО счётчика в рамках запуска (см.
+    ``EudbExportRun``) — нужен для интерфейса: какие именно счётчики не
+    экспортировались и почему (не найден UUID в ЕЭБД, профиль не в
+    ожидаемом формате колонок, свежих данных профиля вообще нет и т.п.)."""
+
+    __tablename__ = "eudb_export_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("eudb_export_runs.id"), nullable=False, index=True)
+    meter_id: Mapped[int] = mapped_column(ForeignKey("meters.id"), nullable=False, index=True)
+    ok: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    rows_exported: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Notification(Base):
     """ТЗ п.4.2.8. Уведомления общесистемные (не персональный inbox на
     пользователя — ТЗ не описывает разный набор уведомлений по ролям),

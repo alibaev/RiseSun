@@ -96,12 +96,28 @@ async def _resolve_payloads(db: AsyncSession, scheduled_job: ScheduledJob) -> li
     payload на весь тик. Пустой список означает «профиль не найден —
     пропустить тик» (см. ``_trigger_one``), а не «нет счётчиков»."""
     if scheduled_job.job_type == "read_load_profile":
-        window_hours = scheduled_job.operation_params.get("window_hours", _DEFAULT_LOAD_PROFILE_WINDOW_HOURS)
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        payload = {
-            "from_iso": (now - timedelta(hours=window_hours)).isoformat(),
-            "to_iso": now.isoformat(),
-        }
+        # from_iso/to_iso уходят в GET-диапазон НАПРЯМУЮ как метка
+        # СОБСТВЕННЫХ часов счётчика (Asia/Bishkek местное время, см.
+        # DECISIONS.md, "Профиль нагрузки: метка времени сохранялась
+        # как UTC вместо Asia/Bishkek") — раньше здесь ошибочно
+        # использовалось «сейчас по UTC» с отброшенным поясом (тот же
+        # класс бага, что уже был найден и исправлен в других местах;
+        # этот код был не замечен раньше, т.к. расписание не было
+        # включено). Теперь — «сейчас по Бишкеку», наивно.
+        now_bishkek = datetime.now(_BISHKEK_TZ).replace(tzinfo=None)
+        if scheduled_job.operation_params.get("since_midnight_bishkek"):
+            # 2026-09-12 (по просьбе пользователя — окно "показания
+            # 00:00-03:00, профиль 03:00-09:00, дальше добивать
+            # параллельно") — окно "с начала текущих суток (Бишкек) до
+            # сейчас", РАСТУЩЕЕ с каждым тиком, а не скользящее
+            # window_hours назад от "сейчас": иначе повторные попытки в
+            # конце окна (например, в 08:50) теряли бы полночь из
+            # диапазона, хотя именно полночь и была целью опроса.
+            from_dt = now_bishkek.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            window_hours = scheduled_job.operation_params.get("window_hours", _DEFAULT_LOAD_PROFILE_WINDOW_HOURS)
+            from_dt = now_bishkek - timedelta(hours=window_hours)
+        payload = {"from_iso": from_dt.isoformat(), "to_iso": now_bishkek.isoformat()}
         if scheduled_job.operation_params.get("obis"):
             payload["obis"] = scheduled_job.operation_params["obis"]
         return [payload]

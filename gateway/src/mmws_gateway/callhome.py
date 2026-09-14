@@ -169,7 +169,9 @@ VER2_EMULATION_TEST_SERIALS: set[str] = set()
 # каждой повторной отправке AARQ дополнительно шлют те же 3 нулевых
 # байта (см. hdlc_dlms._send_aarq_and_await_aare). Пусто по умолчанию —
 # заполняется точечно для конкретного эксперимента, не постоянная фича.
-HEARTBEAT_PROBE_TEST_SERIALS: set[str] = set()
+HEARTBEAT_PROBE_TEST_SERIALS: set[str] = {
+    "201811000033", "201811000016", "201811000017", "201811000032",
+}
 
 # 2026-09-12 (по просьбе пользователя "покопай почему data-access-error
 # 250") — тот же принцип точечного эксперимента, что и у
@@ -896,7 +898,7 @@ class CallHomePool:
             from . import backend_client
 
             claimed = backend_client.claim_due_jobs(pc.serial, peer_ip=pc.peer[0], local_port=pc.local_port)
-            if claimed is None or not (claimed.jobs or claimed.load_profile_jobs):
+            if claimed is None or not (claimed.jobs or claimed.load_profile_jobs or claimed.control_jobs):
                 return
 
             with self._lock:
@@ -933,6 +935,18 @@ class CallHomePool:
                 )
 
             password_bytes = claimed.password.encode("ascii")
+
+            if claimed.control_jobs:
+                # 2026-09-12 (по просьбе пользователя — "все такие
+                # команды/запросы (отключение/подключение, запрос
+                # состояния реле) должны выполняться немедленно, не
+                # ждать очереди. если есть очередь, то только из этих
+                # команд") — Backend гарантирует (см. job_worker.
+                # PRIORITY_JOB_TYPES), что claimed.jobs/load_profile_jobs
+                # пусты, когда есть control_jobs: обрабатываем ТОЛЬКО их
+                # на этом дозвоне, не запуская обычное чтение вовсе.
+                self._run_control_jobs(pc, claimed, password_bytes, candidates)
+                return
 
             if claimed.jobs:
                 obis_specs = [(job.obis, job.class_id) for job in claimed.jobs]
@@ -1073,6 +1087,95 @@ class CallHomePool:
                 self._run_load_profile_jobs(pc, claimed, password_bytes)
         except Exception:
             logger.exception("Immediate-read: неожиданная ошибка при обработке соединения #%d", pc.conn_no)
+
+    def _run_control_jobs(
+        self,
+        pc: "_PooledConnection",
+        claimed: "backend_client.ClaimDueJobsResult",
+        password_bytes: bytes,
+        candidates: list["_PooledConnection"],
+    ) -> None:
+        """Отключение/подключение (Этап 5, 2026-09-12 — событийный путь,
+        см. DECISIONS.md) — единственный способ выполнить эти команды
+        для call-home счётчиков вообще (старый gRPC DisconnectMeter
+        прямо отказывается работать при call_home=True). В отличие от
+        обычного чтения, НЕ перебирает несколько held-соединений на один
+        job — команда управления реле либо проходит на первом же
+        доступном соединении, либо (при обрыве/отказе SNRM) ждёт
+        следующий дозвон, как и профиль нагрузки (см. ``_run_load_
+        profile_jobs``) — держать про запас несколько соединений ради
+        ОДНОЙ команды управления не нужно."""
+        from . import backend_client
+        from .protocols import dlms as dlms_module
+
+        method_ids = {
+            "disconnect": dlms_module.METHOD_REMOTE_DISCONNECT,
+            "reconnect": dlms_module.METHOD_REMOTE_RECONNECT,
+        }
+
+        remaining_candidates = list(candidates)
+        for job in claimed.control_jobs:
+            if remaining_candidates:
+                candidate = remaining_candidates.pop(0)
+            else:
+                deadline = time.time() + DEFAULT_IMMEDIATE_READ_MAX_WAIT_S
+                candidate = self._wait_for_sibling_connection(pc.serial, deadline)
+                if candidate is None:
+                    logger.info(
+                        "Immediate-control: не дождались нового соединения счётчика %s "
+                        "для job #%d (%s) за %.0fс — job вернётся в очередь по таймауту",
+                        pc.serial, job.job_id, job.job_type, DEFAULT_IMMEDIATE_READ_MAX_WAIT_S,
+                    )
+                    continue
+
+            method_id = method_ids.get(job.job_type)
+            error: GatewayError | None
+            if method_id is None:
+                error = GatewayError(f"Неизвестная команда управления реле: {job.job_type!r}")
+            else:
+                try:
+                    error = execute_control_via_fresh_connection(
+                        candidate, serial=pc.serial, password=password_bytes, method_id=method_id,
+                    )
+                except (ConnectionError, OSError) as exc:
+                    logger.info("Immediate-control: соединение #%d оборвалось (%s)", candidate.conn_no, exc)
+                    error = GatewayError(f"Обрыв соединения #{candidate.conn_no}: {exc}")
+                finally:
+                    candidate.cancelled.set()
+                    try:
+                        candidate.raw_sock.close()
+                    except OSError:
+                        pass
+
+            if error is not None:
+                logger.info(
+                    "Immediate-control: счётчик %s, job #%d (%s) — отказ: %s",
+                    pc.serial, job.job_id, job.job_type, error.code,
+                )
+            else:
+                logger.info(
+                    "Immediate-control: счётчик %s, job #%d (%s) — успех",
+                    pc.serial, job.job_id, job.job_type,
+                )
+
+            result = backend_client.JobResultReport(
+                job_id=job.job_id, ok=error is None,
+                error_code=error.code if error else None,
+                error_message=error.message if error else None,
+            )
+            if not backend_client.report_job_results(pc.serial, [result]):
+                logger.warning(
+                    "Immediate-control: не удалось отправить результат в Backend для %s "
+                    "(job #%d) — job вернётся в очередь по таймауту",
+                    pc.serial, job.job_id,
+                )
+
+        for candidate in remaining_candidates:
+            candidate.cancelled.set()
+            try:
+                candidate.raw_sock.close()
+            except OSError:
+                pass
 
     def _run_load_profile_jobs(
         self,
@@ -1353,6 +1456,83 @@ def _log_captured_on_failure(filtering_sock: "DlT645FilteringSocket", conn_no: i
             "Immediate-read: соединение #%d — на этапе %s не пришло ВООБЩЕ НИ БАЙТА",
             conn_no, stage,
         )
+
+
+def execute_control_via_fresh_connection(
+    pc: "_PooledConnection",
+    *,
+    serial: str,
+    password: bytes,
+    method_id: int,
+    retry_interval_s: float = DEFAULT_RETRY_INTERVAL_S,
+    per_attempt_timeout_ms: int = DEFAULT_PER_ATTEMPT_TIMEOUT_MS,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS_PER_CONNECTION,
+    association_timeout_ms: int = DEFAULT_ASSOCIATION_TIMEOUT_MS,
+) -> "GatewayError | None":
+    """Отключение/подключение (Этап 5, 2026-09-12 — перенос на
+    событийный путь, см. DECISIONS.md — "все такие команды/запросы
+    должны выполняться немедленно, не ждать очереди") через УЖЕ
+    принятое call-home соединение. Тот же SNRM-повтор + терпеливое
+    ожидание AARE, что и у ``read_batch_via_fresh_connection`` (см. её
+    докстринг), но вместо GET шлёт ACTION на объект Disconnect Control
+    (класс 70) с обязательным параметром "пустая структура" (см.
+    dlms.DISCONNECT_ACTION_PARAMETERS — без него реальные счётчики
+    отвечают отказом, подтверждено декомпилированным референсом
+    IECMeterManage, ResetCommand_DLMS.cs).
+
+    Возвращает ``None`` при успехе, иначе ``GatewayError`` — НЕ бросает
+    исключение, чтобы вызывающий код мог единообразно сформировать
+    отчёт об отказе (та же договорённость, что и у ``read_load_profile_
+    via_fresh_connection``, возвращающего ``(rows, error)``)."""
+    from .protocols import dlms as dlms_module
+    from .protocols import hdlc_dlms
+    from .transport import TcpServerTransport
+
+    hdlc_dlms.server_hdlc_address(hdlc_dlms.physical_address(serial, hdlc_dlms.HDLC_DLMS))
+
+    filtering_sock = DlT645FilteringSocket(pc.raw_sock)
+    linked = False
+    transport = None
+    last_error: GatewayError | None = None
+    for attempt in range(1, max_attempts + 1):
+        transport = TcpServerTransport.from_accepted_socket(
+            filtering_sock, peer_host=pc.peer[0], peer_port=pc.peer[1], timeout_ms=per_attempt_timeout_ms
+        )
+        try:
+            hdlc_dlms.establish_link(transport, serial=serial)
+            linked = True
+            break
+        except GatewayError as exc:
+            last_error = exc
+            logger.info(
+                "Immediate-control: попытка %d SNRM на соединении #%d — %s, повтор",
+                attempt, pc.conn_no, exc.code,
+            )
+            _drain_stale_bytes(pc.raw_sock)
+        except (ConnectionError, OSError) as exc:
+            return GatewayError(f"Обрыв соединения #{pc.conn_no}: {exc}")
+        time.sleep(retry_interval_s)
+
+    if not linked:
+        _log_captured_on_failure(filtering_sock, pc.conn_no, "SNRM (управление реле)")
+        return last_error or GatewayError(
+            f"Immediate-control: счётчик {serial} не подтвердил SNRM на свежем соединении "
+            f"за {max_attempts} попыток"
+        )
+
+    filtering_sock.set_deadline(time.time() + association_timeout_ms / 1000)
+    filtering_sock.clear_captured()
+    try:
+        hdlc_dlms.execute_action_via_established_link(
+            transport, serial=serial, password=password,
+            obis=dlms_module.DISCONNECT_CONTROL_OBIS, method_id=method_id,
+            class_id=dlms_module.DISCONNECT_CONTROL_CLASS_ID,
+            parameters=dlms_module.DISCONNECT_ACTION_PARAMETERS,
+        )
+        return None
+    except GatewayError as exc:
+        _log_captured_on_failure(filtering_sock, pc.conn_no, "AARQ/AARE/ACTION (управление реле)")
+        return exc
 
 
 def read_batch_via_fresh_connection(

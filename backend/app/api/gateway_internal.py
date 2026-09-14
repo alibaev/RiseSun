@@ -33,6 +33,7 @@ logger = logging.getLogger("mmws_backend.gateway_internal")
 from ..schemas import (
     ClaimDueJobsRequest,
     ClaimDueJobsResponse,
+    DueControlJobOut,
     DueJobOut,
     DueLoadProfileJobOut,
     ReportJobResultsRequest,
@@ -44,9 +45,12 @@ from ..services.gateway_client import ReadResult
 from ..services.load_profile import DEFAULT_LOAD_PROFILE_OBIS
 from ..services.job_worker import (
     RATED_CURRENT_OBIS,
+    RELAY_STATE_OBIS,
     _insert_load_profile_row,
+    _maybe_finalize_disconnect_batch_item,
     _maybe_finalize_scheduled_job_run,
     claim_due_jobs_for_meter,
+    finalize_disconnect_job,
     finalize_read_current_job,
     finalize_read_load_profile_job,
     finalize_read_rated_current_job,
@@ -127,6 +131,7 @@ async def claim_due_jobs(
 
     jobs: list[DueJobOut] = []
     load_profile_jobs: list[DueLoadProfileJobOut] = []
+    control_jobs: list[DueControlJobOut] = []
     for job in claimed:
         if job.job_type == "read_current":
             # class_id — из payload (по умолчанию 0 = Register), а не
@@ -144,6 +149,11 @@ async def claim_due_jobs(
             )
         elif job.job_type == "read_rated_current":
             jobs.append(DueJobOut(job_id=job.id, job_type=job.job_type, obis=RATED_CURRENT_OBIS, class_id=0))
+        elif job.job_type == "read_relay_state":
+            # 2026-09-12 (см. DECISIONS.md) — обычный GET, class_id=1
+            # (Data), та же механика, что read_current/read_rated_current
+            # (Gateway batch'ует все три в одной ассоциации).
+            jobs.append(DueJobOut(job_id=job.id, job_type=job.job_type, obis=RELAY_STATE_OBIS, class_id=1))
         elif job.job_type == "read_load_profile":
             # 2026-09-11 — перенос на событийный путь (см. DECISIONS.md).
             load_profile_jobs.append(
@@ -155,6 +165,12 @@ async def claim_due_jobs(
                     to_iso=job.payload["to_iso"],
                 )
             )
+        elif job.job_type in ("disconnect", "reconnect"):
+            # 2026-09-12 (см. DECISIONS.md — приоритет над рядовым
+            # чтением, job_worker.PRIORITY_JOB_TYPES гарантирует, что
+            # claim_due_jobs_for_meter не отдаёт эти job'ы вперемешку
+            # с обычным чтением в одном заходе).
+            control_jobs.append(DueControlJobOut(job_id=job.id, job_type=job.job_type))
 
     password = decrypt_secret(meter.password_encrypted).decode("ascii")
     return ClaimDueJobsResponse(
@@ -164,6 +180,7 @@ async def claim_due_jobs(
         password=password,
         jobs=jobs,
         load_profile_jobs=load_profile_jobs,
+        control_jobs=control_jobs,
     )
 
 
@@ -201,6 +218,22 @@ async def report_job_results(
             await finalize_read_current_job(db, job, meter, outcome, obis=item.obis)
         elif job.job_type == "read_rated_current":
             await finalize_read_rated_current_job(db, job, meter, outcome)
+        elif job.job_type == "read_relay_state":
+            # Тот же финализатор, что и read_current — концептуально это
+            # обычное чтение объекта (см. DECISIONS.md), только адрес и
+            # смысл значения другие; результат так же попадает в
+            # meter_readings под тем же obis.
+            await finalize_read_current_job(db, job, meter, outcome, obis=item.obis)
+        elif job.job_type in ("disconnect", "reconnect"):
+            # 2026-09-12 (см. DECISIONS.md) — единственный путь, которым
+            # disconnect/reconnect вообще МОГУТ выполниться для call-home
+            # счётчиков: старый gRPC DisconnectMeter прямо отказывается
+            # работать при call_home=True (см. grpc_server.py).
+            await finalize_disconnect_job(
+                db, job, meter, operation=job.job_type, ok=item.ok,
+                error_code=item.error_code, error_message=item.error_message,
+            )
+            await _maybe_finalize_disconnect_batch_item(db, job)
         else:
             skipped += 1
             continue

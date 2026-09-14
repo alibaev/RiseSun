@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth.deps import require_permission
@@ -101,5 +102,49 @@ async def reset_user_password(
     await record_audit(
         db, user_id=user.id, action="user.reset_password", object_type="user",
         object_id=str(target.id), ip_address=request.client.host if request.client else None,
+    )
+    await db.commit()
+
+
+@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_user(
+    user_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(Permission.MANAGE_USERS)),
+) -> None:
+    """По просьбе пользователя (2026-09-14) — жёсткое удаление учётной
+    записи, а не только блокировка (``is_active=false``, уже есть в
+    ``update_user``). Тот же защитный принцип, что и у
+    ``meters.py::delete_meter`` — если у пользователя уже есть история
+    в audit_log (FK ``audit_log.user_id -> users.id`` без каскада),
+    удаление НЕ проходит молча/каскадно, а даёт понятную ошибку с
+    советом заблокировать вместо удаления: история действий — часть
+    аудита, теряться при удалении учётки не должна."""
+    if user_id == user.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Нельзя удалить собственную учётную запись")
+
+    target = await db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пользователь не найден")
+
+    username = target.username
+    await db.delete(target)
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Нельзя удалить пользователя — за ним есть история в журнале аудита. "
+                "Заблокируйте учётную запись (is_active=false) вместо удаления."
+            ),
+        )
+
+    await record_audit(
+        db, user_id=user.id, action="user.delete", object_type="user",
+        object_id=str(user_id), ip_address=request.client.host if request.client else None,
+        details={"username": username},
     )
     await db.commit()

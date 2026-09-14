@@ -29,6 +29,8 @@ from app.models import (
 from app.services.gateway_client import LoadProfileError, LoadProfileRow, ReadResult, WriteResult
 from app.services.job_worker import (
     RATED_CURRENT_OBIS,
+    RELAY_STATE_OBIS,
+    _JOB_HANDLERS,
     claim_due_jobs_for_meter,
     reap_stale_running_jobs,
     requeue_stale_running_jobs,
@@ -37,6 +39,7 @@ from app.services.job_worker import (
     _run_read_current,
     _run_read_load_profile,
     _run_read_rated_current,
+    _run_read_relay_state,
     _run_reconnect,
     _run_write_datetime,
     _run_write_parameter,
@@ -150,6 +153,57 @@ async def test_read_rated_current_stores_value_on_meter_not_reading(db_session):
     assert meter.rated_current_amps == 100.0
     readings = (await db_session.execute(select(MeterReading))).scalars().all()
     assert readings == []
+
+
+def test_priority_job_types_have_fifo_fallback_handlers():
+    """2026-09-12 (см. DECISIONS.md) — живой тест поймал реальный баг:
+    read_relay_state был известен событийному пути (claim-jobs), но не
+    старому FIFO-воркеру (`_JOB_HANDLERS`) — если событийный путь не
+    успевал забрать job первым, FIFO-воркер падал с "Неизвестный тип
+    задачи". Каждый приоритетный job_type обязан иметь обработчик и
+    здесь тоже, иначе он не сможет выполниться при проигрыше гонки."""
+    from app.services.job_worker import PRIORITY_JOB_TYPES
+
+    for job_type in PRIORITY_JOB_TYPES:
+        assert job_type in _JOB_HANDLERS, f"{job_type!r} не зарегистрирован в _JOB_HANDLERS"
+
+
+@pytest.mark.asyncio
+async def test_read_relay_state_via_old_fifo_path_reads_correct_obis(db_session):
+    """2026-09-12 (см. DECISIONS.md) — read_relay_state должен иметь
+    рабочий обработчик и на старом FIFO-пути, не только в событийном
+    (claim-jobs при звонке): если событийный путь не успел забрать job
+    первым (реальный случай, живой тест поймал это как "Неизвестный тип
+    задачи" до этого фикса), FIFO-воркер должен уметь её выполнить сам,
+    а не падать."""
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202306004113",
+        is_call_home=True,
+        protocol_profile=ProtocolProfile.HDLC_DLMS,
+        password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    job = Job(job_type="read_relay_state", meter_id=meter.id, payload={})
+    db_session.add(job)
+    await db_session.commit()
+
+    with patch(
+        "app.services.job_worker.read_register",
+        new=AsyncMock(return_value=ReadResult(ok=True, value="000080000000")),
+    ) as mocked:
+        await _run_read_relay_state(db_session, job)
+
+    kwargs = mocked.call_args.kwargs
+    assert kwargs["obis"] == RELAY_STATE_OBIS
+    assert kwargs["class_id"] == 1
+    assert job.status == JobStatus.SUCCEEDED
+    assert job.result == {"obis": RELAY_STATE_OBIS, "value": "000080000000"}
+    readings = (await db_session.execute(select(MeterReading))).scalars().all()
+    assert len(readings) == 1
+    assert readings[0].obis_code == RELAY_STATE_OBIS
 
 
 @pytest.mark.asyncio
@@ -495,6 +549,46 @@ async def test_read_load_profile_obis_override(db_session):
 
 
 @pytest.mark.asyncio
+async def test_read_load_profile_localizes_naive_timestamp_as_bishkek_time(db_session):
+    """Часы буфера профиля нагрузки — местное время счётчика (Asia/Bishkek),
+    не UTC. Gateway отдаёт метку как naive ISO-строку без пояса — без
+    явной локализации она ошибочно легла бы в БД как UTC (сдвиг на 6
+    часов от истинного момента, см. DECISIONS.md, 2026-09-12)."""
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202006003608",
+        ip_address="192.168.1.51",
+        port=4059,
+        protocol_profile=ProtocolProfile.HDLC_DLMS,
+        password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    root = (await db_session.execute(select(User))).scalars().first()
+    job = Job(
+        job_type="read_load_profile",
+        meter_id=meter.id,
+        payload={"from_iso": "2026-09-12T00:00:00", "to_iso": "2026-09-12T02:00:00"},
+        created_by_id=root.id,
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    rows = [LoadProfileRow(timestamp_iso="2026-09-12T00:00:00", values=[1])]
+    with patch("app.services.job_worker.read_load_profile", new=_async_gen(rows)):
+        await _run_read_load_profile(db_session, job)
+
+    stored = (
+        (await db_session.execute(select(LoadProfileData).where(LoadProfileData.meter_id == meter.id)))
+        .scalars()
+        .one()
+    )
+    # 00:00 в Бишкеке (UTC+6) — это 18:00 предыдущих суток в UTC.
+    assert stored.timestamp == datetime(2026, 9, 11, 18, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
 async def test_read_load_profile_partial_failure_keeps_already_received_rows(db_session):
     """Обрыв связи посреди передачи (ТЗ п.4.2.3 — докачка): строки, уже
     отданные генератором ДО исключения, остаются в БД, job помечается
@@ -730,6 +824,169 @@ async def test_claim_next_job_commits_even_when_queue_empty(db_session):
 
     assert job is None
     assert db_session.in_transaction() is False
+
+
+@pytest.mark.asyncio
+async def test_claim_next_job_prioritizes_control_commands_over_older_jobs(db_session):
+    """2026-09-12 (по просьбе пользователя — "запрос пользователя встал
+    в очередь, а не должен") — этот GLOBAL FIFO раньше был чистым
+    ``ORDER BY created_at``: свежая команда управления (disconnect/
+    reconnect/read_relay_state) вставала в общий хвост наравне со
+    старыми job'ами вместо немедленного выполнения. Теперь она обязана
+    забираться первой, даже если она новее."""
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202006003607",
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    old_job = Job(job_type="read_current", meter_id=meter.id, payload={"obis": "1.1.1.8.0.ff"})
+    db_session.add(old_job)
+    await db_session.commit()
+
+    new_control_job = Job(job_type="disconnect", meter_id=meter.id, payload={"source": "web"})
+    db_session.add(new_control_job)
+    await db_session.commit()
+    await db_session.refresh(new_control_job)
+    assert new_control_job.created_at >= old_job.created_at  # реально новее, не просто по id
+
+    claimed = await _claim_next_job(db_session)
+    assert claimed is not None
+    assert claimed.id == new_control_job.id
+
+
+@pytest.mark.asyncio
+async def test_claim_next_job_prioritizes_operator_action_over_older_scheduled(db_session):
+    """2026-09-12 (см. запись выше) — среди рядового чтения тоже
+    действует приоритет: прямое действие оператора через интерфейс
+    (``scheduled_job_run_id IS NULL``) обгоняет плановое, даже более
+    старое."""
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202006003607",
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+    scheduled_old = Job(
+        job_type="read_current", meter_id=meter.id, payload={"obis": "1.1.1.8.0.ff"}, scheduled_job_run_id=None,
+    )
+    scheduled_old.scheduled_job_run_id = 999999  # не важна валидная FK для этого теста — не коммитим с FK-проверкой
+    db_session.add(Job(job_type="read_current", meter_id=meter.id, payload={"obis": "1.1.32.7.0.ff"}))
+    await db_session.commit()
+
+    operator_job = (
+        await db_session.execute(select(Job).where(Job.scheduled_job_run_id.is_(None)))
+    ).scalars().one()
+
+    claimed = await _claim_next_job(db_session)
+    assert claimed is not None
+    assert claimed.id == operator_job.id
+
+
+@pytest.mark.asyncio
+async def test_claim_next_job_skips_disconnect_reconnect_for_call_home_meter(db_session):
+    """Реальный баг, найден 2026-09-14 на живом счётчике 201909002049:
+    ``reconnect`` для call-home счётчика мгновенно проваливался с
+    "не реализовано", потому что этот GLOBAL FIFO забирал его наравне с
+    обычными job'ами и гнал через старый gRPC-путь (``_run_disconnect_
+    operation``), который для call-home НЕ работает (см.
+    grpc_server.py::_do_disconnect) — единственный рабочий путь для
+    таких счётчиков — событийный (``claim_due_jobs_for_meter`` при
+    реальном звонке). ``_claim_next_job`` теперь обязан игнорировать
+    disconnect/reconnect call-home счётчика целиком (ни в приоритетной,
+    ни в общей выборке), оставляя job в очереди для событийного пути."""
+    gateway = await _seed_gateway_and_user(db_session)
+    call_home_meter = Meter(
+        serial_number="201909002049", is_call_home=True,
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    direct_meter = Meter(
+        serial_number="202006003607", is_call_home=False,
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add_all([call_home_meter, direct_meter])
+    await db_session.flush()
+    stuck_reconnect = Job(job_type="reconnect", meter_id=call_home_meter.id, payload={"source": "web"})
+    db_session.add(stuck_reconnect)
+    await db_session.commit()
+
+    # Очередь состоит ИЗ ОДНОЙ этой job'ы — если фильтр работает
+    # правильно, claim не должен вернуть вообще ничего, а не "что
+    # угодно, кроме неё".
+    claimed = await _claim_next_job(db_session)
+    assert claimed is None
+
+    # read_relay_state для того же call-home счётчика — НЕ входит в
+    # исключение, должен забираться как обычно (это работает и через
+    # старый путь).
+    relay_job = Job(job_type="read_relay_state", meter_id=call_home_meter.id, payload={})
+    db_session.add(relay_job)
+    await db_session.commit()
+    claimed_relay = await _claim_next_job(db_session)
+    assert claimed_relay is not None
+    assert claimed_relay.id == relay_job.id
+
+    # disconnect/reconnect для счётчика с ПРЯМЫМ IP — старый путь
+    # рабочий, должен забираться как обычно.
+    direct_reconnect = Job(job_type="reconnect", meter_id=direct_meter.id, payload={"source": "web"})
+    db_session.add(direct_reconnect)
+    await db_session.commit()
+    claimed_direct = await _claim_next_job(db_session)
+    assert claimed_direct is not None
+    assert claimed_direct.id == direct_reconnect.id
+
+
+@pytest.mark.asyncio
+async def test_expire_stale_queued_jobs_for_new_day_clears_only_routine_before_today(db_session):
+    """2026-09-13 (по прямому указанию пользователя — "с наступлением
+    новых суток, очередь заданий обнуляется") — QUEUED-задача планового
+    опроса, оставшаяся с ВЧЕРА, отменяется (FAILED), чтобы не блокировать
+    создание свежей на сегодня (_outstanding_job_meter_ids). Команды
+    управления (disconnect/reconnect/read_relay_state) НЕ трогаются —
+    это разовые действия оператора, должны доводиться до конца. Задача,
+    поставленная СЕГОДНЯ, тоже не трогается."""
+    from app.services.job_worker import expire_stale_queued_jobs_for_new_day
+
+    gateway = await _seed_gateway_and_user(db_session)
+    meter = Meter(
+        serial_number="202006003607",
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id,
+    )
+    db_session.add(meter)
+    await db_session.flush()
+
+    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+    stale_reading = Job(
+        job_type="read_current", meter_id=meter.id, payload={"obis": "1.1.1.8.0.ff"},
+        status=JobStatus.QUEUED, created_at=yesterday,
+    )
+    stale_control = Job(
+        job_type="disconnect", meter_id=meter.id, payload={"source": "web"},
+        status=JobStatus.QUEUED, created_at=yesterday,
+    )
+    fresh_reading = Job(
+        job_type="read_current", meter_id=meter.id, payload={"obis": "1.1.32.7.0.ff"}, status=JobStatus.QUEUED,
+    )
+    db_session.add_all([stale_reading, stale_control, fresh_reading])
+    await db_session.commit()
+
+    count = await expire_stale_queued_jobs_for_new_day(db_session)
+
+    assert count == 1
+    await db_session.refresh(stale_reading)
+    await db_session.refresh(stale_control)
+    await db_session.refresh(fresh_reading)
+    assert stale_reading.status == JobStatus.FAILED
+    assert stale_reading.error["code"] == "EXPIRED_DAY_ROLLOVER"
+    assert stale_control.status == JobStatus.QUEUED  # команда управления не трогается
+    assert fresh_reading.status == JobStatus.QUEUED  # сегодняшняя задача не трогается
 
 
 @pytest.mark.asyncio

@@ -7,7 +7,18 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.core.security import encrypt_secret, hash_password
-from app.models import Gateway, GatewayStatus, Job, Meter, MeterReading, ProtocolProfile, User, UserRole
+from app.models import (
+    Gateway,
+    GatewayStatus,
+    Job,
+    JobStatus,
+    LoadProfileData,
+    Meter,
+    MeterReading,
+    ProtocolProfile,
+    User,
+    UserRole,
+)
 
 
 async def _seed_user(db, *, username: str, password: str, role: UserRole) -> User:
@@ -101,6 +112,56 @@ async def test_dashboard_read_percentage_excludes_old_readings(client, db_sessio
     body = resp.json()
     assert body["read_percentage_today"] == 0.0
     assert body["read_percentage_3d"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_dashboard_load_profile_stats(client, db_session):
+    """load_profile_percentage_today считает по LoadProfileData.recorded_at
+    (момент сохранения у нас), а не по timestamp строки (момент замера
+    на счётчике) — тестовое чтение окна 00:00-02:00 сегодняшнего дня
+    должно засчитаться как «опрос сегодня» независимо от того, какой
+    исторический диапазон запрашивался."""
+    root = await _seed_user(db_session, username="root3", password="pass1234", role=UserRole.SUPER_ADMIN)
+    gateway = Gateway(name="GW", grpc_target="localhost:50051", status=GatewayStatus.APPROVED, registered_by_id=root.id)
+    db_session.add(gateway)
+    await db_session.flush()
+
+    now = datetime.now(timezone.utc)
+    meter_ok = Meter(
+        serial_number="lp-ok", ip_address="127.0.0.1", port=4059,
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id, last_seen_at=now,
+    )
+    meter_pending = Meter(
+        serial_number="lp-pending", ip_address="127.0.0.1", port=4060,
+        protocol_profile=ProtocolProfile.HDLC_DLMS, password_encrypted=encrypt_secret(b"12345678"),
+        gateway_id=gateway.id, last_seen_at=now,
+    )
+    db_session.add_all([meter_ok, meter_pending])
+    await db_session.flush()
+
+    db_session.add(
+        LoadProfileData(
+            meter_id=meter_ok.id, obis_code="1-0:99.1.0.255",
+            timestamp=now - timedelta(days=5), values_json=[1, 2, 3], recorded_at=now,
+        )
+    )
+    db_session.add(Job(job_type="read_load_profile", meter_id=meter_pending.id, status=JobStatus.QUEUED, payload={}))
+    db_session.add(
+        Job(
+            job_type="read_load_profile", meter_id=meter_pending.id, status=JobStatus.FAILED,
+            payload={}, finished_at=now,
+        )
+    )
+    await db_session.commit()
+
+    token = await _login(client, "root3", "pass1234")
+    resp = await client.get("/api/dashboard", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["load_profile_percentage_today"] == 50.0
+    assert body["load_profile_jobs_active"] == 1
+    assert body["load_profile_jobs_failed_24h"] == 1
 
 
 @pytest.mark.asyncio
