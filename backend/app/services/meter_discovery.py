@@ -88,7 +88,24 @@ async def _run_once() -> None:
             existing_serials = set((await db.execute(select(Meter.serial_number))).scalars().all())
             new_serials = [s.serial for s in seen if s.serial not in existing_serials]
             auto_activated = []
+            # Побитый при call-home обнаружении серийник (буквы вместо
+            # цифр) отклоняется Gateway ещё на этапе опознания (см.
+            # CallHomePool._identify, callhome.py) и до ListCallHomeSerials
+            # доходить не должен — проверка здесь оставлена только как
+            # защита на случай рассинхронизации версий Gateway/Backend, по
+            # прямому указанию пользователя (2026-09-14, взамен прежнего
+            # MeterStatus.INVALID и вкладки «Некорректные данные»): такой
+            # серийник просто пропускается, счётчик вообще не заводится.
+            rejected_serials = [s for s in new_serials if not s.isdigit()]
+            for serial in rejected_serials:
+                logger.warning(
+                    "Call-home серийник %s с gateway_id=%s содержит не только цифры — "
+                    "пропущен (ожидалось, что Gateway отклонит его раньше)",
+                    serial, gateway.id,
+                )
             for serial in new_serials:
+                if not serial.isdigit():
+                    continue
                 meter = Meter(
                     serial_number=serial, is_call_home=True, gateway_id=gateway.id,
                     status=MeterStatus.ACTIVE, protocol_profile=_AUTO_ACTIVATE_PROFILE,
@@ -96,12 +113,13 @@ async def _run_once() -> None:
                 )
                 auto_activated.append(meter)
                 db.add(meter)
-            if new_serials:
+            if auto_activated:
                 logger.info(
                     "Обнаружено и автоактивировано %d новых счётчиков через call-home "
                     "на gateway_id=%s: %s",
-                    len(new_serials), gateway.id, new_serials,
+                    len(auto_activated), gateway.id, [m.serial_number for m in auto_activated],
                 )
+            if auto_activated:
                 await db.flush()  # нужны meter.id для добавления в расписания
                 for meter in auto_activated:
                     await _add_to_catchall_schedules(db, meter.id)

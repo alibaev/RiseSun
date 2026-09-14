@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api/client";
 import { canManageMeters, useAuth } from "../auth/AuthContext";
-import { ConfirmModal } from "../components/ConfirmModal";
 import { exportToExcel } from "../lib/exportExcel";
 import { formatValue } from "../lib/format";
 import type { Meter, ProtocolProfile } from "../api/types";
@@ -51,12 +50,6 @@ export function MetersListPage() {
   const [activatePassword, setActivatePassword] = useState("");
   const [activateLocation, setActivateLocation] = useState("");
 
-  // Вкладка «Некорректные данные» (2026-09-08) — правка serial_number/
-  // ip_address по каждой строке независимо, до нажатия "Сохранить".
-  const [invalidEdits, setInvalidEdits] = useState<Record<number, { serial_number: string; ip_address: string }>>({});
-  const [savingInvalidId, setSavingInvalidId] = useState<number | null>(null);
-  const [pendingDeleteMeter, setPendingDeleteMeter] = useState<Meter | null>(null);
-
   function buildParams(): URLSearchParams {
     const params = new URLSearchParams();
     if (search) params.set("search", search);
@@ -84,8 +77,8 @@ export function MetersListPage() {
   const installedRows = useMemo(() => rows.filter((m) => m.status === "installed"), [rows]);
   // "Малое потребление" (2026-09-11) — активные счётчики с
   // пренебрежимо малым/нулевым расходом (см. Meter.is_low_consumption)
-  // — отдельная секция между "Некорректные данные" и "Активные",
-  // исключены из основного списка "Активные", чтобы не дублировались.
+  // — отдельная секция, исключены из основного списка "Активные", чтобы
+  // не дублировались.
   const lowConsumptionRows = useMemo(
     () => rows.filter((m) => m.status === "active" && m.is_low_consumption),
     [rows]
@@ -99,53 +92,6 @@ export function MetersListPage() {
     if (!query) return activeRows;
     return activeRows.filter((m) => m.serial_number.toLowerCase().includes(query));
   }, [activeRows, activeSearch]);
-  const invalidRows = useMemo(() => rows.filter((m) => m.status === "invalid"), [rows]);
-
-  function invalidEditFor(m: Meter) {
-    return invalidEdits[m.id] ?? { serial_number: m.serial_number, ip_address: m.ip_address ?? "" };
-  }
-
-  function setInvalidEdit(m: Meter, patch: Partial<{ serial_number: string; ip_address: string }>) {
-    setInvalidEdits((prev) => ({ ...prev, [m.id]: { ...invalidEditFor(m), ...patch } }));
-  }
-
-  function handleSaveInvalid(m: Meter) {
-    const edit = invalidEditFor(m);
-    setSavingInvalidId(m.id);
-    setError(null);
-    api
-      .put<Meter>(`/api/meters/${m.id}`, {
-        serial_number: edit.serial_number,
-        ip_address: edit.ip_address || null,
-      })
-      .then(() => {
-        setInvalidEdits((prev) => {
-          const next = { ...prev };
-          delete next[m.id];
-          return next;
-        });
-        load();
-      })
-      .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось сохранить изменения"))
-      .finally(() => setSavingInvalidId(null));
-  }
-
-  // По просьбе пользователя (2026-09-14) — удаление записи из
-  // "Некорректные данные" целиком, а не только правка серийника/IP: у
-  // этих счётчиков обычно ещё нет показаний/задач (обнаружены, но не
-  // активированы), поэтому DELETE .../{meter_id} (см. meters.py) в
-  // норме проходит без конфликта; если история всё же есть — backend
-  // вернёт понятную 409-ошибку вместо тихого/каскадного удаления.
-  function handleConfirmDeleteMeter() {
-    if (!pendingDeleteMeter) return;
-    const meter = pendingDeleteMeter;
-    setPendingDeleteMeter(null);
-    setError(null);
-    api
-      .del(`/api/meters/${meter.id}`)
-      .then(load)
-      .catch((err) => setError(err instanceof ApiError ? err.message : "Не удалось удалить счётчик"));
-  }
 
   function handleSetLowConsumption(m: Meter, value: boolean) {
     setError(null);
@@ -303,72 +249,6 @@ export function MetersListPage() {
             </tbody>
           </table>
         </section>
-      )}
-
-      {meters !== null && invalidRows.length > 0 && (
-        <section className="card">
-          <div className="card-header">
-            <h2>Некорректные данные — {invalidRows.length}</h2>
-          </div>
-          <p className="hint">
-            У этих счётчиков серийный номер повреждён (получен с ошибкой при обнаружении, содержит не только цифры) —
-            физический адрес не вычисляется, чтение невозможно. Счётчик деактивирован. Исправьте серийный номер
-            и/или IP-адрес и сохраните, затем активируйте.
-          </p>
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Серийный номер</th>
-                <th>IP-адрес</th>
-                <th>Обнаружен</th>
-                {canManageMeters(role) && <th>Действия</th>}
-              </tr>
-            </thead>
-            <tbody>
-              {invalidRows.map((m) => {
-                const edit = invalidEditFor(m);
-                return (
-                  <tr key={m.id}>
-                    <td>
-                      <input
-                        value={edit.serial_number}
-                        onChange={(e) => setInvalidEdit(m, { serial_number: e.target.value })}
-                      />
-                    </td>
-                    <td>
-                      <input
-                        value={edit.ip_address}
-                        onChange={(e) => setInvalidEdit(m, { ip_address: e.target.value })}
-                      />
-                    </td>
-                    <td>{new Date(m.created_at).toLocaleString("ru-RU")}</td>
-                    {canManageMeters(role) && (
-                      <td>
-                        <button onClick={() => handleSaveInvalid(m)} disabled={savingInvalidId === m.id}>
-                          Сохранить
-                        </button>{" "}
-                        <button onClick={() => openActivate(m)}>Активировать</button>{" "}
-                        <button className="danger" onClick={() => setPendingDeleteMeter(m)}>
-                          Удалить
-                        </button>
-                      </td>
-                    )}
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </section>
-      )}
-
-      {pendingDeleteMeter && (
-        <ConfirmModal
-          title="Удалить счётчик"
-          message={`Запись «${pendingDeleteMeter.serial_number}» будет удалена безвозвратно. Если по счётчику уже есть показания, задачи или журналы — удаление не пройдёт, деактивируйте вместо удаления. Подтвердите операцию.`}
-          confirmLabel="Удалить"
-          onConfirm={handleConfirmDeleteMeter}
-          onCancel={() => setPendingDeleteMeter(null)}
-        />
       )}
 
       {meters !== null && (

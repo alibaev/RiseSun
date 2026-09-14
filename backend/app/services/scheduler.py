@@ -215,11 +215,10 @@ async def _outstanding_job_meter_ids(db: AsyncSession, meter_ids: list[int], job
 
 async def _trigger_one(db: AsyncSession, scheduled_job: ScheduledJob) -> None:
     now = datetime.now(timezone.utc)
-    # is_active=False здесь — не косметика: без этого фильтра счётчик,
-    # деактивированный администратором (например переведённый в
-    # MeterStatus.INVALID из-за повреждённого серийника, 2026-09-08),
-    # продолжал бы попадать в jobs из старого scheduled_job.meter_ids и
-    # вхолостую жечь попытки воркеров каждый цикл расписания.
+    # is_active=False здесь — не косметика: без этого фильтра деактиви-
+    # рованный администратором счётчик продолжал бы попадать в jobs из
+    # старого scheduled_job.meter_ids и вхолостую жечь попытки воркеров
+    # каждый цикл расписания.
     #
     # operation_params.all_active_meters (2026-09-11, по просьбе
     # пользователя — "сохрани эти функции для новых счётчиков на

@@ -105,6 +105,25 @@ async def test_unreachable_gateway_does_not_raise(db_session):
 
 
 @pytest.mark.asyncio
+async def test_non_digit_serial_is_rejected_not_created(db_session):
+    """По прямому указанию пользователя (2026-09-14, взамен прежнего
+    MeterStatus.INVALID и вкладки «Некорректные данные») — серийник с
+    буквами (Gateway обязан отклонять такие сам на call-home, см.
+    CallHomePool._identify) не должен заводить счётчик в справочнике,
+    даже если каким-то образом всё же дошёл до ListCallHomeSerials."""
+    await _seed_approved_gateway(db_session)
+
+    with patch(
+        "app.services.meter_discovery.list_call_home_serials",
+        new=AsyncMock(return_value=[SeenSerial(serial="20d901230058", first_seen_unix=1755590400.0)]),
+    ):
+        await _run_once()
+
+    meters = (await db_session.execute(select(Meter))).scalars().all()
+    assert meters == []
+
+
+@pytest.mark.asyncio
 async def test_pending_gateway_not_polled(db_session):
     user = User(username="root", password_hash=hash_password("x"), role=UserRole.SUPER_ADMIN)
     db_session.add(user)

@@ -596,6 +596,28 @@ class CallHomePool:
                 rest += more
             addr6 = header[1:7]
             pc.serial = serial_from_dlt645_address(addr6)
+            if not pc.serial.isdigit():
+                # По прямому указанию пользователя (2026-09-14, взамен
+                # прежнего подхода с MeterStatus.INVALID и вкладкой
+                # «Некорректные данные» в UI) — счётчик с повреждённым при
+                # обнаружении серийным номером (буквы вместо цифр из-за
+                # не-BCD байт в анонс-адресе) отклоняется здесь же, на
+                # этапе опознания, и вообще не попадает ни в пул
+                # claim-able соединений, ни в ListCallHomeSerials —
+                # backend никогда не узнаёт о таком счётчике.
+                logger.warning(
+                    "Call-home: соединение #%d (порт %d) отклонено — серийный номер "
+                    "%s повреждён (не только цифры), адрес анонс-кадра %s",
+                    pc.conn_no, pc.local_port, pc.serial, addr6.hex(),
+                )
+                with self._lock:
+                    self._pool.pop(pc.conn_no, None)
+                pc.cancelled.set()
+                try:
+                    pc.raw_sock.close()
+                except OSError:
+                    pass
+                return
             evicted = None
             with self._lock:
                 self._seen_serials.setdefault(pc.serial, time.time())

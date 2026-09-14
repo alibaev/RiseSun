@@ -406,6 +406,34 @@ def test_list_seen_serials_persists_after_sliding_window_eviction():
         pool.stop()
 
 
+def test_pool_rejects_non_digit_serial_and_closes_connection():
+    """По прямому указанию пользователя (2026-09-14, взамен прежнего
+    подхода с MeterStatus.INVALID и вкладкой «Некорректные данные» в
+    UI) — счётчик с повреждённым серийником (не-BCD байты в анонс-
+    адресе дают буквы при hex-форматировании) отклоняется прямо на
+    этапе опознания: соединение закрывается, не остаётся в пуле и не
+    попадает в list_seen_serials() — Backend о нём никогда не узнает."""
+    pool = CallHomePool(bind_host="127.0.0.1", bind_port=0, window_size=4)
+    pool.start()
+    try:
+        addr6 = bytes.fromhex("de23000f2020")  # nibbles > 9 -> serial с буквами
+        assert not serial_from_dlt645_address(addr6).isdigit()
+
+        c1 = socket.create_connection(("127.0.0.1", pool.bind_port), timeout=3)
+        c1.sendall(_build_dummy_dlt645_frame(addr6))
+        time.sleep(0.3)  # даём _identify() время обработать анонс-кадр
+
+        assert pool.list_seen_serials() == {}
+        assert pool.pending_count() == 0
+
+        c1.settimeout(2)
+        assert c1.recv(1) == b""  # Gateway закрыл соединение со своей стороны
+
+        c1.close()
+    finally:
+        pool.stop()
+
+
 def _run_fake_meter(conn: socket.socket, *, addr6: bytes, password: bytes, obis_values: dict, ignore_first_n_snrm: int) -> None:
     """Имитирует реальное поведение счётчика: сначала шлёт DL/T645-анонс,
     затем игнорирует первые ``ignore_first_n_snrm`` попыток SNRM (не

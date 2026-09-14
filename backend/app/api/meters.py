@@ -146,8 +146,8 @@ async def res_stats(
     # "Процент чтения" (2026-09-11, по просьбе пользователя) — доля
     # АКТИВНЫХ счётчиков РЭС с показанием (last_read_at) за период,
     # тот же industry-стандартный смысл, что и "Acquisition Rate".
-    # Знаменатель — активные счётчики (неактивные/INVALID не должны
-    # занижать процент — от них показаний и не ждём). "Сегодня" — тот же
+    # Знаменатель — активные счётчики (неактивные не должны занижать
+    # процент — от них показаний и не ждём). "Сегодня" — тот же
     # календарный день по Asia/Bishkek, что использует is_online/
     # scheduler.skip_if_read_today; "за 3 дня" — скользящее окно 72ч.
     now = datetime.now(timezone.utc)
@@ -264,10 +264,6 @@ async def activate_meter(
     if body.model is not None:
         meter.model = body.model
     meter.status = MeterStatus.ACTIVE
-    # Счётчик мог быть переведён в INVALID вместе с is_active=False (см.
-    # MeterStatus.INVALID) — активация должна вернуть его в обслуживание,
-    # иначе он останется невидим для планировщика даже после исправления
-    # serial_number/ip_address.
     meter.is_active = True
 
     await record_audit(
@@ -308,9 +304,8 @@ async def update_meter(
     try:
         await db.flush()
     except IntegrityError:
-        # serial_number уникален (см. вкладку «Некорректные данные»,
-        # 2026-09-08) — без этой проверки правка на уже занятый номер
-        # роняла бы 500 вместо понятной ошибки.
+        # serial_number уникален — без этой проверки правка на уже
+        # занятый номер роняла бы 500 вместо понятной ошибки.
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
