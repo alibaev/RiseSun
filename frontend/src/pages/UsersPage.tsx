@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "../api/client";
 import { ConfirmModal } from "../components/ConfirmModal";
+import { Pagination } from "../components/Pagination";
+import { usePagination } from "../lib/usePagination";
 import type { UserRole } from "../api/types";
 
 interface UserOut {
@@ -37,6 +39,8 @@ export function UsersPage() {
   const [resetPassword, setResetPassword] = useState("");
   const [pendingBlock, setPendingBlock] = useState<UserOut | null>(null);
   const [pendingDelete, setPendingDelete] = useState<UserOut | null>(null);
+
+  const pagination = usePagination(users ?? []);
 
   const load = useCallback(() => {
     setError(null);
@@ -173,7 +177,7 @@ export function UsersPage() {
             </tr>
           </thead>
           <tbody>
-            {users.map((u) => (
+            {pagination.pageRows.map((u) => (
               <tr key={u.id}>
                 <td>{u.username}</td>
                 <td>
@@ -200,6 +204,16 @@ export function UsersPage() {
             ))}
           </tbody>
         </table>
+      )}
+      {users !== null && (
+        <Pagination
+          page={pagination.page}
+          pageCount={pagination.pageCount}
+          onPageChange={pagination.setPage}
+          total={pagination.total}
+          start={pagination.start}
+          pageSize={pagination.pageSize}
+        />
       )}
 
       {resetTarget && (

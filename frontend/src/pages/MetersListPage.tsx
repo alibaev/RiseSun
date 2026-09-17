@@ -2,8 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api/client";
 import { canManageMeters, useAuth } from "../auth/AuthContext";
+import { Pagination } from "../components/Pagination";
 import { exportToExcel } from "../lib/exportExcel";
 import { formatValue } from "../lib/format";
+import { usePagination } from "../lib/usePagination";
 import type { Meter, ProtocolProfile } from "../api/types";
 
 const PROFILE_LABELS: Record<ProtocolProfile, string> = {
@@ -92,6 +94,9 @@ export function MetersListPage() {
     if (!query) return activeRows;
     return activeRows.filter((m) => m.serial_number.toLowerCase().includes(query));
   }, [activeRows, activeSearch]);
+  const activePagination = usePagination(filteredActiveRows, [activeSearch, search, protocolFilter, statusFilter, resNameFilter]);
+  const installedPagination = usePagination(installedRows, [search, protocolFilter, statusFilter, resNameFilter]);
+  const lowConsumptionPagination = usePagination(lowConsumptionRows, [search, protocolFilter, statusFilter, resNameFilter]);
 
   function handleSetLowConsumption(m: Meter, value: boolean) {
     setError(null);
@@ -233,7 +238,7 @@ export function MetersListPage() {
               </tr>
             </thead>
             <tbody>
-              {installedRows.map((m) => (
+              {installedPagination.pageRows.map((m) => (
                 <tr key={m.id}>
                   <td>
                     <Link to={`/meters/${m.id}`}>{m.serial_number}</Link>
@@ -248,6 +253,14 @@ export function MetersListPage() {
               ))}
             </tbody>
           </table>
+          <Pagination
+            page={installedPagination.page}
+            pageCount={installedPagination.pageCount}
+            onPageChange={installedPagination.setPage}
+            total={installedPagination.total}
+            start={installedPagination.start}
+            pageSize={installedPagination.pageSize}
+          />
         </section>
       )}
 
@@ -301,7 +314,7 @@ export function MetersListPage() {
                 </tr>
               </thead>
               <tbody>
-                {lowConsumptionRows.map((m) => (
+                {lowConsumptionPagination.pageRows.map((m) => (
                   <tr key={m.id}>
                     <td>
                       <Link to={`/meters/${m.id}`}>{m.serial_number}</Link>
@@ -319,6 +332,14 @@ export function MetersListPage() {
               </tbody>
             </table>
           )}
+          <Pagination
+            page={lowConsumptionPagination.page}
+            pageCount={lowConsumptionPagination.pageCount}
+            onPageChange={lowConsumptionPagination.setPage}
+            total={lowConsumptionPagination.total}
+            start={lowConsumptionPagination.start}
+            pageSize={lowConsumptionPagination.pageSize}
+          />
         </section>
       )}
 
@@ -400,7 +421,7 @@ export function MetersListPage() {
               </tr>
             </thead>
             <tbody>
-              {filteredActiveRows.map((m) => (
+              {activePagination.pageRows.map((m) => (
                 <tr key={m.id} className={readingAgeClass(m.last_read_at)}>
                   <td>
                     <Link to={`/meters/${m.id}`}>{m.serial_number}</Link>
@@ -423,6 +444,14 @@ export function MetersListPage() {
             </tbody>
           </table>
         )}
+        <Pagination
+          page={activePagination.page}
+          pageCount={activePagination.pageCount}
+          onPageChange={activePagination.setPage}
+          total={activePagination.total}
+          start={activePagination.start}
+          pageSize={activePagination.pageSize}
+        />
       </section>
     </div>
   );

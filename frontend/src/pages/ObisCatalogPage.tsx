@@ -1,11 +1,14 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "../api/client";
+import { Pagination } from "../components/Pagination";
 import { exportToExcel } from "../lib/exportExcel";
+import { usePagination } from "../lib/usePagination";
 import type { ObisEntry } from "../api/types";
 
 export function ObisCatalogPage() {
   const [entries, setEntries] = useState<ObisEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const pagination = usePagination(entries ?? []);
 
   useEffect(() => {
     api
@@ -56,7 +59,7 @@ export function ObisCatalogPage() {
             </tr>
           </thead>
           <tbody>
-            {entries.map((e) => (
+            {pagination.pageRows.map((e) => (
               <tr key={e.number}>
                 <td>{e.number}</td>
                 <td>{e.obis}</td>
@@ -69,6 +72,16 @@ export function ObisCatalogPage() {
             ))}
           </tbody>
         </table>
+      )}
+      {entries !== null && (
+        <Pagination
+          page={pagination.page}
+          pageCount={pagination.pageCount}
+          onPageChange={pagination.setPage}
+          total={pagination.total}
+          start={pagination.start}
+          pageSize={pagination.pageSize}
+        />
       )}
     </div>
   );

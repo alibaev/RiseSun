@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "../api/client";
 import { ConfirmModal } from "../components/ConfirmModal";
+import { Pagination } from "../components/Pagination";
+import { usePagination } from "../lib/usePagination";
 
 interface BillingApiKey {
   id: number;
@@ -26,6 +28,8 @@ export function BillingKeysPage() {
   const [rateLimit, setRateLimit] = useState("60");
 
   const [pendingRevoke, setPendingRevoke] = useState<BillingApiKey | null>(null);
+
+  const pagination = usePagination(keys ?? []);
 
   const load = useCallback(() => {
     setError(null);
@@ -141,7 +145,7 @@ export function BillingKeysPage() {
             </tr>
           </thead>
           <tbody>
-            {keys.map((k) => (
+            {pagination.pageRows.map((k) => (
               <tr key={k.id}>
                 <td>{k.client_id}</td>
                 <td>{k.description ?? "—"}</td>
@@ -159,6 +163,16 @@ export function BillingKeysPage() {
             ))}
           </tbody>
         </table>
+      )}
+      {keys !== null && (
+        <Pagination
+          page={pagination.page}
+          pageCount={pagination.pageCount}
+          onPageChange={pagination.setPage}
+          total={pagination.total}
+          start={pagination.start}
+          pageSize={pagination.pageSize}
+        />
       )}
 
       {pendingRevoke && (

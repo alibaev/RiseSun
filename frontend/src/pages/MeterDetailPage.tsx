@@ -4,7 +4,9 @@ import { api, ApiError } from "../api/client";
 import { tokenStorage } from "../auth/tokenStorage";
 import { useAuth, canTriggerRead, canWriteParameter } from "../auth/AuthContext";
 import { ConfirmModal } from "../components/ConfirmModal";
+import { Pagination } from "../components/Pagination";
 import { formatValue } from "../lib/format";
+import { usePagination } from "../lib/usePagination";
 import type { Job, LoadProfileRow, LogEntry, Meter, MeterReading } from "../api/types";
 
 const DEFAULT_OBIS = "1.1.1.8.0.ff"; // активная энергия, приём, всего (ТЗ Приложение Г.3)
@@ -31,8 +33,6 @@ const LOAD_PROFILE_COLUMNS: { label: string; index: number }[] = [
   { label: "Коэф. мощности, фаза B", index: 7 },
   { label: "Коэф. мощности, фаза C", index: 8 },
 ];
-const LOAD_PROFILE_PAGE_SIZE = 20;
-
 function profileCellValue(row: LoadProfileRow, index: number): string {
   const value = row.values_json[index];
   if (value == null) return "—";
@@ -86,10 +86,13 @@ export function MeterDetailPage() {
   const [profileFrom, setProfileFrom] = useState(() => toDateInput(new Date()));
   const [profileTo, setProfileTo] = useState(() => toDateInput(new Date()));
   const [profileRows, setProfileRows] = useState<LoadProfileRow[]>([]);
-  const [profilePage, setProfilePage] = useState(1);
   const [profileError, setProfileError] = useState<string | null>(null);
   const [profileJob, setProfileJob] = useState<Job | null>(null);
   const profileWsRef = useRef<WebSocket | null>(null);
+  const readingsPagination = usePagination(readings);
+  const profilePagination = usePagination(profileRows);
+  const eventLogPagination = usePagination(eventLog);
+  const tamperLogPagination = usePagination(tamperLog);
 
   const loadReadings = useCallback(async () => {
     if (!id) return;
@@ -99,9 +102,11 @@ export function MeterDetailPage() {
         to_iso: `${readingsTo}:00`,
       });
       setReadings(await api.get<MeterReading[]>(`/api/meters/${id}/readings?${params}`));
+      readingsPagination.setPage(1);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Не удалось загрузить показания");
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, readingsFrom, readingsTo]);
 
   const loadProfileRows = useCallback(async () => {
@@ -114,10 +119,11 @@ export function MeterDetailPage() {
       });
       const rows = await api.get<LoadProfileRow[]>(`/api/meters/${id}/load-profile?${params}`);
       setProfileRows(rows);
-      setProfilePage(1);
+      profilePagination.setPage(1);
     } catch (err) {
       setProfileError(err instanceof ApiError ? err.message : "Не удалось загрузить профиль нагрузки");
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, profileFrom, profileTo]);
 
   const loadAll = useCallback(async () => {
@@ -388,7 +394,7 @@ export function MeterDetailPage() {
               </tr>
             </thead>
             <tbody>
-              {readings.map((r) => {
+              {readingsPagination.pageRows.map((r) => {
                 const readAt = new Date(r.read_at);
                 return (
                   <tr key={r.id}>
@@ -402,6 +408,16 @@ export function MeterDetailPage() {
               })}
             </tbody>
           </table>
+        )}
+        {readings.length > 0 && (
+          <Pagination
+            page={readingsPagination.page}
+            pageCount={readingsPagination.pageCount}
+            onPageChange={readingsPagination.setPage}
+            total={readingsPagination.total}
+            start={readingsPagination.start}
+            pageSize={readingsPagination.pageSize}
+          />
         )}
       </section>
 
@@ -453,42 +469,25 @@ export function MeterDetailPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {profileRows
-                    .slice((profilePage - 1) * LOAD_PROFILE_PAGE_SIZE, profilePage * LOAD_PROFILE_PAGE_SIZE)
-                    .map((row) => (
-                      <tr key={row.id}>
-                        <td>{new Date(row.timestamp).toLocaleString("ru-RU")}</td>
-                        {LOAD_PROFILE_COLUMNS.map((col) => (
-                          <td key={col.label}>{profileCellValue(row, col.index)}</td>
-                        ))}
-                      </tr>
-                    ))}
+                  {profilePagination.pageRows.map((row) => (
+                    <tr key={row.id}>
+                      <td>{new Date(row.timestamp).toLocaleString("ru-RU")}</td>
+                      {LOAD_PROFILE_COLUMNS.map((col) => (
+                        <td key={col.label}>{profileCellValue(row, col.index)}</td>
+                      ))}
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>
-            {profileRows.length > LOAD_PROFILE_PAGE_SIZE && (
-              <div className="filters" style={{ alignItems: "center" }}>
-                <button
-                  className="secondary"
-                  onClick={() => setProfilePage((p) => Math.max(1, p - 1))}
-                  disabled={profilePage <= 1}
-                >
-                  ‹
-                </button>
-                <span>
-                  Стр. {profilePage} из {Math.ceil(profileRows.length / LOAD_PROFILE_PAGE_SIZE)}
-                </span>
-                <button
-                  className="secondary"
-                  onClick={() =>
-                    setProfilePage((p) => Math.min(Math.ceil(profileRows.length / LOAD_PROFILE_PAGE_SIZE), p + 1))
-                  }
-                  disabled={profilePage >= Math.ceil(profileRows.length / LOAD_PROFILE_PAGE_SIZE)}
-                >
-                  ›
-                </button>
-              </div>
-            )}
+            <Pagination
+              page={profilePagination.page}
+              pageCount={profilePagination.pageCount}
+              onPageChange={profilePagination.setPage}
+              total={profilePagination.total}
+              start={profilePagination.start}
+              pageSize={profilePagination.pageSize}
+            />
           </>
         )}
       </section>
@@ -498,13 +497,23 @@ export function MeterDetailPage() {
         {eventLog.length === 0 ? (
           <p>Событий не зафиксировано.</p>
         ) : (
-          <ul className="log-list">
-            {eventLog.map((e) => (
-              <li key={e.id}>
-                {new Date(e.occurred_at).toLocaleString("ru-RU")} — {e.category}
-              </li>
-            ))}
-          </ul>
+          <>
+            <ul className="log-list">
+              {eventLogPagination.pageRows.map((e) => (
+                <li key={e.id}>
+                  {new Date(e.occurred_at).toLocaleString("ru-RU")} — {e.category}
+                </li>
+              ))}
+            </ul>
+            <Pagination
+              page={eventLogPagination.page}
+              pageCount={eventLogPagination.pageCount}
+              onPageChange={eventLogPagination.setPage}
+              total={eventLogPagination.total}
+              start={eventLogPagination.start}
+              pageSize={eventLogPagination.pageSize}
+            />
+          </>
         )}
       </section>
 
@@ -513,13 +522,23 @@ export function MeterDetailPage() {
         {tamperLog.length === 0 ? (
           <p>Вмешательств не зафиксировано.</p>
         ) : (
-          <ul className="log-list">
-            {tamperLog.map((e) => (
-              <li key={e.id}>
-                {new Date(e.occurred_at).toLocaleString("ru-RU")} — {e.category}
-              </li>
-            ))}
-          </ul>
+          <>
+            <ul className="log-list">
+              {tamperLogPagination.pageRows.map((e) => (
+                <li key={e.id}>
+                  {new Date(e.occurred_at).toLocaleString("ru-RU")} — {e.category}
+                </li>
+              ))}
+            </ul>
+            <Pagination
+              page={tamperLogPagination.page}
+              pageCount={tamperLogPagination.pageCount}
+              onPageChange={tamperLogPagination.setPage}
+              total={tamperLogPagination.total}
+              start={tamperLogPagination.start}
+              pageSize={tamperLogPagination.pageSize}
+            />
+          </>
         )}
       </section>
     </div>

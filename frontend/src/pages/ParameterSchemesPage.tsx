@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "../api/client";
 import { canManageAutomation, canWriteParameter, useAuth } from "../auth/AuthContext";
 import { ConfirmModal } from "../components/ConfirmModal";
+import { Pagination } from "../components/Pagination";
 import { WRITABLE_PARAMS, WRITABLE_PARAM_LABELS } from "../constants/writableParameters";
+import { usePagination } from "../lib/usePagination";
 import type { Job, Meter, ParameterScheme, ParameterSchemeParam } from "../api/types";
 
 function formatParameters(parameters: ParameterSchemeParam[]): string {
@@ -25,6 +27,15 @@ export function ParameterSchemesPage() {
   const [selectedMeterIds, setSelectedMeterIds] = useState<Set<number>>(new Set());
   const [pendingApply, setPendingApply] = useState<ParameterScheme | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ParameterScheme | null>(null);
+  const [meterSearch, setMeterSearch] = useState("");
+
+  const schemesPagination = usePagination(schemes ?? []);
+  const filteredMeters = useMemo(() => {
+    const query = meterSearch.trim().toLowerCase();
+    if (!query) return meters;
+    return meters.filter((m) => m.serial_number.toLowerCase().includes(query));
+  }, [meters, meterSearch]);
+  const metersPagination = usePagination(filteredMeters, [meterSearch, applyingScheme?.id]);
 
   const loadAll = useCallback(async () => {
     setError(null);
@@ -177,7 +188,7 @@ export function ParameterSchemesPage() {
             </tr>
           </thead>
           <tbody>
-            {schemes.map((s) => (
+            {schemesPagination.pageRows.map((s) => (
               <tr key={s.id}>
                 <td>{s.name}</td>
                 <td>{s.description ?? "—"}</td>
@@ -191,12 +202,28 @@ export function ParameterSchemesPage() {
           </tbody>
         </table>
       )}
+      {schemes !== null && schemes.length > 0 && (
+        <Pagination
+          page={schemesPagination.page}
+          pageCount={schemesPagination.pageCount}
+          onPageChange={schemesPagination.setPage}
+          total={schemesPagination.total}
+          start={schemesPagination.start}
+          pageSize={schemesPagination.pageSize}
+        />
+      )}
 
       {applyingScheme && (
         <section className="card">
           <h2>Применить «{applyingScheme.name}» к счётчикам</h2>
+          <input
+            placeholder="Поиск по серийному номеру"
+            value={meterSearch}
+            onChange={(e) => setMeterSearch(e.target.value)}
+            style={{ marginBottom: 10 }}
+          />
           <div className="filters">
-            {meters.map((m) => (
+            {metersPagination.pageRows.map((m) => (
               <label key={m.id} style={{ display: "block" }}>
                 <input
                   type="checkbox"
@@ -207,6 +234,14 @@ export function ParameterSchemesPage() {
               </label>
             ))}
           </div>
+          <Pagination
+            page={metersPagination.page}
+            pageCount={metersPagination.pageCount}
+            onPageChange={metersPagination.setPage}
+            total={metersPagination.total}
+            start={metersPagination.start}
+            pageSize={metersPagination.pageSize}
+          />
           <button
             onClick={() => setPendingApply(applyingScheme)}
             disabled={selectedMeterIds.size === 0}

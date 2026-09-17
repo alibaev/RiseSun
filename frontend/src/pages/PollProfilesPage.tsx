@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "../api/client";
 import { canManageAutomation, useAuth } from "../auth/AuthContext";
 import { ConfirmModal } from "../components/ConfirmModal";
+import { Pagination } from "../components/Pagination";
+import { usePagination } from "../lib/usePagination";
 import type { ObisEntry, PollProfile, PollProfileItem } from "../api/types";
 
 const OBIS_PATTERN = /^[0-9a-fA-F]{1,2}(\.[0-9a-fA-F]{1,2}){5}$/;
@@ -23,6 +25,8 @@ export function PollProfilesPage() {
   const [form, setForm] = useState(emptyForm());
   const [pendingDelete, setPendingDelete] = useState<PollProfile | null>(null);
   const [showCatalogPicker, setShowCatalogPicker] = useState(false);
+  const profilesPagination = usePagination(profiles ?? []);
+  const catalogPagination = usePagination(catalog, [showCatalogPicker]);
 
   const loadAll = useCallback(async () => {
     setError(null);
@@ -224,7 +228,7 @@ export function PollProfilesPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {catalog.map((entry) => {
+                      {catalogPagination.pageRows.map((entry) => {
                         const alreadyAdded = form.items.some((it) => it.obis === entry.obis);
                         return (
                           <tr key={entry.number}>
@@ -247,6 +251,16 @@ export function PollProfilesPage() {
                       Карта OBIS-кодов пуста — см. раздел «Параметры → Карта OBIS-кодов».
                     </p>
                   )}
+                  {catalog.length > 0 && (
+                    <Pagination
+                      page={catalogPagination.page}
+                      pageCount={catalogPagination.pageCount}
+                      onPageChange={catalogPagination.setPage}
+                      total={catalogPagination.total}
+                      start={catalogPagination.start}
+                      pageSize={catalogPagination.pageSize}
+                    />
+                  )}
                 </div>
               )}
             </div>
@@ -268,7 +282,7 @@ export function PollProfilesPage() {
             </tr>
           </thead>
           <tbody>
-            {profiles.map((p) => (
+            {profilesPagination.pageRows.map((p) => (
               <tr key={p.id}>
                 <td>{p.name}</td>
                 <td>{p.description ?? "—"}</td>
@@ -287,6 +301,16 @@ export function PollProfilesPage() {
             ))}
           </tbody>
         </table>
+      )}
+      {profiles !== null && profiles.length > 0 && (
+        <Pagination
+          page={profilesPagination.page}
+          pageCount={profilesPagination.pageCount}
+          onPageChange={profilesPagination.setPage}
+          total={profilesPagination.total}
+          start={profilesPagination.start}
+          pageSize={profilesPagination.pageSize}
+        />
       )}
 
       {pendingDelete && (

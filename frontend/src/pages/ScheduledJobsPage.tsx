@@ -2,6 +2,8 @@ import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "../api/client";
 import { canManageAutomation, useAuth } from "../auth/AuthContext";
 import { ConfirmModal } from "../components/ConfirmModal";
+import { Pagination } from "../components/Pagination";
+import { usePagination } from "../lib/usePagination";
 import type { Job, Meter, PollProfile, ScheduledJob, ScheduledJobRun, ScheduledJobType } from "../api/types";
 
 const JOB_TYPE_LABELS: Record<ScheduledJobType, string> = {
@@ -265,6 +267,7 @@ export function ScheduledJobsPage() {
 
   const managedPairs = useMemo(() => groupManagedPairs(jobs ?? []), [jobs]);
   const genericJobs = useMemo(() => (jobs ?? []).filter((j) => !isManaged(j)), [jobs]);
+  const genericJobsPagination = usePagination(genericJobs);
 
   const loadManagedRuns = useCallback(async (pairs: ManagedPair[]) => {
     setManagedRunsLoading(true);
@@ -585,7 +588,7 @@ export function ScheduledJobsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {genericJobs.map((j) => (
+                  {genericJobsPagination.pageRows.map((j) => (
                     <Fragment key={j.id}>
                       <tr>
                         <td>
@@ -693,6 +696,16 @@ export function ScheduledJobsPage() {
                   ))}
                 </tbody>
               </table>
+            )}
+            {genericJobs.length > 0 && (
+              <Pagination
+                page={genericJobsPagination.page}
+                pageCount={genericJobsPagination.pageCount}
+                onPageChange={genericJobsPagination.setPage}
+                total={genericJobsPagination.total}
+                start={genericJobsPagination.start}
+                pageSize={genericJobsPagination.pageSize}
+              />
             )}
           </>
         )}

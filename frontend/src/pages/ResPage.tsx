@@ -1,11 +1,14 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError } from "../api/client";
+import { Pagination } from "../components/Pagination";
+import { usePagination } from "../lib/usePagination";
 import type { ResStats } from "../api/types";
 
 export function ResPage() {
   const [stats, setStats] = useState<ResStats[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const pagination = usePagination(stats ?? []);
 
   function load() {
     setError(null);
@@ -58,7 +61,7 @@ export function ResPage() {
             </tr>
           </thead>
           <tbody>
-            {stats.map((s) => (
+            {pagination.pageRows.map((s) => (
               <tr key={s.res_name}>
                 <td>
                   <Link to={`/meters?res_name=${encodeURIComponent(s.res_name)}`}>{s.res_name}</Link>
@@ -82,6 +85,16 @@ export function ResPage() {
             </tr>
           </tfoot>
         </table>
+      )}
+      {stats !== null && stats.length > 0 && (
+        <Pagination
+          page={pagination.page}
+          pageCount={pagination.pageCount}
+          onPageChange={pagination.setPage}
+          total={pagination.total}
+          start={pagination.start}
+          pageSize={pagination.pageSize}
+        />
       )}
     </div>
   );

@@ -1,6 +1,8 @@
 import { Fragment, useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "../api/client";
 import { canManageAutomation, useAuth } from "../auth/AuthContext";
+import { Pagination } from "../components/Pagination";
+import { usePagination } from "../lib/usePagination";
 import type { EudbExportItem, EudbExportRun } from "../api/types";
 
 // Ежедневный экспорт профиля нагрузки (Profile1) во внешнюю БД ЕЭБД
@@ -30,6 +32,8 @@ export function EudbExportPage() {
   const [starting, setStarting] = useState(false);
   const [expandedRunId, setExpandedRunId] = useState<number | null>(null);
   const [items, setItems] = useState<Record<number, EudbExportItem[]>>({});
+  const runsPagination = usePagination(runs ?? []);
+  const itemsPagination = usePagination(items[expandedRunId ?? -1] ?? [], [expandedRunId]);
 
   const load = useCallback(() => {
     api
@@ -124,7 +128,7 @@ export function EudbExportPage() {
               </tr>
             </thead>
             <tbody>
-              {runs.map((r) => (
+              {runsPagination.pageRows.map((r) => (
                 <Fragment key={r.id}>
                   <tr>
                     <td>{new Date(r.started_at).toLocaleString("ru-RU")}</td>
@@ -161,7 +165,7 @@ export function EudbExportPage() {
                               </tr>
                             </thead>
                             <tbody>
-                              {items[r.id].map((it) => (
+                              {itemsPagination.pageRows.map((it) => (
                                 <tr key={it.id}>
                                   <td>{it.meter_serial}</td>
                                   <td>{it.ok ? "успешно" : it.error_message}</td>
@@ -171,6 +175,16 @@ export function EudbExportPage() {
                             </tbody>
                           </table>
                         )}
+                        {items[r.id] && items[r.id].length > 0 && (
+                          <Pagination
+                            page={itemsPagination.page}
+                            pageCount={itemsPagination.pageCount}
+                            onPageChange={itemsPagination.setPage}
+                            total={itemsPagination.total}
+                            start={itemsPagination.start}
+                            pageSize={itemsPagination.pageSize}
+                          />
+                        )}
                       </td>
                     </tr>
                   )}
@@ -178,6 +192,16 @@ export function EudbExportPage() {
               ))}
             </tbody>
           </table>
+        )}
+        {runs !== null && runs.length > 0 && (
+          <Pagination
+            page={runsPagination.page}
+            pageCount={runsPagination.pageCount}
+            onPageChange={runsPagination.setPage}
+            total={runsPagination.total}
+            start={runsPagination.start}
+            pageSize={runsPagination.pageSize}
+          />
         )}
       </section>
     </div>

@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "../api/client";
+import { Pagination } from "../components/Pagination";
+import { usePagination } from "../lib/usePagination";
 
 interface AuditRow {
   id: number;
@@ -64,6 +66,8 @@ export function AuditLogPage() {
   }, []);
 
   const userLabel = (id: number | null) => (id === null ? "—" : users.find((u) => u.id === id)?.username ?? `#${id}`);
+
+  const pagination = usePagination(rows, [userId, action, dateFrom, dateTo]);
 
   function handleExportCsv() {
     const header = ["id", "время", "пользователь", "источник", "действие", "объект", "id объекта", "результат", "IP"];
@@ -149,7 +153,7 @@ export function AuditLogPage() {
             </tr>
           </thead>
           <tbody>
-            {rows.map((r) => (
+            {pagination.pageRows.map((r) => (
               <tr key={r.id}>
                 <td>{new Date(r.created_at).toLocaleString("ru-RU")}</td>
                 <td>{userLabel(r.user_id)}</td>
@@ -164,6 +168,16 @@ export function AuditLogPage() {
             ))}
           </tbody>
         </table>
+      )}
+      {rows.length > 0 && (
+        <Pagination
+          page={pagination.page}
+          pageCount={pagination.pageCount}
+          onPageChange={pagination.setPage}
+          total={pagination.total}
+          start={pagination.start}
+          pageSize={pagination.pageSize}
+        />
       )}
     </div>
   );
